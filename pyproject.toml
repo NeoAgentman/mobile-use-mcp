@@ -34,7 +34,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-q", "--strict-markers"]
+addopts = ["-q", "--strict-markers", "-m", "not android"]
 asyncio_mode = "auto"
 markers = [
     "android: requires a connected Android device or emulator",
@@ -51,4 +51,3 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 include = ["src", "tests"]
-

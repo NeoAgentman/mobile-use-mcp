@@ -245,8 +245,11 @@ npx -y @modelcontextprotocol/inspector --cli \
 Tests marked `android` require a connected device or emulator:
 
 ```bash
-uv run pytest -m android
+MOBILE_USE_ANDROID_SERIAL=ABC123 uv run pytest -m android
 ```
+
+Device tests are excluded from the default test run and require an explicit serial so the test
+suite never selects and operates a connected phone accidentally.
 
 ## Known limitations
 
