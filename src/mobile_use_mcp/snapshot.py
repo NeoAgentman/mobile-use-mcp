@@ -39,12 +39,12 @@ def parse_hierarchy(
     hierarchy_xml: str,
     *,
     interactive_only: bool = False,
-    max_elements: int = 200,
+    max_elements: int | None = 200,
     max_text_length: int = 500,
 ) -> list[UIElement]:
     """Flatten and compact a UIAutomator XML hierarchy."""
 
-    if max_elements < 1:
+    if max_elements is not None and max_elements < 1:
         return []
     try:
         root = ET.fromstring(hierarchy_xml)
@@ -80,6 +80,6 @@ def parse_hierarchy(
         if not element.has_semantic_content() and not element.is_interactive():
             continue
         elements.append(element)
-        if len(elements) >= max_elements:
+        if max_elements is not None and len(elements) >= max_elements:
             break
     return elements

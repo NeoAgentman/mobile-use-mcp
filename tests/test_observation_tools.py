@@ -94,6 +94,9 @@ async def test_snapshot_returns_image_and_structured_ui(
 
     assert result.structuredContent is not None
     assert result.structuredContent["element_count"] == 1
+    assert result.structuredContent["total_elements"] == 1
+    assert result.structuredContent["truncated"] is False
+    assert str(result.structuredContent["snapshot_id"]).startswith("s-")
     assert any(isinstance(content, ImageContent) for content in result.content)
 
 
@@ -121,6 +124,41 @@ async def test_snapshot_supports_downscaled_jpeg(monkeypatch: pytest.MonkeyPatch
     assert result.structuredContent["image_height"] == 1200
     image_content = next(item for item in result.content if isinstance(item, ImageContent))
     assert image_content.mimeType == "image/jpeg"
+
+
+async def test_snapshot_marks_truncation_and_supports_full_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = BytesIO()
+    Image.new("RGB", (1080, 2400)).save(image, format="PNG")
+    elements = [UIElement(text=f"Item {index}") for index in range(3)]
+    controller = Mock()
+    controller.snapshot = AsyncMock(
+        return_value=ScreenSnapshot(
+            serial="ABC",
+            width=1080,
+            height=2400,
+            screenshot_png=image.getvalue(),
+            elements=elements,
+            foreground_app=ForegroundApp(),
+        )
+    )
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    compact = await android_snapshot(max_elements=2)
+    full = await android_snapshot(detail_level="full", max_elements=1)
+
+    assert compact.structuredContent is not None
+    assert compact.structuredContent["returned_elements"] == 2
+    assert compact.structuredContent["total_elements"] == 3
+    assert compact.structuredContent["truncated"] is True
+    assert compact.structuredContent["next_offset"] == 2
+    assert compact.structuredContent["full_fallback"]["arguments"] == {  # type: ignore[index]
+        "detail_level": "full"
+    }
+    assert full.structuredContent is not None
+    assert full.structuredContent["returned_elements"] == 3
+    assert full.structuredContent["truncated"] is False
 
 
 async def test_snapshot_hides_internal_exception(monkeypatch: pytest.MonkeyPatch) -> None:

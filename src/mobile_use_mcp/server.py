@@ -148,6 +148,7 @@ async def android_disconnect() -> dict[str, Any]:
     annotations=READ_ONLY,
 )
 async def android_snapshot(
+    detail_level: Literal["compact", "full"] = "compact",
     interactive_only: bool = False,
     max_elements: int = 200,
     max_text_length: int = 500,
@@ -155,7 +156,7 @@ async def android_snapshot(
     image_quality: int = 80,
     max_width: int | None = None,
 ) -> CallToolResult:
-    """Return a configurable screenshot, compact UI elements, dimensions, and foreground app."""
+    """Return a screenshot and either bounded or full normalized UI elements."""
 
     if not 1 <= max_elements <= 500:
         raise ValueError("max_elements must be between 1 and 500")
@@ -169,7 +170,7 @@ async def android_snapshot(
         controller = session.require_controller()
         snapshot = await controller.snapshot(
             interactive_only=interactive_only,
-            max_elements=max_elements,
+            max_elements=None,
             max_text_length=max_text_length,
         )
     except MobileUseError as error:
@@ -192,6 +193,12 @@ async def android_snapshot(
             structuredContent=failure,
         )
 
+    snapshot_id = session.store_snapshot(snapshot)
+    total_elements = len(snapshot.elements)
+    returned_elements = (
+        snapshot.elements if detail_level == "full" else snapshot.elements[:max_elements]
+    )
+    truncated = len(returned_elements) < total_elements
     image_data, image_width, image_height = encode_screenshot(
         snapshot.screenshot_png,
         image_format=image_format,
@@ -200,6 +207,8 @@ async def android_snapshot(
     )
     metadata = {
         "success": True,
+        "snapshot_id": snapshot_id,
+        "detail_level": detail_level,
         "serial": snapshot.serial,
         "width": snapshot.width,
         "height": snapshot.height,
@@ -207,8 +216,17 @@ async def android_snapshot(
         "image_width": image_width,
         "image_height": image_height,
         "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
-        "element_count": len(snapshot.elements),
-        "elements": [element.model_dump(mode="json") for element in snapshot.elements],
+        "total_elements": total_elements,
+        "returned_elements": len(returned_elements),
+        "element_count": len(returned_elements),
+        "truncated": truncated,
+        "next_offset": len(returned_elements) if truncated else None,
+        "full_fallback": (
+            {"tool": "android_snapshot", "arguments": {"detail_level": "full"}}
+            if truncated
+            else None
+        ),
+        "elements": [element.model_dump(mode="json") for element in returned_elements],
     }
     return CallToolResult(
         content=[

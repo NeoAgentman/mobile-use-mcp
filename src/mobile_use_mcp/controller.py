@@ -88,7 +88,7 @@ class AndroidController:
         self,
         *,
         interactive_only: bool = False,
-        max_elements: int = 200,
+        max_elements: int | None = 200,
         max_text_length: int = 500,
     ) -> ScreenSnapshot:
         screenshot, hierarchy, width, height = await asyncio.to_thread(
