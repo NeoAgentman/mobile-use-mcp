@@ -39,3 +39,10 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 - Input method restoration: passed; the user's Baidu input method was restored after automation.
 - Physical USB disconnect during an active MCP session: passed; the next device operation returned
   structured `DEVICE_DISCONNECTED` with a reconnect suggestion.
+
+## Version 0.2 additions
+
+- PNG/JPEG screenshot encoding and proportional downscaling are covered by unit and MCP tool tests.
+- App launch results include structured attempt and foreground-blocker diagnostics.
+- Bounded recording, segment rollover, stop, transfer, missing-ffmpeg fallback, and disconnect
+  cleanup are covered by non-device tests. Real-device recording remains an opt-in verification.

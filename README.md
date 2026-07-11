@@ -10,13 +10,16 @@ and UI elements, plans actions, and calls MCP tools directly.
 
 - Discover, select, and disconnect Android physical devices and emulators
 - Return screenshots as native MCP image content
+- Downscale screenshots and encode them as PNG or quality-controlled JPEG
 - Return a compact UIAutomator accessibility hierarchy
 - Tap or long press using bounds, resource ID, or text fallbacks
 - Swipe using validated screen coordinates
 - Type and clear text in the focused field
 - Press a bounded set of Android keys
 - List, launch, and terminate apps
+- Diagnose App launch attempts and foreground blockers
 - Open HTTP and HTTPS URLs
+- Record bounded Android screen videos with automatic segment rollover
 - Detect unauthorized, offline, disconnected, and ambiguous device states
 
 ## Non-goals and safety boundaries
@@ -40,6 +43,7 @@ and model environment.
 - [`uv`](https://docs.astral.sh/uv/)
 - Android SDK platform-tools with `adb` on `PATH`
 - A physical Android device with USB debugging enabled, or an Android emulator
+- Optional: `ffmpeg` on `PATH` to merge recordings longer than one Android segment
 
 Confirm ADB connectivity before starting:
 
@@ -149,8 +153,9 @@ and report the device model. Observe the screen again after every action.
 | `android_list_apps` | Filter third-party package names |
 
 `android_snapshot` supports `interactive_only`, `max_elements`, and `max_text_length` to control
-context size. Screenshots are returned as MCP image content; screenshot base64 is not duplicated in
-the structured JSON result.
+context size. It and `android_screenshot` also support `image_format`, `image_quality`, and
+`max_width`. Device dimensions and encoded image dimensions are returned separately. Screenshots
+are returned as MCP image content; screenshot base64 is not duplicated in structured JSON.
 
 ### Actions
 
@@ -165,7 +170,19 @@ the structured JSON result.
 | `android_launch_app` | Launch a package and poll until foreground |
 | `android_terminate_app` | Force-stop a package |
 | `android_open_url` | Open an HTTP or HTTPS URL |
+| `android_start_recording` | Start a bounded screen recording with automatic segment rollover |
+| `android_stop_recording` | Stop, pull, and optionally merge recording segments |
 | `android_wait` | Wait for a bounded delay before observing again |
+
+`android_launch_app` reports every launch attempt, polling count, and the last foreground App. A
+permission controller, chooser, or other foreground blocker is reported separately from an App
+that remains in an indeterminate loading state.
+
+Recordings are limited to 5–1800 seconds. Device-side temporary files use randomized names and are
+removed after transfer. Android's per-recording time limit is handled with 170-second segments. If
+`ffmpeg` is available, multiple segments are losslessly concatenated; otherwise the tool returns
+the segment paths and a warning. Returned paths are local to the MCP host and may contain sensitive
+screen content.
 
 ## Target selection
 
@@ -258,6 +275,8 @@ device verification results.
 
 - Custom-rendered Canvas/game interfaces may not expose useful accessibility elements; coordinate
   actions can still be selected from the screenshot.
+- Screen recording availability and supported resolution depend on the Android device's built-in
+  `screenrecord` implementation.
 - UI elements are snapshots, not stable DOM nodes. Observe again after navigation, animation, or
   scrolling.
 - `android_type_text` and `android_clear_text` accept an optional target. Without one, they operate

@@ -258,6 +258,17 @@ mobile-use-mcp/
 - [x] README：Claude Code 配置
 - [x] README：工具清单和调用示例
 - [x] README：真机授权、unauthorized 和 offline 排障
+
+## Post-MVP P1：观察、启动诊断与录屏
+
+- [x] snapshot/screenshot 支持 PNG、JPEG、质量参数和等比例缩放
+- [x] 同时返回设备原始尺寸和实际 MCP 图像尺寸
+- [x] App 启动返回逐次 attempt、poll 数量和最终前台 App
+- [x] 区分持续加载与被其他前台 App 阻塞
+- [x] 有界 Android `screenrecord` 启停工具
+- [x] 170 秒自动分段、随机设备路径、拉取和设备端清理
+- [x] 可用时通过参数化 ffmpeg 调用合并，缺失时返回分段与 warning
+- [x] disconnect 时终止录制并清理未完成文件
 - [x] README：截图和敏感数据说明
 - [x] README：已知限制
 - [x] 生成源码复用与修改说明
