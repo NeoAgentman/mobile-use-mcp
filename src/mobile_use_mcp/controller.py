@@ -9,7 +9,13 @@ from adbutils import AdbClient  # pyright: ignore[reportMissingTypeStubs]
 
 from mobile_use_mcp.android_client import AndroidClient
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
-from mobile_use_mcp.models import ForegroundApp, ScreenSnapshot, Target
+from mobile_use_mcp.models import (
+    AppLaunchAttempt,
+    AppLaunchResult,
+    ForegroundApp,
+    ScreenSnapshot,
+    Target,
+)
 from mobile_use_mcp.selectors import resolve_target
 from mobile_use_mcp.snapshot import parse_hierarchy
 
@@ -236,21 +242,66 @@ class AndroidController:
         *,
         retries: int = 3,
         timeout_seconds: float = 15,
-    ) -> ForegroundApp:
-        for attempt in range(retries):
-            await asyncio.to_thread(self.adb_device.app_start, package)
+    ) -> AppLaunchResult:
+        attempts: list[AppLaunchAttempt] = []
+        last_foreground = ForegroundApp()
+        for attempt_index in range(1, retries + 1):
+            try:
+                await asyncio.to_thread(self.adb_device.app_start, package)
+            except Exception as error:
+                raise MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    f"Android could not start package {package!r}.",
+                    "Check that the exact package is installed with android_list_apps.",
+                    data={"stage": "start_command", "attempt": attempt_index},
+                ) from error
             deadline = asyncio.get_running_loop().time() + timeout_seconds
+            polls = 0
             while asyncio.get_running_loop().time() < deadline:
-                foreground = await self.get_foreground_app()
-                if foreground.package == package:
-                    return foreground
+                polls += 1
+                last_foreground = await self.get_foreground_app()
+                if last_foreground.package == package:
+                    attempts.append(
+                        AppLaunchAttempt(
+                            attempt=attempt_index,
+                            outcome="ready",
+                            polls=polls,
+                            foreground_app=last_foreground,
+                        )
+                    )
+                    return AppLaunchResult(foreground_app=last_foreground, attempts=attempts)
+                if last_foreground.package is not None:
+                    attempts.append(
+                        AppLaunchAttempt(
+                            attempt=attempt_index,
+                            outcome="blocked_by_other_app",
+                            polls=polls,
+                            foreground_app=last_foreground,
+                        )
+                    )
+                    break
                 await asyncio.sleep(0.5)
-            if attempt + 1 < retries:
+            else:
+                attempts.append(
+                    AppLaunchAttempt(
+                        attempt=attempt_index,
+                        outcome="loading_timeout",
+                        polls=polls,
+                        foreground_app=last_foreground,
+                    )
+                )
+            if attempt_index < retries:
                 await asyncio.sleep(0.5)
         raise MobileUseError(
             ErrorCode.TIMEOUT,
-            f"App {package!r} did not reach the foreground after {retries} attempts.",
-            "Check that the package is installed with android_list_apps.",
+            f"App {package!r} did not reach the foreground after {retries} attempts; "
+            f"last foreground package was {last_foreground.package!r}.",
+            "Inspect the current screen for a permission dialog or another app, then retry.",
+            data={
+                "requested_package": package,
+                "last_foreground_app": last_foreground.model_dump(mode="json"),
+                "attempts": [item.model_dump(mode="json") for item in attempts],
+            },
         )
 
     async def terminate_app(self, package: str) -> None:

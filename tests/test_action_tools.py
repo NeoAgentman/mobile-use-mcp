@@ -2,7 +2,8 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from mobile_use_mcp.models import Bounds, ForegroundApp, Target
+from mobile_use_mcp.errors import ErrorCode, MobileUseError
+from mobile_use_mcp.models import AppLaunchAttempt, AppLaunchResult, Bounds, ForegroundApp, Target
 from mobile_use_mcp.server import (
     android_launch_app,
     android_open_url,
@@ -30,7 +31,20 @@ def controller(monkeypatch: pytest.MonkeyPatch) -> Mock:
     fake.type_text = AsyncMock(return_value="uiautomator2")
     fake.clear_text = AsyncMock(return_value="uiautomator2")
     fake.press_key = AsyncMock()
-    fake.launch_app = AsyncMock(return_value=ForegroundApp(package="com.example", activity=".Main"))
+    foreground = ForegroundApp(package="com.example", activity=".Main")
+    fake.launch_app = AsyncMock(
+        return_value=AppLaunchResult(
+            foreground_app=foreground,
+            attempts=[
+                AppLaunchAttempt(
+                    attempt=1,
+                    outcome="ready",
+                    polls=1,
+                    foreground_app=foreground,
+                )
+            ],
+        )
+    )
     fake.open_url = AsyncMock()
     monkeypatch.setattr(session, "require_controller", lambda: fake)
     return fake
@@ -84,6 +98,22 @@ async def test_key_app_and_url_tools(controller: Mock) -> None:
 
     assert key_result["success"] is True
     assert app_result["data"]["foreground_app"]["package"] == "com.example"  # type: ignore[index]
+    assert app_result["data"]["attempts"][0]["outcome"] == "ready"  # type: ignore[index]
     assert url_result["success"] is True
     controller.press_key.assert_awaited_once_with("home")
     controller.open_url.assert_awaited_once_with("https://example.com")
+
+
+async def test_launch_app_returns_diagnostic_failure(controller: Mock) -> None:
+    controller.launch_app.side_effect = MobileUseError(
+        ErrorCode.TIMEOUT,
+        "launch timed out",
+        "inspect the screen",
+        data={"attempts": [{"outcome": "blocked_by_other_app"}]},
+    )
+
+    result = await android_launch_app("com.example")
+
+    assert result["success"] is False
+    assert result["error_code"] == "TIMEOUT"
+    assert result["data"]["attempts"][0]["outcome"] == "blocked_by_other_app"  # type: ignore[index]

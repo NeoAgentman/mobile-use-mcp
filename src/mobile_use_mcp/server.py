@@ -43,6 +43,7 @@ def _failure(error: MobileUseError) -> OperationResult:
         error_code=error.code,
         message=error.message,
         suggestion=error.suggestion,
+        data=error.data,
     )
 
 
@@ -544,7 +545,7 @@ async def android_launch_app(
 
     try:
         async with session.write_lock:
-            foreground = await session.require_controller().launch_app(package)
+            launch = await session.require_controller().launch_app(package)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -552,7 +553,7 @@ async def android_launch_app(
     return OperationResult(
         success=True,
         message=f"Launched Android app {package!r}.",
-        data={"foreground_app": foreground.model_dump(mode="json")},
+        data=launch.model_dump(mode="json"),
     ).model_dump(mode="json")
 
 

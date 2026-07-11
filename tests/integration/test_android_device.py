@@ -52,7 +52,7 @@ async def test_launch_settings_and_basic_navigation(
         retries=2,
         timeout_seconds=10,
     )
-    assert foreground.package == "com.android.settings"
+    assert foreground.foreground_app.package == "com.android.settings"
 
     snapshot = await android_controller.snapshot(interactive_only=True)
     center_x = snapshot.width // 2

@@ -1,6 +1,7 @@
 """Stable error types returned by the MCP tools."""
 
 from enum import StrEnum
+from typing import Any
 
 
 class ErrorCode(StrEnum):
@@ -23,8 +24,15 @@ class ErrorCode(StrEnum):
 class MobileUseError(Exception):
     """Expected operational failure safe to expose to an MCP client."""
 
-    def __init__(self, code: ErrorCode, message: str, suggestion: str | None = None):
+    def __init__(
+        self,
+        code: ErrorCode,
+        message: str,
+        suggestion: str | None = None,
+        data: dict[str, Any] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.suggestion = suggestion
+        self.data = data or {}

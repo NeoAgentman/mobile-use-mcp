@@ -87,6 +87,18 @@ class ForegroundApp(StrictModel):
     activity: str | None = None
 
 
+class AppLaunchAttempt(StrictModel):
+    attempt: int = Field(ge=1)
+    outcome: str
+    polls: int = Field(ge=0)
+    foreground_app: ForegroundApp
+
+
+class AppLaunchResult(StrictModel):
+    foreground_app: ForegroundApp
+    attempts: list[AppLaunchAttempt]
+
+
 class ScreenSnapshot(StrictModel):
     serial: str
     width: int = Field(gt=0)

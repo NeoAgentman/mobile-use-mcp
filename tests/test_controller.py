@@ -143,9 +143,32 @@ async def test_key_url_and_app_operations(
     await service.open_url("https://example.com")
 
     assert adb.keys == ["HOME"]
-    assert foreground.package == "org.demo"
+    assert foreground.foreground_app.package == "org.demo"
+    assert foreground.attempts[0].outcome == "ready"
     assert adb.stopped == ["org.demo"]
     assert adb.urls == ["https://example.com"]
+
+
+async def test_launch_app_reports_blocking_foreground() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+    adb_device.app_start = lambda package_name, activity=None: None  # type: ignore[method-assign]
+    adb_device.current = FakeRunningApp(package="com.android.permissioncontroller")
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    with pytest.raises(MobileUseError) as caught:
+        await service.launch_app("org.demo", retries=1, timeout_seconds=0.1)
+
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert caught.value.data["last_foreground_app"] == {
+        "package": "com.android.permissioncontroller",
+        "activity": ".MainActivity",
+    }
+    assert caught.value.data["attempts"][0]["outcome"] == "blocked_by_other_app"  # type: ignore[index]
 
 
 async def test_invalid_url_is_rejected(
