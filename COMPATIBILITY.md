@@ -46,3 +46,5 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 - App launch results include structured attempt and foreground-blocker diagnostics.
 - Bounded recording, segment rollover, stop, transfer, missing-ffmpeg fallback, and disconnect
   cleanup are covered by non-device tests. Real-device recording remains an opt-in verification.
+- The verified HUAWEI P20 HarmonyOS build does not include Android's `screenrecord` binary; the
+  MCP returns structured `UNSUPPORTED` instead of repeatedly restarting a failed process.

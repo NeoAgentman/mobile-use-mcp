@@ -19,6 +19,7 @@ class ErrorCode(StrEnum):
     INVALID_COORDINATES = "INVALID_COORDINATES"
     OPERATION_FAILED = "OPERATION_FAILED"
     TIMEOUT = "TIMEOUT"
+    UNSUPPORTED = "UNSUPPORTED"
 
 
 class MobileUseError(Exception):

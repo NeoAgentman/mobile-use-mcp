@@ -1,6 +1,8 @@
 """Opt-in tests that require an explicitly selected Android device."""
 
+import asyncio
 import os
+import shutil
 import sys
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -14,6 +16,7 @@ from mcp.types import ImageContent
 
 from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.devices import DeviceRegistry
+from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import Target
 
 pytestmark = pytest.mark.android
@@ -95,6 +98,25 @@ async def test_unicode_text_input_and_clear(android_controller: AndroidControlle
         await android_controller.press_key("home")
 
 
+async def test_real_screen_recording(android_controller: AndroidController) -> None:
+    try:
+        await android_controller.start_recording(max_duration_seconds=10, bit_rate=2_000_000)
+    except MobileUseError as error:
+        if error.code == ErrorCode.UNSUPPORTED:
+            pytest.skip("This Android build does not provide screenrecord")
+        raise
+    await asyncio.sleep(2)
+    result = await android_controller.stop_recording()
+
+    recording_path = Path(str(result["recording_path"]))
+    try:
+        assert recording_path.exists()
+        assert recording_path.stat().st_size > 0
+        assert result["segment_count"] == 1
+    finally:
+        shutil.rmtree(recording_path.parent, ignore_errors=True)
+
+
 async def test_stdio_mcp_on_real_device() -> None:
     serial = os.environ["MOBILE_USE_ANDROID_SERIAL"]
     project_root = Path(__file__).resolve().parents[2]
@@ -117,7 +139,12 @@ async def test_stdio_mcp_on_real_device() -> None:
         try:
             snapshot = await client.call_tool(
                 "android_snapshot",
-                {"max_elements": 200},
+                {
+                    "max_elements": 200,
+                    "image_format": "jpeg",
+                    "image_quality": 60,
+                    "max_width": 540,
+                },
                 read_timeout_seconds=timedelta(seconds=30),
             )
             launched = await client.call_tool(
@@ -140,8 +167,11 @@ async def test_stdio_mcp_on_real_device() -> None:
     assert connected.structuredContent["success"] is True
     assert snapshot.structuredContent is not None
     assert snapshot.structuredContent["serial"] == serial
+    assert snapshot.structuredContent["image_format"] == "jpeg"
+    assert snapshot.structuredContent["image_width"] == 540
     assert snapshot.structuredContent["element_count"] > 0
-    assert any(isinstance(content, ImageContent) for content in snapshot.content)
+    image = next(content for content in snapshot.content if isinstance(content, ImageContent))
+    assert image.mimeType == "image/jpeg"
     assert launched.structuredContent is not None
     assert launched.structuredContent["data"]["foreground_app"]["package"] == (
         "com.android.settings"

@@ -49,6 +49,8 @@ class FakeADB:
         rstrip: bool = True,
     ) -> str:
         self.shell_calls.append(cmdargs)
+        if cmdargs == ["command", "-v", "screenrecord"]:
+            return "/system/bin/screenrecord"
         return ""
 
 
@@ -72,7 +74,7 @@ async def test_recording_start_and_stop_returns_local_segment() -> None:
     assert process.terminated
     assert stopped["segment_count"] == 1
     assert Path(str(stopped["recording_path"])).read_bytes() == b"mp4-data"
-    assert adb.shell_calls[0][:2] == ["rm", "-f"]
+    assert adb.shell_calls[-1][:2] == ["rm", "-f"]
 
 
 async def test_recording_rejects_duplicate_start_and_missing_stop() -> None:
@@ -108,7 +110,18 @@ async def test_abort_terminates_process_and_removes_device_file() -> None:
     await asyncio.sleep(0)
 
     assert process.terminated
-    assert adb.shell_calls[0][:2] == ["rm", "-f"]
+    assert adb.shell_calls[-1][:2] == ["rm", "-f"]
+
+
+async def test_recording_reports_unsupported_device() -> None:
+    adb = FakeADB()
+    adb.shell = lambda *args, **kwargs: ""  # type: ignore[method-assign]
+    manager = RecordingManager("ABC", adb)
+
+    with pytest.raises(MobileUseError) as caught:
+        await manager.start(60)
+
+    assert caught.value.code == ErrorCode.UNSUPPORTED
 
 
 async def test_recording_rolls_over_and_returns_segments_without_ffmpeg(

@@ -118,6 +118,18 @@ class RecordingManager:
                 "An Android screen recording is already active.",
                 "Call android_stop_recording before starting another recording.",
             )
+        availability = await asyncio.to_thread(
+            self.adb_device.shell,
+            ["command", "-v", "screenrecord"],
+        )
+        if not isinstance(availability, str) or "screenrecord" not in availability:
+            raise MobileUseError(
+                ErrorCode.UNSUPPORTED,
+                "This Android device does not provide the built-in screenrecord command.",
+                "Use screenshots for observation or connect a device whose Android build "
+                "includes screenrecord.",
+                data={"serial": self.serial},
+            )
         self._directory = Path(tempfile.mkdtemp(prefix="mobile-use-mcp-recording-"))
         self._segments = []
         self._errors = []

@@ -233,6 +233,7 @@ Stable error codes include:
 - `INVALID_COORDINATES`
 - `OPERATION_FAILED`
 - `TIMEOUT`
+- `UNSUPPORTED`
 
 ## Development and verification
 
