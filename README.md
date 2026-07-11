@@ -10,7 +10,7 @@ and UI elements, plans actions, and calls MCP tools directly.
 
 - Discover, select, and disconnect Android physical devices and emulators
 - Return screenshots as native MCP image content
-- Downscale screenshots and encode them as PNG or quality-controlled JPEG
+- Encode original-resolution screenshots as PNG or quality-controlled JPEG
 - Return a compact UIAutomator accessibility hierarchy
 - Tap or long press using bounds, resource ID, or text fallbacks
 - Swipe using validated screen coordinates
@@ -156,8 +156,11 @@ and report the device model. Observe the screen again after every action.
 `total_elements`, `returned_elements`, `truncated`, and `next_offset`; no truncation is silent.
 Use `detail_level="full"` for an explicit full normalized hierarchy fallback. It also supports
 `interactive_only`, `max_elements`, and `max_text_length`. It and `android_screenshot` support
-`image_format`, `image_quality`, and `max_width`. Device dimensions and encoded image dimensions
-are returned separately. Screenshot base64 is not duplicated in structured JSON.
+`image_format` and `image_quality`. Screenshots always keep the original device resolution. The
+default is JPEG quality 60; use `image_format="png"` when small text, tables, icons, or other visual
+details require the original lossless image. Every JPEG response includes a `quality_notice` and
+machine-readable `lossless_fallback` with the exact PNG retry arguments. Screenshot base64 is not
+duplicated in structured JSON.
 
 Use `android_get_ui_elements` with the returned `snapshot_id` to page the exact same hierarchy.
 It supports `offset`, `limit`, a case-insensitive `query` across text, content description,
@@ -302,6 +305,8 @@ device verification results.
   scrolling. Only the latest `snapshot_id` can be paged, and state-changing operations invalidate
   it deliberately.
 - `detail_level="full"` can produce a large tool result. Prefer pagination and query first.
+- Screenshots always use the phone's original resolution. JPEG is lossy by default; retry with PNG
+  when the returned quality notice indicates that visual detail may be insufficient.
 - `android_type_text` and `android_clear_text` accept an optional target. Without one, they operate
   on the currently focused field.
 - App discovery currently returns package names rather than localized display names.

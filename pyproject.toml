@@ -1,6 +1,6 @@
 [project]
 name = "mobile-use-mcp"
-version = "0.3.0"
+version = "0.3.1"
 description = "MCP server that lets coding agents observe and operate Android devices."
 readme = "README.md"
 requires-python = ">=3.12"

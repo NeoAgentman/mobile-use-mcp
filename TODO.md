@@ -261,8 +261,9 @@ mobile-use-mcp/
 
 ## Post-MVP P1：观察、启动诊断与录屏
 
-- [x] snapshot/screenshot 支持 PNG、JPEG、质量参数和等比例缩放
-- [x] 同时返回设备原始尺寸和实际 MCP 图像尺寸
+- [x] snapshot/screenshot 支持原始分辨率 PNG、JPEG 和 JPEG 质量参数
+- [x] 默认使用原始分辨率 JPEG 60，不提供缩放参数
+- [x] JPEG 返回明确的原始无损 PNG 升级提示和机器可读 fallback
 - [x] App 启动返回逐次 attempt、poll 数量和最终前台 App
 - [x] 区分持续加载与被其他前台 App 阻塞
 - [x] 有界 Android `screenrecord` 启停工具

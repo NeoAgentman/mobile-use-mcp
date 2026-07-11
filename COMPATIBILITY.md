@@ -42,7 +42,7 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 
 ## Version 0.2 additions
 
-- PNG/JPEG screenshot encoding and proportional downscaling are covered by unit and MCP tool tests.
+- PNG/JPEG screenshot encoding was introduced here; optional resizing was later removed in 0.3.1.
 - App launch results include structured attempt and foreground-blocker diagnostics.
 - Bounded recording, segment rollover, stop, transfer, missing-ffmpeg fallback, and disconnect
   cleanup are covered by non-device tests. Real-device recording remains an opt-in verification.
@@ -57,3 +57,11 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
   interactive-only filtering against the same cached snapshot.
 - State-changing operations invalidate cached IDs and stale reads return `SNAPSHOT_NOT_FOUND`.
 - The complete stdio snapshot-to-pagination flow passed on the verified HUAWEI P20 device.
+
+## Version 0.3.1 screenshot defaults
+
+- Snapshot and screenshot tools always preserve the physical device resolution.
+- The default image is JPEG quality 60; lossless PNG remains an explicit retry option.
+- JPEG responses expose both a human-readable quality notice and machine-readable PNG fallback.
+- MCP schemas no longer expose a screenshot resizing parameter.
+- The default original-resolution JPEG and PNG fallback metadata passed real-device stdio testing.
