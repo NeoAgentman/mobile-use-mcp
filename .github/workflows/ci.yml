@@ -15,10 +15,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
 
@@ -45,4 +45,3 @@ jobs:
           npx -y @modelcontextprotocol/inspector --cli
           uv --directory "$GITHUB_WORKSPACE" run mobile-use-mcp
           --method tools/list
-
