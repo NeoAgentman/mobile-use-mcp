@@ -11,7 +11,7 @@ and UI elements, plans actions, and calls MCP tools directly.
 - Discover, select, and disconnect Android physical devices and emulators
 - Return screenshots as native MCP image content
 - Encode original-resolution screenshots as PNG or quality-controlled JPEG
-- Return a compact UIAutomator accessibility hierarchy
+- Return compact or full UIAutomator accessibility hierarchies with query and pagination
 - Tap or long press using bounds, resource ID, or text fallbacks
 - Swipe using validated screen coordinates
 - Type and clear text in the focused field
@@ -36,6 +36,12 @@ The initial release intentionally excludes:
 The server never automatically uninstalls software from the connected device. Screenshots and UI
 text can contain sensitive information and are returned to the host agent, so use a trusted agent
 and model environment.
+
+The MCP initialize response includes service instructions that tell compatible host agents to use
+these tools for natural-language requests involving a physical Android phone or mobile App, such
+as opening an App, browsing content, reading comments, collecting visible data, tapping, swiping,
+typing, screenshots, and screen recording. Users normally should not need to name `mobile-use` or
+ADB explicitly, although tool selection ultimately remains under the host agent's control.
 
 ## Requirements
 
@@ -124,6 +130,9 @@ Use `--scope project` instead if the configuration should only apply to one proj
 6. Call `android_snapshot` again to verify the resulting state.
 7. If an action fails, use the returned selector attempts and refresh the snapshot.
 
+`android_wait` is only a fixed delay. It does not wait for a condition or inspect whether an
+element appeared, and it invalidates the cached snapshot. Always observe again afterward.
+
 Example instruction for the host agent:
 
 ```text
@@ -152,19 +161,28 @@ and report the device model. Observe the screen again after every action.
 | `android_get_foreground_app` | Current package and activity |
 | `android_list_apps` | Filter third-party package names |
 
-`android_snapshot` defaults to `detail_level="compact"` and reports `snapshot_id`,
-`total_elements`, `returned_elements`, `truncated`, and `next_offset`; no truncation is silent.
-Use `detail_level="full"` for an explicit full normalized hierarchy fallback. It also supports
-`interactive_only`, `max_elements`, and `max_text_length`. It and `android_screenshot` support
-`image_format` and `image_quality`. Screenshots always keep the original device resolution. The
-default is JPEG quality 60; use `image_format="png"` when small text, tables, icons, or other visual
-details require the original lossless image. Every JPEG response includes a `quality_notice` and
-machine-readable `lossless_fallback` with the exact PNG retry arguments. Screenshot base64 is not
-duplicated in structured JSON.
+`android_snapshot` defaults to `detail_level="compact"`, returns at most 200 elements, and reports
+`snapshot_id`, `total_elements`, `returned_elements`, `truncated`, and `next_offset`; no truncation
+is silent. The default `max_text_length=500` is applied separately to each node's text and content
+description, including in full mode. Increase it up to 2000 when reading long-form content.
+
+When `truncated=true`, first query or page the same snapshot with `android_get_ui_elements`; use
+`detail_level="full"` only as an explicit large-output fallback. `interactive_only=true` keeps only
+clickable, focusable, or scrollable nodes, so leave it false when reading static content such as
+articles, product descriptions, prices, tables, or comments.
+
+`android_snapshot` and `android_screenshot` support `image_format` and `image_quality`.
+Screenshots always keep the original device resolution. The default is JPEG quality 60; use
+`image_format="png"` when small text, tables, icons, or other visual details require the original
+lossless image. Every JPEG response includes a `quality_notice` and machine-readable
+`lossless_fallback` with the exact PNG retry arguments. Screenshot base64 is not duplicated in
+structured JSON. Use `android_snapshot` when UI text or targets are needed; use
+`android_screenshot` for visual-only inspection without a pageable hierarchy.
 
 Use `android_get_ui_elements` with the returned `snapshot_id` to page the exact same hierarchy.
-It supports `offset`, `limit`, a case-insensitive `query` across text, content description,
-resource ID, class, and package, plus exact package and interactive-only filters:
+Its default page size is 100. It supports `offset`, `limit`, a case-insensitive `query` across
+text, content description, resource ID, class, and package, plus exact package and interactive-only
+filters. Filters are applied before pagination; reset `offset` to zero when changing a filter:
 
 ```json
 {
@@ -194,7 +212,7 @@ it; an expired ID returns `SNAPSHOT_NOT_FOUND` and instructs the agent to observ
 | `android_open_url` | Open an HTTP or HTTPS URL |
 | `android_start_recording` | Start a bounded screen recording with automatic segment rollover |
 | `android_stop_recording` | Stop, pull, and optionally merge recording segments |
-| `android_wait` | Wait for a bounded delay before observing again |
+| `android_wait` | Sleep for a bounded fixed delay and invalidate the cached snapshot |
 
 `android_launch_app` reports every launch attempt, polling count, and the last foreground App. A
 permission controller, chooser, or other foreground blocker is reported separately from an App
@@ -226,6 +244,12 @@ The server tries selectors in this order:
 2. Resource ID and occurrence index
 3. Exact case-insensitive text/content description and occurrence index
 
+`Target` does not accept `content_description`, `class_name`, or `package` fields. To act on a
+snapshot node whose accessible label is in `content_description`, pass that value through the
+target's `text` field. `class_name` and `package` are available as query filters through
+`android_get_ui_elements`, not as action selectors. Bounds use original device pixels and become
+stale after the UI changes.
+
 Failure responses include every attempted selector and recommend taking a fresh snapshot.
 
 ## Error model
@@ -251,6 +275,7 @@ Stable error codes include:
 - `DEVICE_DISCONNECTED`
 - `MULTIPLE_DEVICES`
 - `NOT_CONNECTED`
+- `INVALID_TARGET`
 - `ELEMENT_NOT_FOUND`
 - `INVALID_COORDINATES`
 - `OPERATION_FAILED`
@@ -305,11 +330,16 @@ device verification results.
   scrolling. Only the latest `snapshot_id` can be paged, and state-changing operations invalidate
   it deliberately.
 - `detail_level="full"` can produce a large tool result. Prefer pagination and query first.
+- `max_text_length` is a per-node limit, not a total response budget; full mode does not disable it.
+- `interactive_only=true` intentionally hides most static text nodes and should not be used for
+  long-form reading or content extraction.
 - Screenshots always use the phone's original resolution. JPEG is lossy by default; retry with PNG
   when the returned quality notice indicates that visual detail may be insufficient.
 - `android_type_text` and `android_clear_text` accept an optional target. Without one, they operate
   on the currently focused field.
 - App discovery currently returns package names rather than localized display names.
+- Screenshot tools return visible pixels as MCP image content; they do not extract or download an
+  App's original remote media file.
 - Physical-device and emulator compatibility still requires validation across Android versions,
   OEM ROMs, and input methods.
 

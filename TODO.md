@@ -18,7 +18,7 @@
 - [x] 不包含 iOS、IDB、WDA
 - [x] 默认不暴露任意 `adb shell`
 
-## 目标目录结构
+## 当前目录结构
 
 ```text
 mobile-use-mcp/
@@ -35,14 +35,13 @@ mobile-use-mcp/
 │   ├── errors.py
 │   ├── android_client.py
 │   ├── controller.py
+│   ├── devices.py
 │   ├── snapshot.py
 │   ├── selectors.py
-│   └── tools/
-│       ├── device.py
-│       ├── observe.py
-│       └── actions.py
+│   ├── images.py
+│   └── recording.py
 └── tests/
-    ├── unit/
+    ├── test_*.py
     └── integration/
 ```
 
@@ -52,7 +51,7 @@ mobile-use-mcp/
 
 - [x] 在研究目录下创建独立 `mobile-use-mcp/` 项目
 - [x] 使用 Python 3.12+ 和官方 Python MCP SDK/FastMCP
-- [x] 配置最小依赖：`mcp`、`adbutils`、`uiautomator2`、`pydantic`、`pillow`
+- [x] 配置锁定依赖：`mcp`、`adbutils`、`apkutils`、`uiautomator2`、`pydantic`、`pillow`
 - [x] 配置 Ruff、Pyright 和 Pytest
 - [x] 从上游复制 Apache 2.0 `LICENSE`、`NOTICE`，保留来源和修改说明
 - [x] 确保 MCP 日志只写 stderr，不污染 stdio JSON-RPC
@@ -80,7 +79,7 @@ mobile-use-mcp/
 ### UI 数据
 
 - [x] 复用 screenshot + hierarchy 联合读取
-- [x] 统一 UI element 字段：text、content description、resource ID、class、bounds、clickable、enabled、focused、selected
+- [x] 统一 UI element 字段：text、content description、resource ID、class、package、bounds、clickable、enabled、focusable、focused、scrollable、selected、checked
 - [x] 将 bounds 标准化为 `{x, y, width, height}`
 - [x] 过滤不可见、无内容且无交互意义的节点
 - [x] 设置最大节点数和最大文本长度，防止 MCP 输出失控
@@ -150,7 +149,7 @@ mobile-use-mcp/
 ### 工具语义
 
 - [x] 所有工具使用 `android_` 前缀
-- [x] 所有工具返回结构化 `success`、`error_code`、`message` 和必要数据
+- [x] 所有工具返回结构化 `success` 和必要数据；操作失败返回 `error_code`、`message`、`suggestion`
 - [x] 操作失败时建议重新调用 `android_snapshot`
 - [x] 标记只读、写入、幂等和破坏性 hints
 - [x] 单个 session 内写操作串行化，防止同时点击/输入
@@ -282,6 +281,16 @@ mobile-use-mcp/
 - [x] 页面状态改变后使旧 snapshot 失效
 - [x] stale snapshot 返回结构化 `SNAPSHOT_NOT_FOUND`
 - [x] 真机 stdio MCP snapshot 到分页链路验证
+
+## Post-MVP：Agent 可发现性与调用提示
+
+- [x] MCP initialize 返回服务级 instructions
+- [x] 覆盖“手机、手机 App、打开 App、浏览内容、查看评论、采集数据”等业务触发语义
+- [x] 关键入口工具描述覆盖移动端浏览、内容读取与 App 启动场景
+- [x] Target Schema 明确 bounds、resource ID、text 和 content description 映射
+- [x] snapshot Schema 明确 compact/full、分页优先、逐节点文本限制和 interactive-only 语义
+- [x] screenshot 响应明确原始无损 PNG 升级路径
+- [x] stdio 端测验证服务 instructions 和关键参数说明真实暴露给宿主
 - [x] README：截图和敏感数据说明
 - [x] README：已知限制
 - [x] 生成源码复用与修改说明
@@ -297,7 +306,7 @@ mobile-use-mcp/
 - [ ] `android_wait_for_ui_change`
 - [ ] UI diff
 - [ ] 多设备并行 session
-- [ ] 视频录制
+- [ ] 录屏实时预览或流式传输（有界本地录制和分段合并已实现）
 - [ ] Logcat
 - [ ] APK 安装与管理
 - [ ] 可选受限 ADB shell

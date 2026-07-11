@@ -65,3 +65,21 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 - JPEG responses expose both a human-readable quality notice and machine-readable PNG fallback.
 - MCP schemas no longer expose a screenshot resizing parameter.
 - The default original-resolution JPEG and PNG fallback metadata passed real-device stdio testing.
+
+## Current main after 0.3.1
+
+- MCP initialize now exposes service-level instructions for natural-language Android/mobile-App
+  requests, including Chinese phrases such as `手机 App`, `打开某个 App`, `查看评论`, and
+  `采集页面数据`.
+- Snapshot and action schemas describe compact/full selection, pagination-first fallback,
+  per-node text limits, interactive-only filtering, Target field mapping, fixed-delay waits, and
+  post-action observation requirements.
+- Stdio tests verify that the service instructions and key schema descriptions are delivered to an
+  MCP client rather than existing only in README documentation.
+- A Codex subagent completed a real Idle Fish (`闲鱼`) workflow using compact snapshots: search for
+  `校招`, open the first three results, and extract their descriptions. It did not use full mode or
+  reuse stale snapshot IDs. Schema validation rejected two invalid arguments and the agent recovered
+  by correcting them.
+- App discovery still searches third-party package names rather than localized launcher labels.
+- Screenshot tools provide visible pixels as MCP image content; downloading an App's original
+  remote image asset is not currently a supported capability.
