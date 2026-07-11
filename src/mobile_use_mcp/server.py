@@ -14,7 +14,15 @@ from mobile_use_mcp.images import encode_screenshot
 from mobile_use_mcp.models import OperationResult, Target, UIElement
 from mobile_use_mcp.session import SessionManager
 
-mcp = FastMCP("mobile_use_mcp")
+MCP_INSTRUCTIONS = """Use this MCP whenever the user asks to interact with a physical Android
+phone or an installed mobile app. This includes requests phrased as 手机, 安卓手机, 手机 App,
+打开某个 App, 浏览或阅读 App 内容, 查看评论, 采集页面数据, 输入文字, 点击, 滑动, 截图, or
+screen recording. Connect the device, resolve the installed package with android_list_apps when
+possible, and compose snapshot/tap/swipe/input tools for multi-step mobile workflows.
+Observe again after actions. The tools operate Android only, not iOS. Screenshots capture visible
+pixels but do not download an app's original remote media file unless another tool provides it."""
+
+mcp = FastMCP("mobile_use_mcp", instructions=MCP_INSTRUCTIONS)
 session = SessionManager()
 
 READ_ONLY = ToolAnnotations(
@@ -236,12 +244,13 @@ async def android_snapshot(
         Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
     ] = 60,
 ) -> CallToolResult:
-    """Observe the current screen with an original-resolution image and normalized UI nodes.
+    """Read visible content from the current Android app and capture its screen.
 
-    Defaults to compact mode with at most 200 nodes. A truncated result includes snapshot_id and
-    next_offset: prefer android_get_ui_elements on that unchanged snapshot for filtering or
-    pagination, and use full only when focused retrieval is insufficient. Any action, wait,
-    reconnect, or disconnect invalidates the cached snapshot.
+    Use this for mobile browsing and data collection such as titles, counts, descriptions, lists,
+    comments, buttons, and form fields. Defaults to compact mode with at most 200 nodes. A truncated
+    result includes snapshot_id and next_offset: prefer android_get_ui_elements on that unchanged
+    snapshot for filtering or pagination, and use full only when focused retrieval is insufficient.
+    Any action, wait, reconnect, or disconnect invalidates the cached snapshot.
     """
 
     if not 1 <= max_elements <= 500:
@@ -817,7 +826,12 @@ async def android_launch_app(
         ),
     ],
 ) -> dict[str, Any]:
-    """Launch an installed package and wait until it reaches the foreground."""
+    """Open an installed Android mobile App and wait until it reaches the foreground.
+
+    Use this for requests such as 打开手机上的小红书 or open the shopping App. This tool requires an
+    exact package; use android_list_apps with a known package fragment when package discovery is
+    needed.
+    """
 
     try:
         async with session.write_lock:

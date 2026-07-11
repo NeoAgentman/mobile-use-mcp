@@ -26,6 +26,8 @@ async def test_stdio_server_initialize_list_and_call() -> None:
         )
 
     assert initialized.serverInfo.name == "mobile_use_mcp"
+    assert initialized.instructions is not None
+    assert "手机 App" in initialized.instructions
     assert "android_snapshot" in {tool.name for tool in tools.tools}
     snapshot_tool = next(tool for tool in tools.tools if tool.name == "android_snapshot")
     screenshot_tool = next(tool for tool in tools.tools if tool.name == "android_screenshot")
