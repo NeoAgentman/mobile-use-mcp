@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
@@ -10,6 +10,7 @@ from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
 from mobile_use_mcp.errors import MobileUseError
+from mobile_use_mcp.images import encode_screenshot
 from mobile_use_mcp.models import OperationResult, Target
 from mobile_use_mcp.session import SessionManager
 
@@ -149,13 +150,20 @@ async def android_snapshot(
     interactive_only: bool = False,
     max_elements: int = 200,
     max_text_length: int = 500,
+    image_format: Literal["png", "jpeg"] = "png",
+    image_quality: int = 80,
+    max_width: int | None = None,
 ) -> CallToolResult:
-    """Return the current screenshot, compact UI elements, dimensions, and foreground app."""
+    """Return a configurable screenshot, compact UI elements, dimensions, and foreground app."""
 
     if not 1 <= max_elements <= 500:
         raise ValueError("max_elements must be between 1 and 500")
     if not 1 <= max_text_length <= 2_000:
         raise ValueError("max_text_length must be between 1 and 2000")
+    if not 1 <= image_quality <= 100:
+        raise ValueError("image_quality must be between 1 and 100")
+    if max_width is not None and not 240 <= max_width <= 4_096:
+        raise ValueError("max_width must be between 240 and 4096")
     try:
         controller = session.require_controller()
         snapshot = await controller.snapshot(
@@ -183,11 +191,20 @@ async def android_snapshot(
             structuredContent=failure,
         )
 
+    image_data, image_width, image_height = encode_screenshot(
+        snapshot.screenshot_png,
+        image_format=image_format,
+        image_quality=image_quality,
+        max_width=max_width,
+    )
     metadata = {
         "success": True,
         "serial": snapshot.serial,
         "width": snapshot.width,
         "height": snapshot.height,
+        "image_format": image_format,
+        "image_width": image_width,
+        "image_height": image_height,
         "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
         "element_count": len(snapshot.elements),
         "elements": [element.model_dump(mode="json") for element in snapshot.elements],
@@ -195,7 +212,7 @@ async def android_snapshot(
     return CallToolResult(
         content=[
             TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
-            Image(data=snapshot.screenshot_png, format="png").to_image_content(),
+            Image(data=image_data, format=image_format).to_image_content(),
         ],
         structuredContent=metadata,
     )
@@ -206,8 +223,17 @@ async def android_snapshot(
     title="Capture Android screenshot",
     annotations=READ_ONLY,
 )
-async def android_screenshot() -> CallToolResult:
-    """Return only the current Android screenshot and basic screen metadata."""
+async def android_screenshot(
+    image_format: Literal["png", "jpeg"] = "png",
+    image_quality: int = 80,
+    max_width: int | None = None,
+) -> CallToolResult:
+    """Return a configurable Android screenshot and basic screen metadata."""
+
+    if not 1 <= image_quality <= 100:
+        raise ValueError("image_quality must be between 1 and 100")
+    if max_width is not None and not 240 <= max_width <= 4_096:
+        raise ValueError("max_width must be between 240 and 4096")
 
     try:
         snapshot = await session.require_controller().snapshot(
@@ -229,17 +255,26 @@ async def android_screenshot() -> CallToolResult:
             content=[TextContent(type="text", text=json.dumps(failure))],
             structuredContent=failure,
         )
+    image_data, image_width, image_height = encode_screenshot(
+        snapshot.screenshot_png,
+        image_format=image_format,
+        image_quality=image_quality,
+        max_width=max_width,
+    )
     metadata = {
         "success": True,
         "serial": snapshot.serial,
         "width": snapshot.width,
         "height": snapshot.height,
+        "image_format": image_format,
+        "image_width": image_width,
+        "image_height": image_height,
         "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
     }
     return CallToolResult(
         content=[
             TextContent(type="text", text=json.dumps(metadata)),
-            Image(data=snapshot.screenshot_png, format="png").to_image_content(),
+            Image(data=image_data, format=image_format).to_image_content(),
         ],
         structuredContent=metadata,
     )

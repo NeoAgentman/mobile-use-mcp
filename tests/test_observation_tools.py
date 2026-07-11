@@ -1,7 +1,9 @@
+from io import BytesIO
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 from mcp.types import ImageContent
+from PIL import Image
 
 from mobile_use_mcp.models import (
     DeviceInfo,
@@ -73,13 +75,15 @@ async def test_connect_and_status(monkeypatch: pytest.MonkeyPatch) -> None:
 async def test_snapshot_returns_image_and_structured_ui(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    image = BytesIO()
+    Image.new("RGB", (1080, 2400)).save(image, format="PNG")
     controller = Mock()
     controller.snapshot = AsyncMock(
         return_value=ScreenSnapshot(
             serial="ABC",
             width=1080,
             height=2400,
-            screenshot_png=b"png-data",
+            screenshot_png=image.getvalue(),
             elements=[UIElement(text="Continue", clickable=True)],
             foreground_app=ForegroundApp(package="com.example", activity=".Main"),
         )
@@ -91,6 +95,32 @@ async def test_snapshot_returns_image_and_structured_ui(
     assert result.structuredContent is not None
     assert result.structuredContent["element_count"] == 1
     assert any(isinstance(content, ImageContent) for content in result.content)
+
+
+async def test_snapshot_supports_downscaled_jpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    image = BytesIO()
+    Image.new("RGB", (1080, 2400)).save(image, format="PNG")
+    controller = Mock()
+    controller.snapshot = AsyncMock(
+        return_value=ScreenSnapshot(
+            serial="ABC",
+            width=1080,
+            height=2400,
+            screenshot_png=image.getvalue(),
+            elements=[],
+            foreground_app=ForegroundApp(),
+        )
+    )
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    result = await android_snapshot(image_format="jpeg", image_quality=60, max_width=540)
+
+    assert result.structuredContent is not None
+    assert result.structuredContent["width"] == 1080
+    assert result.structuredContent["image_width"] == 540
+    assert result.structuredContent["image_height"] == 1200
+    image_content = next(item for item in result.content if isinstance(item, ImageContent))
+    assert image_content.mimeType == "image/jpeg"
 
 
 async def test_snapshot_hides_internal_exception(monkeypatch: pytest.MonkeyPatch) -> None:
