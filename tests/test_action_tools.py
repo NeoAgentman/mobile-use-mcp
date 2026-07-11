@@ -73,6 +73,7 @@ async def test_type_text_does_not_echo_sensitive_content(controller: Mock) -> No
     assert result["success"] is True
     assert secret not in str(result)
     assert result["data"]["character_count"] == 6  # type: ignore[index]
+    controller.type_text.assert_awaited_once_with(secret, None)
 
 
 async def test_key_app_and_url_tools(controller: Mock) -> None:

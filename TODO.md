@@ -95,8 +95,8 @@ mobile-use-mcp/
 
 ### 文本输入
 
-- [ ] 复用输入框 focus 检查
-- [ ] 点击后重新读取 hierarchy 验证 focused 状态
+- [x] 复用输入框 focus 检查
+- [x] 点击后重新读取 hierarchy 验证 focused 状态
 - [x] 优先使用 uiautomator2 输入
 - [x] 保留参数化 ADB 输入 fallback
 - [x] 支持删除指定字符数

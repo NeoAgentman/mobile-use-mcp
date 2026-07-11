@@ -10,6 +10,9 @@ from mobile_use_mcp.models import Target
 
 
 class FakeU2Device:
+    def __init__(self) -> None:
+        self.focused = False
+
     @property
     def info(self) -> dict[str, object]:
         return {}
@@ -18,9 +21,10 @@ class FakeU2Device:
         return Image.new("RGB", (1080, 2400), "white")
 
     def dump_hierarchy(self, compressed: bool = True) -> str:
-        return """<hierarchy><node text="Continue" resource-id="com.example:id/continue"
+        focused = str(self.focused).lower()
+        return f"""<hierarchy><node text="Continue" resource-id="com.example:id/continue"
         class="android.widget.Button" package="com.example" clickable="true" enabled="true"
-        focusable="true" focused="false" scrollable="false" selected="false"
+        focusable="true" focused="{focused}" scrollable="false" selected="false"
         checkable="false" checked="false" bounds="[20,100][300,180]" /></hierarchy>"""
 
     def press(self, key: str) -> bool:
@@ -40,7 +44,8 @@ class FakeRunningApp:
 
 
 class FakeADBDevice:
-    def __init__(self) -> None:
+    def __init__(self, u2_device: FakeU2Device | None = None) -> None:
+        self.u2_device = u2_device
         self.clicks: list[tuple[int, int]] = []
         self.swipes: list[tuple[int, int, int, int, float]] = []
         self.keys: list[str] = []
@@ -51,6 +56,8 @@ class FakeADBDevice:
 
     def click(self, x: int, y: int, display_id: int | None = None) -> None:
         self.clicks.append((x, y))
+        if self.u2_device is not None:
+            self.u2_device.focused = True
 
     def swipe(self, sx: int, sy: int, ex: int, ey: int, duration: float = 1.0) -> None:
         self.swipes.append((sx, sy, ex, ey, duration))
@@ -87,7 +94,7 @@ class FakeADBDevice:
 @pytest.fixture
 def controller() -> tuple[AndroidController, FakeADBDevice]:
     u2_device = FakeU2Device()
-    adb_device = FakeADBDevice()
+    adb_device = FakeADBDevice(u2_device)
     android_client = AndroidClient("serial", connector=lambda _: u2_device)
     return (
         AndroidController(
@@ -152,3 +159,17 @@ async def test_list_apps_filters_and_limits(
     service, _ = controller
 
     assert await service.list_apps(query="demo") == ["org.demo"]
+
+
+async def test_type_text_can_focus_and_verify_target(
+    controller: tuple[AndroidController, FakeADBDevice],
+) -> None:
+    service, adb = controller
+
+    method = await service.type_text(
+        "hello",
+        Target(resource_id="com.example:id/continue"),
+    )
+
+    assert method == "uiautomator2"
+    assert adb.clicks == [(160, 140)]

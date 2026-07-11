@@ -163,7 +163,44 @@ class AndroidController:
             duration_ms / 1_000,
         )
 
-    async def type_text(self, text: str) -> str:
+    async def focus(self, target: Target, timeout_seconds: float = 2) -> str:
+        """Tap a target and verify focus when it has a semantic selector."""
+
+        details = await self.tap(target)
+        if not target.resource_id and not target.text:
+            return str(details["selector"])
+
+        verification_target = Target(
+            resource_id=target.resource_id,
+            resource_id_index=target.resource_id_index,
+            text=target.text,
+            text_index=target.text_index,
+        )
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            snapshot = await self.snapshot()
+            try:
+                resolved = resolve_target(
+                    verification_target,
+                    snapshot.elements,
+                    screen_width=snapshot.width,
+                    screen_height=snapshot.height,
+                )
+            except MobileUseError:
+                await asyncio.sleep(0.1)
+                continue
+            if resolved.element and resolved.element.focused:
+                return resolved.selector
+            await asyncio.sleep(0.1)
+        raise MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "The requested Android input target did not become focused.",
+            "Call android_snapshot, verify the input element, and try a different selector.",
+        )
+
+    async def type_text(self, text: str, target: Target | None = None) -> str:
+        if target is not None:
+            await self.focus(target)
         try:
             await asyncio.to_thread(self.android_client.send_text, text)
             return "uiautomator2"
@@ -171,7 +208,9 @@ class AndroidController:
             await asyncio.to_thread(self.adb_device.shell, ["input", "text", text])
             return "adb"
 
-    async def clear_text(self, characters: int = 100) -> None:
+    async def clear_text(self, characters: int = 100, target: Target | None = None) -> None:
+        if target is not None:
+            await self.focus(target)
         for _ in range(characters):
             await asyncio.to_thread(self.adb_device.keyevent, "DEL")
 

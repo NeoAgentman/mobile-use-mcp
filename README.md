@@ -159,8 +159,8 @@ the structured JSON result.
 | `android_tap` | Tap using bounds, resource ID, or text fallbacks |
 | `android_long_press` | Long press a target |
 | `android_swipe` | Swipe between validated pixel coordinates |
-| `android_type_text` | Type into the focused field |
-| `android_clear_text` | Send bounded delete key events |
+| `android_type_text` | Optionally focus a target, then type text |
+| `android_clear_text` | Optionally focus a target, then send bounded delete events |
 | `android_press_key` | Press back/home/enter/delete/tab/menu/volume keys |
 | `android_launch_app` | Launch a package and poll until foreground |
 | `android_terminate_app` | Force-stop a package |
@@ -254,7 +254,8 @@ uv run pytest -m android
   actions can still be selected from the screenshot.
 - UI elements are snapshots, not stable DOM nodes. Observe again after navigation, animation, or
   scrolling.
-- `android_type_text` targets the currently focused field. Tap the desired field first.
+- `android_type_text` and `android_clear_text` accept an optional target. Without one, they operate
+  on the currently focused field.
 - App discovery currently returns package names rather than localized display names.
 - Physical-device and emulator compatibility still requires validation across Android versions,
   OEM ROMs, and input methods.
@@ -264,4 +265,3 @@ uv run pytest -m android
 Android controller and selector behavior is derived from
 [`minitap-ai/mobile-use`](https://github.com/minitap-ai/mobile-use), licensed under the Apache
 License 2.0. See `LICENSE` and `NOTICE` for attribution and license details.
-

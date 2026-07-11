@@ -431,12 +431,13 @@ async def android_swipe(
 )
 async def android_type_text(
     text: Annotated[str, Field(min_length=1, max_length=10_000)],
+    target: Target | None = None,
 ) -> dict[str, Any]:
-    """Type text into the currently focused Android input field."""
+    """Optionally focus a target, then type text into the focused Android field."""
 
     try:
         async with session.write_lock:
-            method = await session.require_controller().type_text(text)
+            method = await session.require_controller().type_text(text, target)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -456,12 +457,13 @@ async def android_type_text(
 )
 async def android_clear_text(
     max_characters: Annotated[int, Field(ge=1, le=2_000)] = 100,
+    target: Target | None = None,
 ) -> dict[str, Any]:
-    """Delete up to max_characters from the currently focused Android field."""
+    """Optionally focus a target, then delete bounded characters from the field."""
 
     try:
         async with session.write_lock:
-            await session.require_controller().clear_text(max_characters)
+            await session.require_controller().clear_text(max_characters, target)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
