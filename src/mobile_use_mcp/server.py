@@ -604,6 +604,58 @@ async def android_open_url(
 
 
 @mcp.tool(
+    name="android_start_recording",
+    title="Start Android screen recording",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_start_recording(
+    max_duration_seconds: Annotated[int, Field(ge=5, le=1_800)] = 300,
+    bit_rate: Annotated[int | None, Field(ge=100_000, le=100_000_000)] = None,
+) -> dict[str, Any]:
+    """Start a bounded Android screen recording that rolls over into safe segments."""
+
+    try:
+        async with session.write_lock:
+            details = await session.require_controller().start_recording(
+                max_duration_seconds,
+                bit_rate,
+            )
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("screen recording start")
+    return OperationResult(
+        success=True,
+        message="Android screen recording started.",
+        data=details,
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_stop_recording",
+    title="Stop Android screen recording",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_stop_recording() -> dict[str, Any]:
+    """Stop the active recording, pull its segments, and merge them when ffmpeg is available."""
+
+    try:
+        async with session.write_lock:
+            details = await session.require_controller().stop_recording()
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("screen recording stop")
+    return OperationResult(
+        success=True,
+        message="Android screen recording stopped.",
+        data=details,
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
     name="android_wait",
     title="Wait for Android UI",
     annotations=READ_ONLY,

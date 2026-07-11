@@ -16,6 +16,7 @@ from mobile_use_mcp.models import (
     ScreenSnapshot,
     Target,
 )
+from mobile_use_mcp.recording import RecordingADBDevice, RecordingManager
 from mobile_use_mcp.selectors import resolve_target
 from mobile_use_mcp.snapshot import parse_hierarchy
 
@@ -81,6 +82,7 @@ class AndroidController:
         self.serial = serial
         self.android_client = android_client or AndroidClient(serial)
         self.adb_device = adb_connector(serial)
+        self.recording = RecordingManager(serial, cast(RecordingADBDevice, self.adb_device))
 
     async def snapshot(
         self,
@@ -340,5 +342,16 @@ class AndroidController:
             packages = [package for package in packages if normalized in package.casefold()]
         return packages[:limit]
 
+    async def start_recording(
+        self,
+        max_duration_seconds: int,
+        bit_rate: int | None = None,
+    ) -> dict[str, object]:
+        return await self.recording.start(max_duration_seconds, bit_rate)
+
+    async def stop_recording(self) -> dict[str, object]:
+        return await self.recording.stop()
+
     def disconnect(self) -> None:
+        self.recording.abort()
         self.android_client.disconnect()

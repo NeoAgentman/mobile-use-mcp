@@ -8,6 +8,8 @@ from mobile_use_mcp.server import (
     android_launch_app,
     android_open_url,
     android_press_key,
+    android_start_recording,
+    android_stop_recording,
     android_swipe,
     android_tap,
     android_type_text,
@@ -46,6 +48,17 @@ def controller(monkeypatch: pytest.MonkeyPatch) -> Mock:
         )
     )
     fake.open_url = AsyncMock()
+    fake.start_recording = AsyncMock(
+        return_value={"serial": "ABC", "max_duration_seconds": 60, "bit_rate": None}
+    )
+    fake.stop_recording = AsyncMock(
+        return_value={
+            "recording_path": "/tmp/recording.mp4",
+            "segment_paths": ["/tmp/recording.mp4"],
+            "segment_count": 1,
+            "warnings": [],
+        }
+    )
     monkeypatch.setattr(session, "require_controller", lambda: fake)
     return fake
 
@@ -62,6 +75,8 @@ async def test_expected_action_tools_are_registered() -> None:
         "android_launch_app",
         "android_terminate_app",
         "android_open_url",
+        "android_start_recording",
+        "android_stop_recording",
         "android_wait",
     } <= names
 
@@ -117,3 +132,13 @@ async def test_launch_app_returns_diagnostic_failure(controller: Mock) -> None:
     assert result["success"] is False
     assert result["error_code"] == "TIMEOUT"
     assert result["data"]["attempts"][0]["outcome"] == "blocked_by_other_app"  # type: ignore[index]
+
+
+async def test_recording_tools_call_controller(controller: Mock) -> None:
+    started = await android_start_recording(60)
+    stopped = await android_stop_recording()
+
+    assert started["success"] is True
+    assert stopped["data"]["recording_path"] == "/tmp/recording.mp4"  # type: ignore[index]
+    controller.start_recording.assert_awaited_once_with(60, None)
+    controller.stop_recording.assert_awaited_once()
