@@ -147,6 +147,18 @@ async def test_stdio_mcp_on_real_device() -> None:
                 },
                 read_timeout_seconds=timedelta(seconds=30),
             )
+            assert snapshot.structuredContent is not None
+            snapshot_id = str(snapshot.structuredContent["snapshot_id"])
+            first_page = await client.call_tool(
+                "android_get_ui_elements",
+                {
+                    "snapshot_id": snapshot_id,
+                    "offset": 0,
+                    "limit": 10,
+                    "package": "com.android.settings",
+                },
+                read_timeout_seconds=timedelta(seconds=30),
+            )
             launched = await client.call_tool(
                 "android_launch_app",
                 {"package": "com.android.settings"},
@@ -170,8 +182,15 @@ async def test_stdio_mcp_on_real_device() -> None:
     assert snapshot.structuredContent["image_format"] == "jpeg"
     assert snapshot.structuredContent["image_width"] == 540
     assert snapshot.structuredContent["element_count"] > 0
+    assert (
+        snapshot.structuredContent["total_elements"] >= snapshot.structuredContent["element_count"]
+    )
     image = next(content for content in snapshot.content if isinstance(content, ImageContent))
     assert image.mimeType == "image/jpeg"
+    assert first_page.structuredContent is not None
+    assert first_page.structuredContent["snapshot_id"] == snapshot_id
+    assert first_page.structuredContent["count"] <= 10
+    assert first_page.structuredContent["package"] == "com.android.settings"
     assert launched.structuredContent is not None
     assert launched.structuredContent["data"]["foreground_app"]["package"] == (
         "com.android.settings"
