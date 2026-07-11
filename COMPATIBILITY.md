@@ -33,4 +33,5 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 - App launch, termination, foreground detection, and HTTP URL opening: passed.
 - Unicode text `MCP 你好 & 123`: exact match passed.
 - Input method restoration: passed; the user's Baidu input method was restored after automation.
-
+- Physical USB disconnect during an active MCP session: passed; the next device operation returned
+  structured `DEVICE_DISCONNECTED` with a reconnect suggestion.

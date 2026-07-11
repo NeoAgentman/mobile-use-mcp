@@ -185,7 +185,7 @@ mobile-use-mcp/
 
 ### 验收
 
-- [ ] 拔掉设备后工具返回可行动的 `DEVICE_DISCONNECTED`
+- [x] 拔掉设备后工具返回可行动的 `DEVICE_DISCONNECTED`
 - [x] 多设备连接时不会误操作未指定设备
 - [x] 非法坐标、超长文本和非法 URL 被 Schema/Controller 层拒绝
 
@@ -225,7 +225,7 @@ mobile-use-mcp/
 - [x] back/home/enter
 - [x] 启动 App
 - [x] 停止 App 和打开 URL
-- [ ] 断开设备后验证错误恢复
+- [x] 断开设备后验证错误恢复
 
 ## Phase 5：Codex 与 Claude Code 接入
 
