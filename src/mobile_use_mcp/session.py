@@ -33,6 +33,8 @@ class SessionManager:
         selected = self.registry.select(serial)
         if self._controller is not None:
             self._controller.disconnect()
+        self._device = None
+        self._controller = None
         controller = self.controller_factory(selected.serial)
         controller.android_client.connect()
         self._device = selected

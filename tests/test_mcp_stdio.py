@@ -55,3 +55,28 @@ async def test_stdio_server_returns_actionable_adb_failure() -> None:
     assert result.structuredContent is not None
     assert result.structuredContent["success"] is False
     assert result.structuredContent["error_code"] == "ADB_UNAVAILABLE"
+
+
+async def test_stdio_action_tool_validates_nested_target_and_returns_session_error() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mobile_use_mcp"],
+        cwd=project_root,
+    )
+
+    async with (
+        stdio_client(parameters) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as client,
+    ):
+        await client.initialize()
+        result = await client.call_tool(
+            "android_tap",
+            arguments={"target": {"text": "Continue"}},
+            read_timeout_seconds=timedelta(seconds=5),
+        )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["success"] is False
+    assert result.structuredContent["error_code"] == "NOT_CONNECTED"

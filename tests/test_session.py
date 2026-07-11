@@ -48,3 +48,29 @@ def test_session_maps_lost_device_to_disconnected() -> None:
         manager.require_controller()
 
     assert caught.value.code == ErrorCode.DEVICE_DISCONNECTED
+
+
+def test_failed_reconnect_does_not_leave_stale_session() -> None:
+    registry = Mock()
+    registry.select.side_effect = [
+        DeviceInfo(serial="OLD", state=DeviceState.DEVICE),
+        DeviceInfo(serial="NEW", state=DeviceState.DEVICE),
+    ]
+    old_controller = Mock()
+    new_controller = Mock()
+    new_controller.android_client.connect.side_effect = RuntimeError("connection failed")
+    controllers = iter([old_controller, new_controller])
+    manager = SessionManager(
+        registry=registry,
+        controller_factory=lambda _: next(controllers),
+    )
+    manager.connect("OLD")
+
+    with pytest.raises(RuntimeError, match="connection failed"):
+        manager.connect("NEW")
+
+    old_controller.disconnect.assert_called_once()
+    assert manager.device is None
+    with pytest.raises(MobileUseError) as caught:
+        manager.require_controller()
+    assert caught.value.code == ErrorCode.NOT_CONNECTED
