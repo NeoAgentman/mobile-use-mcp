@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install Python and dependencies
+        run: uv sync --locked --dev
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run pyright
+
+      - name: Run non-device tests
+        run: uv run pytest
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Inspect MCP tool schema
+        run: >-
+          npx -y @modelcontextprotocol/inspector --cli
+          uv --directory "$GITHUB_WORKSPACE" run mobile-use-mcp
+          --method tools/list
+
