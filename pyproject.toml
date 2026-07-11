@@ -1,0 +1,54 @@
+[project]
+name = "mobile-use-mcp"
+version = "0.1.0"
+description = "MCP server that lets coding agents observe and operate Android devices."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { file = "LICENSE" }
+authors = [{ name = "NeoAgentman" }]
+dependencies = [
+    "adbutils>=2.9.3,<3",
+    "mcp>=1.20,<2",
+    "pillow>=11,<13",
+    "pydantic>=2.10,<3",
+    "uiautomator2>=3.5,<4",
+]
+
+[project.scripts]
+mobile-use-mcp = "mobile_use_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mobile_use_mcp"]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.405",
+    "pytest>=8.4",
+    "pytest-asyncio>=1.2",
+    "ruff>=0.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-q", "--strict-markers"]
+asyncio_mode = "auto"
+markers = [
+    "android: requires a connected Android device or emulator",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+include = ["src", "tests"]
+
