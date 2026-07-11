@@ -2,11 +2,12 @@
 
 import asyncio
 from collections.abc import Callable
+from uuid import uuid4
 
 from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.devices import DeviceRegistry
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
-from mobile_use_mcp.models import DeviceInfo
+from mobile_use_mcp.models import DeviceInfo, ScreenSnapshot
 
 ControllerFactory = Callable[[str], AndroidController]
 
@@ -23,6 +24,8 @@ class SessionManager:
         self.controller_factory = controller_factory
         self._device: DeviceInfo | None = None
         self._controller: AndroidController | None = None
+        self._snapshot_id: str | None = None
+        self._snapshot: ScreenSnapshot | None = None
         self.write_lock = asyncio.Lock()
 
     @property
@@ -35,11 +38,34 @@ class SessionManager:
             self._controller.disconnect()
         self._device = None
         self._controller = None
+        self.clear_snapshot()
         controller = self.controller_factory(selected.serial)
         controller.android_client.connect()
         self._device = selected
         self._controller = controller
         return selected
+
+    def store_snapshot(self, snapshot: ScreenSnapshot) -> str:
+        """Replace the one-entry snapshot cache and return its opaque identifier."""
+
+        self._snapshot_id = f"s-{uuid4().hex}"
+        self._snapshot = snapshot
+        return self._snapshot_id
+
+    def get_snapshot(self, snapshot_id: str) -> ScreenSnapshot:
+        """Return the cached snapshot or reject an expired/unknown identifier."""
+
+        if self._snapshot_id != snapshot_id or self._snapshot is None:
+            raise MobileUseError(
+                ErrorCode.SNAPSHOT_NOT_FOUND,
+                f"Android snapshot {snapshot_id!r} is no longer available.",
+                "Call android_snapshot to capture the current screen and use its new snapshot_id.",
+            )
+        return self._snapshot
+
+    def clear_snapshot(self) -> None:
+        self._snapshot_id = None
+        self._snapshot = None
 
     def require_controller(self) -> AndroidController:
         if self._controller is None or self._device is None:
@@ -70,3 +96,4 @@ class SessionManager:
             self._controller.disconnect()
         self._controller = None
         self._device = None
+        self.clear_snapshot()

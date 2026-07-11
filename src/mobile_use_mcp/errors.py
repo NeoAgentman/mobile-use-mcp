@@ -20,6 +20,7 @@ class ErrorCode(StrEnum):
     OPERATION_FAILED = "OPERATION_FAILED"
     TIMEOUT = "TIMEOUT"
     UNSUPPORTED = "UNSUPPORTED"
+    SNAPSHOT_NOT_FOUND = "SNAPSHOT_NOT_FOUND"
 
 
 class MobileUseError(Exception):
