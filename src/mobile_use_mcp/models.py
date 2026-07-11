@@ -28,10 +28,10 @@ class DeviceInfo(StrictModel):
 
 
 class Bounds(StrictModel):
-    x: int = Field(ge=0)
-    y: int = Field(ge=0)
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
+    x: int = Field(ge=0, description="Left coordinate in original device pixels.")
+    y: int = Field(ge=0, description="Top coordinate in original device pixels.")
+    width: int = Field(gt=0, description="Width in original device pixels.")
+    height: int = Field(gt=0, description="Height in original device pixels.")
 
     @property
     def center(self) -> tuple[int, int]:
@@ -45,11 +45,39 @@ class Bounds(StrictModel):
 class Target(StrictModel):
     """A UI target with deterministic selector fallbacks."""
 
-    bounds: Bounds | None = None
-    resource_id: str | None = Field(default=None, max_length=512)
-    resource_id_index: int = Field(default=0, ge=0, le=10_000)
-    text: str | None = Field(default=None, max_length=2_000)
-    text_index: int = Field(default=0, ge=0, le=10_000)
+    bounds: Bounds | None = Field(
+        default=None,
+        description=(
+            "Current on-screen bounds from android_snapshot. Bounds are tried first and their "
+            "center is used for the action; refresh after the UI changes."
+        ),
+    )
+    resource_id: str | None = Field(
+        default=None,
+        max_length=512,
+        description="Exact resource_id from a current snapshot; tried after bounds.",
+    )
+    resource_id_index: int = Field(
+        default=0,
+        ge=0,
+        le=10_000,
+        description="Zero-based occurrence when multiple nodes share the resource_id.",
+    )
+    text: str | None = Field(
+        default=None,
+        max_length=2_000,
+        description=(
+            "Exact case-insensitive text selector tried after resource_id. It matches either a "
+            "node's text or content_description; pass content_description values here. "
+            "class_name and package are query filters, not Target fields."
+        ),
+    )
+    text_index: int = Field(
+        default=0,
+        ge=0,
+        le=10_000,
+        description="Zero-based occurrence among exact text/content_description matches.",
+    )
 
     @model_validator(mode="after")
     def require_selector(self) -> "Target":

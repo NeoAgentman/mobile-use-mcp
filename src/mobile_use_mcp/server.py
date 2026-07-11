@@ -109,8 +109,22 @@ async def android_list_devices(limit: int = 50, offset: int = 0) -> dict[str, An
     annotations=SESSION_WRITE,
     structured_output=True,
 )
-async def android_connect(serial: str | None = None) -> dict[str, Any]:
-    """Connect the MCP session to one authorized Android device."""
+async def android_connect(
+    serial: Annotated[
+        str | None,
+        Field(
+            max_length=256,
+            description=(
+                "Exact serial from android_list_devices. Required when multiple devices are online."
+            ),
+        ),
+    ] = None,
+) -> dict[str, Any]:
+    """Connect this single-device MCP session to one authorized Android device.
+
+    Specify serial when multiple devices are online. Reconnecting replaces the current device and
+    invalidates any cached snapshot; a new MCP process does not inherit this session.
+    """
 
     try:
         device = await asyncio.to_thread(session.connect, serial)
@@ -161,7 +175,7 @@ async def android_status() -> dict[str, Any]:
     structured_output=True,
 )
 async def android_disconnect() -> dict[str, Any]:
-    """Disconnect the current Android session and release uiautomator2 state."""
+    """Disconnect the current session and clear cached snapshots and recording state."""
 
     await asyncio.to_thread(session.disconnect)
     return OperationResult(success=True, message="Android device disconnected.").model_dump(
@@ -175,10 +189,44 @@ async def android_disconnect() -> dict[str, Any]:
     annotations=READ_ONLY,
 )
 async def android_snapshot(
-    detail_level: Literal["compact", "full"] = "compact",
-    interactive_only: bool = False,
-    max_elements: int = 200,
-    max_text_length: int = 500,
+    detail_level: Annotated[
+        Literal["compact", "full"],
+        Field(
+            description=(
+                "compact returns at most max_elements and is the default. If truncated, first "
+                "page or query the same snapshot_id with android_get_ui_elements; use full only "
+                "as an explicit large-output fallback."
+            )
+        ),
+    ] = "compact",
+    interactive_only: Annotated[
+        bool,
+        Field(
+            description=(
+                "Return only clickable, focusable, or scrollable nodes. Keep false when reading "
+                "static text such as product descriptions, articles, prices, or tables."
+            )
+        ),
+    ] = False,
+    max_elements: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=500,
+            description="Maximum nodes returned by compact mode; ignored by full mode.",
+        ),
+    ] = 200,
+    max_text_length: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=2_000,
+            description=(
+                "Maximum characters retained per node text/content_description, not a total "
+                "response limit. Full mode still applies it; increase for long-form content."
+            ),
+        ),
+    ] = 500,
     image_format: Annotated[
         Literal["png", "jpeg"],
         Field(description="JPEG is smaller; use PNG to retry with original lossless quality."),
@@ -188,7 +236,13 @@ async def android_snapshot(
         Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
     ] = 60,
 ) -> CallToolResult:
-    """Return an original-resolution screenshot and bounded or full normalized UI elements."""
+    """Observe the current screen with an original-resolution image and normalized UI nodes.
+
+    Defaults to compact mode with at most 200 nodes. A truncated result includes snapshot_id and
+    next_offset: prefer android_get_ui_elements on that unchanged snapshot for filtering or
+    pagination, and use full only when focused retrieval is insufficient. Any action, wait,
+    reconnect, or disconnect invalidates the cached snapshot.
+    """
 
     if not 1 <= max_elements <= 500:
         raise ValueError("max_elements must be between 1 and 500")
@@ -280,7 +334,11 @@ async def android_screenshot(
         Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
     ] = 60,
 ) -> CallToolResult:
-    """Return an original-resolution Android screenshot and basic screen metadata."""
+    """Return only an original-resolution screenshot and basic metadata.
+
+    This does not cache a pageable UI hierarchy. Use android_snapshot when locating targets or
+    reading UI text; use this tool for visual-only inspection with lower structured context.
+    """
 
     try:
         snapshot = await session.require_controller().snapshot(
@@ -351,9 +409,23 @@ async def android_get_ui_elements(
         str | None,
         Field(max_length=512, description="Exact case-insensitive Android package filter."),
     ] = None,
-    interactive_only: bool = False,
+    interactive_only: Annotated[
+        bool,
+        Field(
+            description=(
+                "After query/package filtering, keep only clickable, focusable, or scrollable "
+                "nodes. Keep false when retrieving static text."
+            )
+        ),
+    ] = False,
 ) -> dict[str, Any]:
-    """Page and query elements from one cached snapshot, or capture a new snapshot."""
+    """Filter and page UI nodes from one unchanged cached snapshot.
+
+    The default page size is 100. Query searches text, content description, resource ID, class,
+    and package; package is an additional exact filter. Filters are applied before pagination, so
+    reset offset to zero when changing them. Omitting snapshot_id captures a new hierarchy with up
+    to 2000 characters per node. Actions and android_wait invalidate prior snapshot IDs.
+    """
 
     try:
         if snapshot_id is None:
@@ -448,8 +520,26 @@ async def android_get_foreground_app() -> dict[str, Any]:
     annotations=READ_ONLY,
     structured_output=True,
 )
-async def android_list_apps(query: str | None = None, limit: int = 100) -> dict[str, Any]:
-    """List third-party package names, optionally filtered by a case-insensitive query."""
+async def android_list_apps(
+    query: Annotated[
+        str | None,
+        Field(
+            max_length=512,
+            description=(
+                "Case-insensitive substring of the package name, not the localized app label."
+            ),
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=500, description="Maximum matching third-party packages to return."),
+    ] = 100,
+) -> dict[str, Any]:
+    """List third-party package names, optionally filtering the package string.
+
+    Query does not search localized launcher display names. android_launch_app requires an exact
+    package such as com.taobao.idlefish, not an app label such as 闲鱼.
+    """
 
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")
@@ -487,7 +577,11 @@ def _unexpected_failure(action: str) -> dict[str, Any]:
     structured_output=True,
 )
 async def android_tap(target: Target) -> dict[str, Any]:
-    """Tap a target using bounds, resource ID, then text as selector fallbacks."""
+    """Tap using bounds, resource ID, then exact text/content description fallbacks.
+
+    A successful call means the input command was sent, not that the expected UI state appeared.
+    Observe again afterward; wait briefly first when the page animates or loads asynchronously.
+    """
 
     try:
         async with session.write_lock:
@@ -512,9 +606,15 @@ async def android_tap(target: Target) -> dict[str, Any]:
 )
 async def android_long_press(
     target: Target,
-    duration_ms: Annotated[int, Field(ge=100, le=10_000)] = 1_000,
+    duration_ms: Annotated[
+        int,
+        Field(ge=100, le=10_000, description="Press duration in milliseconds."),
+    ] = 1_000,
 ) -> dict[str, Any]:
-    """Long press a target for a bounded duration in milliseconds."""
+    """Long press a target using original-device-pixel bounds or semantic fallbacks.
+
+    Observe again afterward to verify the resulting UI state.
+    """
 
     try:
         async with session.write_lock:
@@ -538,13 +638,20 @@ async def android_long_press(
     structured_output=True,
 )
 async def android_swipe(
-    start_x: Annotated[int, Field(ge=0)],
-    start_y: Annotated[int, Field(ge=0)],
-    end_x: Annotated[int, Field(ge=0)],
-    end_y: Annotated[int, Field(ge=0)],
-    duration_ms: Annotated[int, Field(ge=1, le=10_000)] = 400,
+    start_x: Annotated[int, Field(ge=0, description="Start X in original device pixels.")],
+    start_y: Annotated[int, Field(ge=0, description="Start Y in original device pixels.")],
+    end_x: Annotated[int, Field(ge=0, description="End X in original device pixels.")],
+    end_y: Annotated[int, Field(ge=0, description="End Y in original device pixels.")],
+    duration_ms: Annotated[
+        int,
+        Field(ge=1, le=10_000, description="Swipe duration in milliseconds."),
+    ] = 400,
 ) -> dict[str, Any]:
-    """Swipe between two pixel coordinates validated against the current screen."""
+    """Swipe between coordinates in original device pixels on the current screen.
+
+    Screenshot previews may be visually scaled by the host. Use the reported device width and
+    height, and observe again after the swipe because old bounds and snapshots become stale.
+    """
 
     try:
         async with session.write_lock:
@@ -578,10 +685,29 @@ async def android_swipe(
     structured_output=True,
 )
 async def android_type_text(
-    text: Annotated[str, Field(min_length=1, max_length=10_000)],
-    target: Target | None = None,
+    text: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=10_000,
+            description="Text to enter; successful responses intentionally do not echo it.",
+        ),
+    ],
+    target: Annotated[
+        Target | None,
+        Field(
+            description=(
+                "Optional input target to tap first. Without it, type into the currently focused "
+                "field. Bounds-only targets cannot verify focus as reliably as resource_id/text."
+            )
+        ),
+    ] = None,
 ) -> dict[str, Any]:
-    """Optionally focus a target, then type text into the focused Android field."""
+    """Optionally focus a target, then type into the focused Android field.
+
+    The returned method identifies uiautomator2 or the less reliable ADB fallback. Observe again to
+    verify the value, especially for Unicode text or bounds-only/Flutter-style input fields.
+    """
 
     try:
         async with session.write_lock:
@@ -605,10 +731,28 @@ async def android_type_text(
     structured_output=True,
 )
 async def android_clear_text(
-    max_characters: Annotated[int, Field(ge=1, le=2_000)] = 100,
-    target: Target | None = None,
+    max_characters: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=2_000,
+            description="Maximum delete key presses used only by the ADB fallback.",
+        ),
+    ] = 100,
+    target: Annotated[
+        Target | None,
+        Field(
+            description=(
+                "Optional input target to tap first. Without it, clear the currently focused field."
+            )
+        ),
+    ] = None,
 ) -> dict[str, Any]:
-    """Optionally focus a target, then delete bounded characters from the field."""
+    """Optionally focus a target, then clear the focused Android text field.
+
+    Observe again to verify the field is empty, especially when the response reports the ADB
+    delete-key fallback.
+    """
 
     try:
         async with session.write_lock:
@@ -631,8 +775,18 @@ async def android_clear_text(
     annotations=SESSION_WRITE,
     structured_output=True,
 )
-async def android_press_key(key: str) -> dict[str, Any]:
-    """Press one allowed Android key such as back, home, enter, delete, or tab."""
+async def android_press_key(
+    key: Annotated[
+        str,
+        Field(
+            description=("One of: back, home, enter, delete, tab, menu, volume_up, volume_down.")
+        ),
+    ],
+) -> dict[str, Any]:
+    """Press back, home, enter, delete, tab, menu, or a volume key.
+
+    Success means the key command was sent; observe again to verify any UI transition.
+    """
 
     try:
         async with session.write_lock:
@@ -654,7 +808,14 @@ async def android_press_key(key: str) -> dict[str, Any]:
     structured_output=True,
 )
 async def android_launch_app(
-    package: Annotated[str, Field(min_length=1, max_length=512)],
+    package: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=512,
+            description="Exact installed Android package name, not a launcher display label.",
+        ),
+    ],
 ) -> dict[str, Any]:
     """Launch an installed package and wait until it reaches the foreground."""
 
@@ -680,9 +841,16 @@ async def android_launch_app(
     structured_output=True,
 )
 async def android_terminate_app(
-    package: Annotated[str, Field(min_length=1, max_length=512)],
+    package: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=512,
+            description="Exact installed Android package name to force-stop.",
+        ),
+    ],
 ) -> dict[str, Any]:
-    """Force-stop one installed Android package."""
+    """Force-stop one exact installed Android package and invalidate cached UI state."""
 
     try:
         async with session.write_lock:
@@ -704,9 +872,20 @@ async def android_terminate_app(
     structured_output=True,
 )
 async def android_open_url(
-    url: Annotated[str, Field(min_length=8, max_length=4_096)],
+    url: Annotated[
+        str,
+        Field(
+            min_length=8,
+            max_length=4_096,
+            description="Absolute http:// or https:// URL to open.",
+        ),
+    ],
 ) -> dict[str, Any]:
-    """Open one absolute HTTP or HTTPS URL in the Android default browser."""
+    """Send one absolute HTTP or HTTPS URL to the Android default browser.
+
+    Success means the open command was sent; observe afterward for a chooser, permission dialog,
+    browser loading state, or another foreground result.
+    """
 
     try:
         async with session.write_lock:
@@ -728,10 +907,28 @@ async def android_open_url(
     structured_output=True,
 )
 async def android_start_recording(
-    max_duration_seconds: Annotated[int, Field(ge=5, le=1_800)] = 300,
-    bit_rate: Annotated[int | None, Field(ge=100_000, le=100_000_000)] = None,
+    max_duration_seconds: Annotated[
+        int,
+        Field(
+            ge=5,
+            le=1_800,
+            description="Maximum total recording duration before automatic stop.",
+        ),
+    ] = 300,
+    bit_rate: Annotated[
+        int | None,
+        Field(
+            ge=100_000,
+            le=100_000_000,
+            description="Optional device screenrecord bit rate in bits per second.",
+        ),
+    ] = None,
 ) -> dict[str, Any]:
-    """Start a bounded Android screen recording that rolls over into safe segments."""
+    """Start one bounded screen recording with automatic segment rollover.
+
+    Call android_stop_recording to retrieve host-local output paths. Do not start a second recording
+    while one is active; disconnect aborts and cleans up unfinished recording state.
+    """
 
     try:
         async with session.write_lock:
@@ -758,7 +955,11 @@ async def android_start_recording(
     structured_output=True,
 )
 async def android_stop_recording() -> dict[str, Any]:
-    """Stop the active recording, pull its segments, and merge them when ffmpeg is available."""
+    """Stop the active recording and return MCP-host-local output paths.
+
+    Multiple segment paths may be returned when ffmpeg is unavailable. Recordings can contain
+    sensitive screen content.
+    """
 
     try:
         async with session.write_lock:
@@ -782,9 +983,20 @@ async def android_stop_recording() -> dict[str, Any]:
     structured_output=True,
 )
 async def android_wait(
-    milliseconds: Annotated[int, Field(ge=0, le=60_000)] = 1_000,
+    milliseconds: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=60_000,
+            description="Fixed sleep duration; this does not wait for any UI condition.",
+        ),
+    ] = 1_000,
 ) -> dict[str, Any]:
-    """Wait for a bounded delay before observing the Android UI again."""
+    """Sleep for a fixed delay and invalidate the cached snapshot.
+
+    This is not a condition wait and does not observe whether an element appeared. Call
+    android_snapshot afterward and do not reuse an earlier snapshot_id.
+    """
 
     session.clear_snapshot()
     await asyncio.sleep(milliseconds / 1_000)
