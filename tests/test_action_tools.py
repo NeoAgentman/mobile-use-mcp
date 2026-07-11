@@ -28,6 +28,7 @@ def controller(monkeypatch: pytest.MonkeyPatch) -> Mock:
     )
     fake.swipe = AsyncMock()
     fake.type_text = AsyncMock(return_value="uiautomator2")
+    fake.clear_text = AsyncMock(return_value="uiautomator2")
     fake.press_key = AsyncMock()
     fake.launch_app = AsyncMock(return_value=ForegroundApp(package="com.example", activity=".Main"))
     fake.open_url = AsyncMock()

@@ -463,14 +463,15 @@ async def android_clear_text(
 
     try:
         async with session.write_lock:
-            await session.require_controller().clear_text(max_characters, target)
+            method = await session.require_controller().clear_text(max_characters, target)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("text clearing")
     return OperationResult(
         success=True,
-        message=f"Sent {max_characters} delete key events to the focused field.",
+        message="Cleared the focused Android text field.",
+        data={"method": method, "fallback_max_characters": max_characters},
     ).model_dump(mode="json")
 
 

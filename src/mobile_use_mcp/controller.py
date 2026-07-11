@@ -208,11 +208,16 @@ class AndroidController:
             await asyncio.to_thread(self.adb_device.shell, ["input", "text", text])
             return "adb"
 
-    async def clear_text(self, characters: int = 100, target: Target | None = None) -> None:
+    async def clear_text(self, characters: int = 100, target: Target | None = None) -> str:
         if target is not None:
             await self.focus(target)
-        for _ in range(characters):
-            await asyncio.to_thread(self.adb_device.keyevent, "DEL")
+        try:
+            await asyncio.to_thread(self.android_client.clear_text)
+            return "uiautomator2"
+        except Exception:
+            for _ in range(characters):
+                await asyncio.to_thread(self.adb_device.keyevent, "DEL")
+            return "adb"
 
     async def press_key(self, key: str) -> None:
         normalized = key.casefold()

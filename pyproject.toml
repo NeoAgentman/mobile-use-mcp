@@ -8,6 +8,7 @@ license = { file = "LICENSE" }
 authors = [{ name = "NeoAgentman" }]
 dependencies = [
     "adbutils>=2.9.3,<3",
+    "apkutils>=2.0.5,<3",
     "mcp>=1.20,<2",
     "pillow>=11,<13",
     "pydantic>=2.10,<3",

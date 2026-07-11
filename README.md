@@ -160,7 +160,7 @@ the structured JSON result.
 | `android_long_press` | Long press a target |
 | `android_swipe` | Swipe between validated pixel coordinates |
 | `android_type_text` | Optionally focus a target, then type text |
-| `android_clear_text` | Optionally focus a target, then send bounded delete events |
+| `android_clear_text` | Optionally focus a target, then clear text with a delete-key fallback |
 | `android_press_key` | Press back/home/enter/delete/tab/menu/volume keys |
 | `android_launch_app` | Launch a package and poll until foreground |
 | `android_terminate_app` | Force-stop a package |

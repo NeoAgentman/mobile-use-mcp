@@ -217,13 +217,14 @@ mobile-use-mcp/
 ### 真机或模拟器测试
 
 - [ ] 连接一台启用 USB debugging 的设备
-- [ ] 获取截图和 UI hierarchy
-- [ ] 打开 Android Settings
-- [ ] 通过 resource ID 或 text 点击设置项
-- [ ] 滑动页面
-- [ ] 聚焦输入框并输入中文、英文、空格和特殊字符
-- [ ] back/home/enter
-- [ ] 启动、停止 App 和打开 URL
+- [x] 获取截图和 UI hierarchy
+- [x] 打开 Android Settings
+- [x] 通过 resource ID 或 text 点击设置项
+- [x] 滑动页面
+- [x] 聚焦输入框并输入中文、英文、空格和特殊字符
+- [x] back/home（enter 仍待专门输入场景）
+- [x] 启动 App
+- [ ] 停止 App 和打开 URL
 - [ ] 断开设备后验证错误恢复
 
 ## Phase 5：Codex 与 Claude Code 接入

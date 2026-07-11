@@ -9,6 +9,7 @@ class FakeDevice:
         self.fast_input_states: list[bool] = []
         self.sent_text: list[str] = []
         self.pressed: list[str] = []
+        self.clear_count = 0
 
     @property
     def info(self) -> dict[str, object]:
@@ -27,11 +28,14 @@ class FakeDevice:
         self.pressed.append(key)
         return True
 
-    def set_fastinput_ime(self, enabled: bool) -> None:
+    def set_input_ime(self, enabled: bool = True) -> None:
         self.fast_input_states.append(enabled)
 
     def send_keys(self, text: str) -> None:
         self.sent_text.append(text)
+
+    def clear_text(self) -> None:
+        self.clear_count += 1
 
 
 def test_get_screen_returns_png_and_hierarchy() -> None:
@@ -52,7 +56,17 @@ def test_send_text_restores_input_method() -> None:
     client.send_text("hello 世界")
 
     assert fake.sent_text == ["hello 世界"]
-    assert fake.fast_input_states == [True, False]
+    assert fake.fast_input_states == [False]
+
+
+def test_clear_text_restores_input_method() -> None:
+    fake = FakeDevice()
+    client = AndroidClient("serial", connector=lambda _: fake)
+
+    client.clear_text()
+
+    assert fake.clear_count == 1
+    assert fake.fast_input_states == [False]
 
 
 def test_client_reconnects_once_after_health_check_failure() -> None:

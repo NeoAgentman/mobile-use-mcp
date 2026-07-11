@@ -30,10 +30,13 @@ class FakeU2Device:
     def press(self, key: str) -> bool:
         return True
 
-    def set_fastinput_ime(self, enabled: bool) -> None:
+    def set_input_ime(self, enabled: bool = True) -> None:
         pass
 
     def send_keys(self, text: str) -> None:
+        pass
+
+    def clear_text(self) -> None:
         pass
 
 
@@ -173,3 +176,14 @@ async def test_type_text_can_focus_and_verify_target(
 
     assert method == "uiautomator2"
     assert adb.clicks == [(160, 140)]
+
+
+async def test_clear_text_prefers_uiautomator2(
+    controller: tuple[AndroidController, FakeADBDevice],
+) -> None:
+    service, adb = controller
+
+    method = await service.clear_text(20)
+
+    assert method == "uiautomator2"
+    assert adb.keys == []

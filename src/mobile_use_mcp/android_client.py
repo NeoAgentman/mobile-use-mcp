@@ -1,6 +1,7 @@
 """Minimal uiautomator2 client for screenshots, hierarchy, and text input."""
 
 import base64
+import time
 from collections.abc import Callable
 from io import BytesIO
 from typing import Protocol, cast
@@ -19,9 +20,11 @@ class AndroidDevice(Protocol):
 
     def press(self, key: str) -> bool: ...
 
-    def set_fastinput_ime(self, enabled: bool) -> None: ...
+    def set_input_ime(self, enabled: bool = True) -> None: ...
 
     def send_keys(self, text: str) -> None: ...
+
+    def clear_text(self) -> None: ...
 
 
 DeviceConnector = Callable[[str], AndroidDevice]
@@ -74,12 +77,26 @@ class AndroidClient:
         return bool(self.ensure_connected().press(key))
 
     def send_text(self, text: str) -> None:
+        """Send Unicode text and restore the user's input method after it settles."""
+
         device = self.ensure_connected()
-        device.set_fastinput_ime(True)
         try:
             device.send_keys(text)
+            # FastInputIME broadcasts asynchronously on some Android/HarmonyOS builds.
+            # Disabling it immediately can drop the beginning of the text.
+            time.sleep(0.3)
         finally:
-            device.set_fastinput_ime(False)
+            device.set_input_ime(False)
+
+    def clear_text(self) -> None:
+        """Clear the focused field using uiautomator2's Unicode-aware input method."""
+
+        device = self.ensure_connected()
+        try:
+            device.clear_text()
+            time.sleep(0.2)
+        finally:
+            device.set_input_ime(False)
 
     def disconnect(self) -> None:
         self._device = None
