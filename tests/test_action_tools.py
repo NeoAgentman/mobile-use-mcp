@@ -3,7 +3,14 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
-from mobile_use_mcp.models import AppLaunchAttempt, AppLaunchResult, Bounds, ForegroundApp, Target
+from mobile_use_mcp.models import (
+    AppLaunchAttempt,
+    AppLaunchResult,
+    Bounds,
+    ForegroundApp,
+    ScreenSnapshot,
+    Target,
+)
 from mobile_use_mcp.server import (
     android_launch_app,
     android_open_url,
@@ -82,11 +89,23 @@ async def test_expected_action_tools_are_registered() -> None:
 
 
 async def test_tap_returns_selector_details(controller: Mock) -> None:
+    snapshot_id = session.store_snapshot(
+        ScreenSnapshot(
+            serial="ABC",
+            width=1080,
+            height=2400,
+            screenshot_png=b"png",
+            elements=[],
+            foreground_app=ForegroundApp(),
+        )
+    )
     result = await android_tap(Target(bounds=Bounds(x=10, y=20, width=30, height=40)))
 
     assert result["success"] is True
     assert result["data"]["selector"] == "text='Continue'[0]"  # type: ignore[index]
     controller.tap.assert_awaited_once()
+    with pytest.raises(MobileUseError):
+        session.get_snapshot(snapshot_id)
 
 
 async def test_swipe_calls_controller(controller: Mock) -> None:

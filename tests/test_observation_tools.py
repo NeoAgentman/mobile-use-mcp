@@ -14,6 +14,7 @@ from mobile_use_mcp.models import (
 )
 from mobile_use_mcp.server import (
     android_connect,
+    android_get_ui_elements,
     android_list_devices,
     android_snapshot,
     android_status,
@@ -172,3 +173,55 @@ async def test_snapshot_hides_internal_exception(monkeypatch: pytest.MonkeyPatch
     assert "secret internal detail" not in str(result)
     assert result.structuredContent is not None
     assert result.structuredContent["error_code"] == "OPERATION_FAILED"
+
+
+async def test_ui_elements_pages_and_queries_one_cached_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = Mock()
+    controller.snapshot = AsyncMock(
+        return_value=ScreenSnapshot(
+            serial="ABC",
+            width=1080,
+            height=2400,
+            screenshot_png=b"png",
+            elements=[
+                UIElement(text="校招信息", package="com.example", clickable=True),
+                UIElement(
+                    content_description="校招搜索按钮",
+                    package="com.example",
+                    clickable=True,
+                ),
+                UIElement(text="其他内容", package="com.other"),
+            ],
+            foreground_app=ForegroundApp(package="com.example"),
+        )
+    )
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    first = await android_get_ui_elements(query="校招", package="com.example", limit=1)
+    second = await android_get_ui_elements(
+        snapshot_id=str(first["snapshot_id"]),
+        query="校招",
+        package="com.example",
+        offset=1,
+        limit=1,
+    )
+
+    assert first["snapshot_total_elements"] == 3
+    assert first["total_matches"] == 2
+    assert first["count"] == 1
+    assert first["has_more"] is True
+    assert first["next_offset"] == 1
+    assert second["count"] == 1
+    assert second["has_more"] is False
+    assert second["next_offset"] is None
+    assert second["snapshot_id"] == first["snapshot_id"]
+    controller.snapshot.assert_awaited_once()
+
+
+async def test_ui_elements_rejects_expired_snapshot_id() -> None:
+    result = await android_get_ui_elements(snapshot_id="s-expired")
+
+    assert result["success"] is False
+    assert result["error_code"] == "SNAPSHOT_NOT_FOUND"

@@ -11,7 +11,7 @@ from pydantic import Field
 
 from mobile_use_mcp.errors import MobileUseError
 from mobile_use_mcp.images import encode_screenshot
-from mobile_use_mcp.models import OperationResult, Target
+from mobile_use_mcp.models import OperationResult, Target, UIElement
 from mobile_use_mcp.session import SessionManager
 
 mcp = FastMCP("mobile_use_mcp")
@@ -306,27 +306,78 @@ async def android_screenshot(
     structured_output=True,
 )
 async def android_get_ui_elements(
+    snapshot_id: Annotated[str | None, Field(max_length=128)] = None,
+    offset: Annotated[int, Field(ge=0)] = 0,
+    limit: Annotated[int, Field(ge=1, le=500)] = 100,
+    query: Annotated[str | None, Field(max_length=500)] = None,
+    package: Annotated[str | None, Field(max_length=512)] = None,
     interactive_only: bool = False,
-    max_elements: int = 200,
 ) -> dict[str, Any]:
-    """Return compact UI elements without including a screenshot in the result."""
+    """Page and query elements from one cached snapshot, or capture a new snapshot."""
 
     try:
-        snapshot = await session.require_controller().snapshot(
-            interactive_only=interactive_only,
-            max_elements=max_elements,
-        )
+        if snapshot_id is None:
+            snapshot = await session.require_controller().snapshot(
+                interactive_only=False,
+                max_elements=None,
+                max_text_length=2_000,
+            )
+            resolved_snapshot_id = session.store_snapshot(snapshot)
+        else:
+            snapshot = session.get_snapshot(snapshot_id)
+            resolved_snapshot_id = snapshot_id
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _observation_failure("read Android UI elements")
+
+    elements = snapshot.elements
+    if interactive_only:
+        elements = [element for element in elements if element.is_interactive()]
+    if package:
+        normalized_package = package.casefold()
+        elements = [
+            element
+            for element in elements
+            if (element.package or "").casefold() == normalized_package
+        ]
+    if query:
+        normalized_query = query.casefold()
+
+        def matches_query(element: UIElement) -> bool:
+            values = (
+                element.text,
+                element.content_description,
+                element.resource_id,
+                element.class_name,
+                element.package,
+            )
+            return any(normalized_query in (value or "").casefold() for value in values)
+
+        elements = [element for element in elements if matches_query(element)]
+
+    page = elements[offset : offset + limit]
+    next_offset = offset + len(page)
+    has_more = next_offset < len(elements)
     return {
         "success": True,
+        "snapshot_id": resolved_snapshot_id,
         "serial": snapshot.serial,
         "width": snapshot.width,
         "height": snapshot.height,
-        "element_count": len(snapshot.elements),
-        "elements": [element.model_dump(mode="json") for element in snapshot.elements],
+        "snapshot_total_elements": len(snapshot.elements),
+        "total_matches": len(elements),
+        "count": len(page),
+        "element_count": len(page),
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+        "truncated": has_more,
+        "next_offset": next_offset if has_more else None,
+        "query": query,
+        "package": package,
+        "interactive_only": interactive_only,
+        "elements": [element.model_dump(mode="json") for element in page],
     }
 
 
@@ -400,6 +451,7 @@ async def android_tap(target: Target) -> dict[str, Any]:
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             details = await session.require_controller().tap(target)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -426,6 +478,7 @@ async def android_long_press(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             details = await session.require_controller().long_press(target, duration_ms)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -455,6 +508,7 @@ async def android_swipe(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             await session.require_controller().swipe(
                 start_x,
                 start_y,
@@ -491,6 +545,7 @@ async def android_type_text(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             method = await session.require_controller().type_text(text, target)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -517,6 +572,7 @@ async def android_clear_text(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             method = await session.require_controller().clear_text(max_characters, target)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -540,6 +596,7 @@ async def android_press_key(key: str) -> dict[str, Any]:
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             await session.require_controller().press_key(key)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -563,6 +620,7 @@ async def android_launch_app(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             launch = await session.require_controller().launch_app(package)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -588,6 +646,7 @@ async def android_terminate_app(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             await session.require_controller().terminate_app(package)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -611,6 +670,7 @@ async def android_open_url(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             await session.require_controller().open_url(url)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -635,6 +695,7 @@ async def android_start_recording(
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             details = await session.require_controller().start_recording(
                 max_duration_seconds,
                 bit_rate,
@@ -661,6 +722,7 @@ async def android_stop_recording() -> dict[str, Any]:
 
     try:
         async with session.write_lock:
+            session.clear_snapshot()
             details = await session.require_controller().stop_recording()
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
@@ -684,6 +746,7 @@ async def android_wait(
 ) -> dict[str, Any]:
     """Wait for a bounded delay before observing the Android UI again."""
 
+    session.clear_snapshot()
     await asyncio.sleep(milliseconds / 1_000)
     return OperationResult(
         success=True,
