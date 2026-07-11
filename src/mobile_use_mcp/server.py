@@ -306,11 +306,23 @@ async def android_screenshot(
     structured_output=True,
 )
 async def android_get_ui_elements(
-    snapshot_id: Annotated[str | None, Field(max_length=128)] = None,
-    offset: Annotated[int, Field(ge=0)] = 0,
-    limit: Annotated[int, Field(ge=1, le=500)] = 100,
-    query: Annotated[str | None, Field(max_length=500)] = None,
-    package: Annotated[str | None, Field(max_length=512)] = None,
+    snapshot_id: Annotated[
+        str | None,
+        Field(max_length=128, description="Snapshot ID returned by android_snapshot."),
+    ] = None,
+    offset: Annotated[int, Field(ge=0, description="Zero-based filtered result offset.")] = 0,
+    limit: Annotated[
+        int,
+        Field(ge=1, le=500, description="Maximum matching elements to return."),
+    ] = 100,
+    query: Annotated[
+        str | None,
+        Field(max_length=500, description="Case-insensitive substring across semantic fields."),
+    ] = None,
+    package: Annotated[
+        str | None,
+        Field(max_length=512, description="Exact case-insensitive Android package filter."),
+    ] = None,
     interactive_only: bool = False,
 ) -> dict[str, Any]:
     """Page and query elements from one cached snapshot, or capture a new snapshot."""

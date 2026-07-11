@@ -146,16 +146,35 @@ and report the device model. Observe the screen again after every action.
 
 | Tool | Purpose |
 |---|---|
-| `android_snapshot` | Screenshot plus compact UI elements and foreground app |
+| `android_snapshot` | Screenshot plus compact or full UI elements and truncation metadata |
 | `android_screenshot` | Screenshot plus basic metadata |
-| `android_get_ui_elements` | UI elements without image content |
+| `android_get_ui_elements` | Page and query elements from one cached snapshot |
 | `android_get_foreground_app` | Current package and activity |
 | `android_list_apps` | Filter third-party package names |
 
-`android_snapshot` supports `interactive_only`, `max_elements`, and `max_text_length` to control
-context size. It and `android_screenshot` also support `image_format`, `image_quality`, and
-`max_width`. Device dimensions and encoded image dimensions are returned separately. Screenshots
-are returned as MCP image content; screenshot base64 is not duplicated in structured JSON.
+`android_snapshot` defaults to `detail_level="compact"` and reports `snapshot_id`,
+`total_elements`, `returned_elements`, `truncated`, and `next_offset`; no truncation is silent.
+Use `detail_level="full"` for an explicit full normalized hierarchy fallback. It also supports
+`interactive_only`, `max_elements`, and `max_text_length`. It and `android_screenshot` support
+`image_format`, `image_quality`, and `max_width`. Device dimensions and encoded image dimensions
+are returned separately. Screenshot base64 is not duplicated in structured JSON.
+
+Use `android_get_ui_elements` with the returned `snapshot_id` to page the exact same hierarchy.
+It supports `offset`, `limit`, a case-insensitive `query` across text, content description,
+resource ID, class, and package, plus exact package and interactive-only filters:
+
+```json
+{
+  "snapshot_id": "s-...",
+  "query": "校招",
+  "package": "com.taobao.idlefish",
+  "offset": 0,
+  "limit": 50
+}
+```
+
+Only the latest snapshot is cached. Actions, waiting, reconnecting, and disconnecting invalidate
+it; an expired ID returns `SNAPSHOT_NOT_FOUND` and instructs the agent to observe again.
 
 ### Actions
 
@@ -234,6 +253,7 @@ Stable error codes include:
 - `OPERATION_FAILED`
 - `TIMEOUT`
 - `UNSUPPORTED`
+- `SNAPSHOT_NOT_FOUND`
 
 ## Development and verification
 
@@ -279,7 +299,9 @@ device verification results.
 - Screen recording availability and supported resolution depend on the Android device's built-in
   `screenrecord` implementation.
 - UI elements are snapshots, not stable DOM nodes. Observe again after navigation, animation, or
-  scrolling.
+  scrolling. Only the latest `snapshot_id` can be paged, and state-changing operations invalidate
+  it deliberately.
+- `detail_level="full"` can produce a large tool result. Prefer pagination and query first.
 - `android_type_text` and `android_clear_text` accept an optional target. Without one, they operate
   on the currently focused field.
 - App discovery currently returns package names rather than localized display names.

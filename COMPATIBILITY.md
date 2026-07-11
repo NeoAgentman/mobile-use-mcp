@@ -48,3 +48,12 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
   cleanup are covered by non-device tests. Real-device recording remains an opt-in verification.
 - The verified HUAWEI P20 HarmonyOS build does not include Android's `screenrecord` binary; the
   MCP returns structured `UNSUPPORTED` instead of repeatedly restarting a failed process.
+
+## Version 0.3 additions
+
+- Compact snapshots expose explicit truncation counts, continuation offsets, and a full fallback.
+- The latest full normalized hierarchy is addressable through an opaque `snapshot_id`.
+- UI element reads support stable pagination, keyword query, package filtering, and
+  interactive-only filtering against the same cached snapshot.
+- State-changing operations invalidate cached IDs and stale reads return `SNAPSHOT_NOT_FOUND`.
+- The complete stdio snapshot-to-pagination flow passed on the verified HUAWEI P20 device.

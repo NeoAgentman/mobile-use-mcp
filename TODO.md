@@ -269,6 +269,18 @@ mobile-use-mcp/
 - [x] 170 秒自动分段、随机设备路径、拉取和设备端清理
 - [x] 可用时通过参数化 ffmpeg 调用合并，缺失时返回分段与 warning
 - [x] disconnect 时终止录制并清理未完成文件
+
+## Post-MVP：无损 UI 上下文控制
+
+- [x] snapshot 返回 opaque `snapshot_id`
+- [x] 明确返回 total、returned、truncated 和 next_offset
+- [x] `detail_level=full` 完整规范化 hierarchy 回退
+- [x] 同一 snapshot 上稳定分页
+- [x] 跨 text、content description、resource ID、class、package 查询
+- [x] package 和 interactive-only 过滤
+- [x] 页面状态改变后使旧 snapshot 失效
+- [x] stale snapshot 返回结构化 `SNAPSHOT_NOT_FOUND`
+- [x] 真机 stdio MCP snapshot 到分页链路验证
 - [x] README：截图和敏感数据说明
 - [x] README：已知限制
 - [x] 生成源码复用与修改说明
