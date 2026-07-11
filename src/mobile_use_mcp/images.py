@@ -1,4 +1,4 @@
-"""Bounded screenshot encoding for MCP image responses."""
+"""Original-resolution screenshot encoding for MCP image responses."""
 
 from io import BytesIO
 from typing import Literal
@@ -11,19 +11,13 @@ ImageFormat = Literal["png", "jpeg"]
 def encode_screenshot(
     screenshot_png: bytes,
     *,
-    image_format: ImageFormat = "png",
-    image_quality: int = 80,
-    max_width: int | None = None,
+    image_format: ImageFormat = "jpeg",
+    image_quality: int = 60,
 ) -> tuple[bytes, int, int]:
-    """Encode a PNG screenshot with optional downscaling and JPEG compression."""
+    """Encode a screenshot without changing the device resolution."""
 
     with Image.open(BytesIO(screenshot_png)) as source:
         image = source.copy()
-    if max_width is not None and image.width > max_width:
-        height = max(1, round(image.height * max_width / image.width))
-        size: tuple[int, int] = (max_width, height)
-        image = image.resize(size, Image.Resampling.LANCZOS)  # pyright: ignore[reportUnknownMemberType]
-
     output = BytesIO()
     if image_format == "jpeg":
         if image.mode not in {"RGB", "L"}:

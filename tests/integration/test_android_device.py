@@ -141,9 +141,6 @@ async def test_stdio_mcp_on_real_device() -> None:
                 "android_snapshot",
                 {
                     "max_elements": 200,
-                    "image_format": "jpeg",
-                    "image_quality": 60,
-                    "max_width": 540,
                 },
                 read_timeout_seconds=timedelta(seconds=30),
             )
@@ -180,7 +177,14 @@ async def test_stdio_mcp_on_real_device() -> None:
     assert snapshot.structuredContent is not None
     assert snapshot.structuredContent["serial"] == serial
     assert snapshot.structuredContent["image_format"] == "jpeg"
-    assert snapshot.structuredContent["image_width"] == 540
+    assert snapshot.structuredContent["image_quality"] == 60
+    assert snapshot.structuredContent["image_lossless"] is False
+    assert snapshot.structuredContent["image_width"] == snapshot.structuredContent["width"]
+    assert snapshot.structuredContent["image_height"] == snapshot.structuredContent["height"]
+    assert snapshot.structuredContent["lossless_fallback"] == {
+        "tool": "android_snapshot",
+        "arguments": {"image_format": "png"},
+    }
     assert snapshot.structuredContent["element_count"] > 0
     assert (
         snapshot.structuredContent["total_elements"] >= snapshot.structuredContent["element_count"]

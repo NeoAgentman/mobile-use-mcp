@@ -47,6 +47,33 @@ def _failure(error: MobileUseError) -> OperationResult:
     )
 
 
+def _image_delivery_metadata(
+    tool_name: str,
+    image_format: Literal["png", "jpeg"],
+    image_quality: int,
+) -> dict[str, Any]:
+    if image_format == "png":
+        return {
+            "image_quality": None,
+            "image_lossless": True,
+            "quality_notice": "This is the original-resolution lossless PNG image.",
+            "lossless_fallback": None,
+        }
+    return {
+        "image_quality": image_quality,
+        "image_lossless": False,
+        "quality_notice": (
+            "This is a lossy JPEG at the original device resolution. If small text, icons, "
+            f"tables, or visual details are unclear, call {tool_name} again with "
+            'image_format="png" for the original lossless image.'
+        ),
+        "lossless_fallback": {
+            "tool": tool_name,
+            "arguments": {"image_format": "png"},
+        },
+    }
+
+
 @mcp.tool(
     name="android_list_devices",
     title="List Android devices",
@@ -152,20 +179,21 @@ async def android_snapshot(
     interactive_only: bool = False,
     max_elements: int = 200,
     max_text_length: int = 500,
-    image_format: Literal["png", "jpeg"] = "png",
-    image_quality: int = 80,
-    max_width: int | None = None,
+    image_format: Annotated[
+        Literal["png", "jpeg"],
+        Field(description="JPEG is smaller; use PNG to retry with original lossless quality."),
+    ] = "jpeg",
+    image_quality: Annotated[
+        int,
+        Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
+    ] = 60,
 ) -> CallToolResult:
-    """Return a screenshot and either bounded or full normalized UI elements."""
+    """Return an original-resolution screenshot and bounded or full normalized UI elements."""
 
     if not 1 <= max_elements <= 500:
         raise ValueError("max_elements must be between 1 and 500")
     if not 1 <= max_text_length <= 2_000:
         raise ValueError("max_text_length must be between 1 and 2000")
-    if not 1 <= image_quality <= 100:
-        raise ValueError("image_quality must be between 1 and 100")
-    if max_width is not None and not 240 <= max_width <= 4_096:
-        raise ValueError("max_width must be between 240 and 4096")
     try:
         controller = session.require_controller()
         snapshot = await controller.snapshot(
@@ -203,7 +231,6 @@ async def android_snapshot(
         snapshot.screenshot_png,
         image_format=image_format,
         image_quality=image_quality,
-        max_width=max_width,
     )
     metadata = {
         "success": True,
@@ -215,6 +242,7 @@ async def android_snapshot(
         "image_format": image_format,
         "image_width": image_width,
         "image_height": image_height,
+        **_image_delivery_metadata("android_snapshot", image_format, image_quality),
         "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
         "total_elements": total_elements,
         "returned_elements": len(returned_elements),
@@ -243,16 +271,16 @@ async def android_snapshot(
     annotations=READ_ONLY,
 )
 async def android_screenshot(
-    image_format: Literal["png", "jpeg"] = "png",
-    image_quality: int = 80,
-    max_width: int | None = None,
+    image_format: Annotated[
+        Literal["png", "jpeg"],
+        Field(description="JPEG is smaller; use PNG to retry with original lossless quality."),
+    ] = "jpeg",
+    image_quality: Annotated[
+        int,
+        Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
+    ] = 60,
 ) -> CallToolResult:
-    """Return a configurable Android screenshot and basic screen metadata."""
-
-    if not 1 <= image_quality <= 100:
-        raise ValueError("image_quality must be between 1 and 100")
-    if max_width is not None and not 240 <= max_width <= 4_096:
-        raise ValueError("max_width must be between 240 and 4096")
+    """Return an original-resolution Android screenshot and basic screen metadata."""
 
     try:
         snapshot = await session.require_controller().snapshot(
@@ -278,7 +306,6 @@ async def android_screenshot(
         snapshot.screenshot_png,
         image_format=image_format,
         image_quality=image_quality,
-        max_width=max_width,
     )
     metadata = {
         "success": True,
@@ -288,6 +315,7 @@ async def android_screenshot(
         "image_format": image_format,
         "image_width": image_width,
         "image_height": image_height,
+        **_image_delivery_metadata("android_screenshot", image_format, image_quality),
         "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
     }
     return CallToolResult(

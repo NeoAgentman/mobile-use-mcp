@@ -16,6 +16,7 @@ from mobile_use_mcp.server import (
     android_connect,
     android_get_ui_elements,
     android_list_devices,
+    android_screenshot,
     android_snapshot,
     android_status,
     mcp,
@@ -98,10 +99,20 @@ async def test_snapshot_returns_image_and_structured_ui(
     assert result.structuredContent["total_elements"] == 1
     assert result.structuredContent["truncated"] is False
     assert str(result.structuredContent["snapshot_id"]).startswith("s-")
+    assert result.structuredContent["image_format"] == "jpeg"
+    assert result.structuredContent["image_quality"] == 60
+    assert result.structuredContent["image_lossless"] is False
+    assert result.structuredContent["image_width"] == 1080
+    assert result.structuredContent["image_height"] == 2400
+    assert result.structuredContent["lossless_fallback"] == {
+        "tool": "android_snapshot",
+        "arguments": {"image_format": "png"},
+    }
+    assert 'image_format="png"' in result.structuredContent["quality_notice"]
     assert any(isinstance(content, ImageContent) for content in result.content)
 
 
-async def test_snapshot_supports_downscaled_jpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_snapshot_supports_explicit_lossless_png(monkeypatch: pytest.MonkeyPatch) -> None:
     image = BytesIO()
     Image.new("RGB", (1080, 2400)).save(image, format="PNG")
     controller = Mock()
@@ -117,14 +128,46 @@ async def test_snapshot_supports_downscaled_jpeg(monkeypatch: pytest.MonkeyPatch
     )
     monkeypatch.setattr(session, "require_controller", lambda: controller)
 
-    result = await android_snapshot(image_format="jpeg", image_quality=60, max_width=540)
+    result = await android_snapshot(image_format="png")
 
     assert result.structuredContent is not None
     assert result.structuredContent["width"] == 1080
-    assert result.structuredContent["image_width"] == 540
-    assert result.structuredContent["image_height"] == 1200
+    assert result.structuredContent["image_width"] == 1080
+    assert result.structuredContent["image_height"] == 2400
+    assert result.structuredContent["image_lossless"] is True
+    assert result.structuredContent["image_quality"] is None
+    assert result.structuredContent["lossless_fallback"] is None
     image_content = next(item for item in result.content if isinstance(item, ImageContent))
-    assert image_content.mimeType == "image/jpeg"
+    assert image_content.mimeType == "image/png"
+
+
+async def test_screenshot_default_mentions_lossless_upgrade(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = BytesIO()
+    Image.new("RGB", (1080, 2400)).save(image, format="PNG")
+    controller = Mock()
+    controller.snapshot = AsyncMock(
+        return_value=ScreenSnapshot(
+            serial="ABC",
+            width=1080,
+            height=2400,
+            screenshot_png=image.getvalue(),
+            elements=[],
+            foreground_app=ForegroundApp(),
+        )
+    )
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    result = await android_screenshot()
+
+    assert result.structuredContent is not None
+    assert result.structuredContent["image_format"] == "jpeg"
+    assert result.structuredContent["image_quality"] == 60
+    assert result.structuredContent["lossless_fallback"] == {
+        "tool": "android_screenshot",
+        "arguments": {"image_format": "png"},
+    }
 
 
 async def test_snapshot_marks_truncation_and_supports_full_fallback(
