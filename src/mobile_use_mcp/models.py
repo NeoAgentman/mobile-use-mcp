@@ -82,6 +82,20 @@ class UIElement(StrictModel):
         return self.clickable or self.focusable or self.scrollable
 
 
+class ForegroundApp(StrictModel):
+    package: str | None = None
+    activity: str | None = None
+
+
+class ScreenSnapshot(StrictModel):
+    serial: str
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    screenshot_png: bytes
+    elements: list[UIElement]
+    foreground_app: ForegroundApp
+
+
 class SelectorAttempt(StrictModel):
     selector: str
     matched: bool
