@@ -251,6 +251,9 @@ MOBILE_USE_ANDROID_SERIAL=ABC123 uv run pytest -m android
 Device tests are excluded from the default test run and require an explicit serial so the test
 suite never selects and operates a connected phone accidentally.
 
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for current Codex, Claude Code, MCP client, and real
+device verification results.
+
 ## Known limitations
 
 - Custom-rendered Canvas/game interfaces may not expose useful accessibility elements; coordinate

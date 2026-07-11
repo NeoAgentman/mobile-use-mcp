@@ -1,10 +1,16 @@
 """Opt-in tests that require an explicitly selected Android device."""
 
 import os
+import sys
 from collections.abc import AsyncIterator
+from datetime import timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import ImageContent
 
 from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.devices import DeviceRegistry
@@ -87,3 +93,56 @@ async def test_unicode_text_input_and_clear(android_controller: AndroidControlle
     finally:
         await android_controller.clear_text(target=target)
         await android_controller.press_key("home")
+
+
+async def test_stdio_mcp_on_real_device() -> None:
+    serial = os.environ["MOBILE_USE_ANDROID_SERIAL"]
+    project_root = Path(__file__).resolve().parents[2]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mobile_use_mcp"],
+        cwd=project_root,
+    )
+
+    async with (
+        stdio_client(parameters) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as client,
+    ):
+        await client.initialize()
+        connected = await client.call_tool(
+            "android_connect",
+            {"serial": serial},
+            read_timeout_seconds=timedelta(seconds=30),
+        )
+        try:
+            snapshot = await client.call_tool(
+                "android_snapshot",
+                {"max_elements": 200},
+                read_timeout_seconds=timedelta(seconds=30),
+            )
+            launched = await client.call_tool(
+                "android_launch_app",
+                {"package": "com.android.settings"},
+                read_timeout_seconds=timedelta(seconds=60),
+            )
+        finally:
+            await client.call_tool(
+                "android_press_key",
+                {"key": "home"},
+                read_timeout_seconds=timedelta(seconds=30),
+            )
+            await client.call_tool(
+                "android_disconnect",
+                read_timeout_seconds=timedelta(seconds=30),
+            )
+
+    assert connected.structuredContent is not None
+    assert connected.structuredContent["success"] is True
+    assert snapshot.structuredContent is not None
+    assert snapshot.structuredContent["serial"] == serial
+    assert snapshot.structuredContent["element_count"] > 0
+    assert any(isinstance(content, ImageContent) for content in snapshot.content)
+    assert launched.structuredContent is not None
+    assert launched.structuredContent["data"]["foreground_app"]["package"] == (
+        "com.android.settings"
+    )

@@ -216,15 +216,15 @@ mobile-use-mcp/
 
 ### 真机或模拟器测试
 
-- [ ] 连接一台启用 USB debugging 的设备
+- [x] 连接一台启用 USB debugging 的设备
 - [x] 获取截图和 UI hierarchy
 - [x] 打开 Android Settings
 - [x] 通过 resource ID 或 text 点击设置项
 - [x] 滑动页面
 - [x] 聚焦输入框并输入中文、英文、空格和特殊字符
-- [x] back/home（enter 仍待专门输入场景）
+- [x] back/home/enter
 - [x] 启动 App
-- [ ] 停止 App 和打开 URL
+- [x] 停止 App 和打开 URL
 - [ ] 断开设备后验证错误恢复
 
 ## Phase 5：Codex 与 Claude Code 接入
@@ -233,12 +233,12 @@ mobile-use-mcp/
 
 - [x] 提供 Codex `config.toml` stdio MCP 配置示例
 - [x] 提供 Claude Code MCP 配置示例
-- [ ] Codex 能发现全部工具
-- [ ] Claude Code 能发现全部工具
-- [ ] 验证宿主 Agent 能读取 snapshot 图像和 UI elements
-- [ ] 用 Codex 完成一个多步骤 Android 任务
+- [x] Codex 能发现全部工具
+- [x] Claude Code MCP health check 能发现并连接 Server
+- [x] 验证宿主 Agent 能读取 snapshot 图像和 UI elements
+- [x] 用 Codex 完成一个多步骤 Android 任务
 - [ ] 用 Claude Code 完成同等任务
-- [ ] 记录两者对截图、UI tree 和错误返回的兼容差异
+- [x] 在 `COMPATIBILITY.md` 记录当前兼容性和 Claude Code 登录阻塞
 
 ### 建议验收任务
 
@@ -296,6 +296,6 @@ mobile-use-mcp/
 - [x] Server 能以 MCP image content 和结构化结果返回截图/UI hierarchy
 - [x] 点击、滑动、输入、按键和 App 生命周期操作已实现并通过 Mock 测试
 - [x] 失败结果包含明确错误码和下一步建议
-- [ ] 一台真实 Android 设备或模拟器完成端到端验收任务
+- [x] 一台真实 Android 设备完成端到端验收任务
 - [x] 所有非设备集成测试通过
 - [x] README、LICENSE、NOTICE 和来源说明齐全
