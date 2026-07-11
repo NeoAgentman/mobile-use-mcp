@@ -19,7 +19,11 @@ def test_encode_screenshot_preserves_png_dimensions() -> None:
 
 def test_encode_screenshot_defaults_to_original_resolution_jpeg_quality() -> None:
     data, width, height = encode_screenshot(_png())
+    explicit_quality_60, _, _ = encode_screenshot(_png(), image_format="jpeg", image_quality=60)
+    quality_90, _, _ = encode_screenshot(_png(), image_format="jpeg", image_quality=90)
     assert data.startswith(b"\xff\xd8")
     assert (width, height) == (1000, 2000)
+    assert data == explicit_quality_60
+    assert data != quality_90
     with Image.open(BytesIO(data)) as image:
         assert image.mode == "RGB"
