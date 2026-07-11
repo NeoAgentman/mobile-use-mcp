@@ -21,9 +21,13 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 ## Claude Code
 
 - MCP health check: connected.
-- Host-agent task: pending because the local Claude Code installation is not authenticated
-  (`Not logged in · Please run /login`).
-- No mobile-use MCP protocol incompatibility was observed before the authentication gate.
+- The stock `claude` command was not authenticated, so host-agent validation used the user's
+  Claude Code-compatible `cc-ark` zsh function.
+- `cc-ark` host-agent task: passed.
+- Task: connect the phone, open Settings, navigate to About phone, read Model name and Model
+  number, press Home, and disconnect.
+- Result: `HUAWEI P20`, `EML-AL00`.
+- No mobile-use MCP protocol incompatibility was observed.
 
 ## Device behavior
 

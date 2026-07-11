@@ -237,7 +237,7 @@ mobile-use-mcp/
 - [x] Claude Code MCP health check 能发现并连接 Server
 - [x] 验证宿主 Agent 能读取 snapshot 图像和 UI elements
 - [x] 用 Codex 完成一个多步骤 Android 任务
-- [ ] 用 Claude Code 完成同等任务
+- [x] 用兼容 Claude Code 用法的 `cc-ark` 完成同等任务
 - [x] 在 `COMPATIBILITY.md` 记录当前兼容性和 Claude Code 登录阻塞
 
 ### 建议验收任务
