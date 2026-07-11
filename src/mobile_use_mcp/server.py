@@ -2,14 +2,15 @@
 
 import asyncio
 import json
-from typing import Any
+from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
+from pydantic import Field
 
 from mobile_use_mcp.errors import MobileUseError
-from mobile_use_mcp.models import OperationResult
+from mobile_use_mcp.models import OperationResult, Target
 from mobile_use_mcp.session import SessionManager
 
 mcp = FastMCP("mobile_use_mcp")
@@ -26,6 +27,12 @@ SESSION_WRITE = ToolAnnotations(
     destructiveHint=False,
     idempotentHint=False,
     openWorldHint=False,
+)
+OPEN_WORLD_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=True,
 )
 
 
@@ -295,6 +302,263 @@ async def android_list_apps(query: str | None = None, limit: int = 100) -> dict[
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     return {"success": True, "count": len(apps), "apps": apps}
+
+
+def _unexpected_failure(action: str) -> dict[str, Any]:
+    return OperationResult(
+        success=False,
+        error_code="OPERATION_FAILED",
+        message=f"Android {action} failed.",
+        suggestion="Call android_snapshot to inspect the current device state, then retry.",
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_tap",
+    title="Tap Android UI target",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_tap(target: Target) -> dict[str, Any]:
+    """Tap a target using bounds, resource ID, then text as selector fallbacks."""
+
+    try:
+        async with session.write_lock:
+            details = await session.require_controller().tap(target)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("tap")
+    return OperationResult(
+        success=True,
+        message=f"Tapped using {details['selector']}.",
+        data=details,
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_long_press",
+    title="Long press Android UI target",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_long_press(
+    target: Target,
+    duration_ms: Annotated[int, Field(ge=100, le=10_000)] = 1_000,
+) -> dict[str, Any]:
+    """Long press a target for a bounded duration in milliseconds."""
+
+    try:
+        async with session.write_lock:
+            details = await session.require_controller().long_press(target, duration_ms)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("long press")
+    return OperationResult(
+        success=True,
+        message=f"Long pressed using {details['selector']}.",
+        data=details,
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_swipe",
+    title="Swipe Android screen",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_swipe(
+    start_x: Annotated[int, Field(ge=0)],
+    start_y: Annotated[int, Field(ge=0)],
+    end_x: Annotated[int, Field(ge=0)],
+    end_y: Annotated[int, Field(ge=0)],
+    duration_ms: Annotated[int, Field(ge=1, le=10_000)] = 400,
+) -> dict[str, Any]:
+    """Swipe between two pixel coordinates validated against the current screen."""
+
+    try:
+        async with session.write_lock:
+            await session.require_controller().swipe(
+                start_x,
+                start_y,
+                end_x,
+                end_y,
+                duration_ms,
+            )
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("swipe")
+    return OperationResult(
+        success=True,
+        message=f"Swiped from ({start_x}, {start_y}) to ({end_x}, {end_y}).",
+        data={
+            "start": {"x": start_x, "y": start_y},
+            "end": {"x": end_x, "y": end_y},
+            "duration_ms": duration_ms,
+        },
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_type_text",
+    title="Type text on Android",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_type_text(
+    text: Annotated[str, Field(min_length=1, max_length=10_000)],
+) -> dict[str, Any]:
+    """Type text into the currently focused Android input field."""
+
+    try:
+        async with session.write_lock:
+            method = await session.require_controller().type_text(text)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("text input")
+    return OperationResult(
+        success=True,
+        message="Text was entered into the focused field.",
+        data={"method": method, "character_count": len(text)},
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_clear_text",
+    title="Clear focused Android text",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_clear_text(
+    max_characters: Annotated[int, Field(ge=1, le=2_000)] = 100,
+) -> dict[str, Any]:
+    """Delete up to max_characters from the currently focused Android field."""
+
+    try:
+        async with session.write_lock:
+            await session.require_controller().clear_text(max_characters)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("text clearing")
+    return OperationResult(
+        success=True,
+        message=f"Sent {max_characters} delete key events to the focused field.",
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_press_key",
+    title="Press Android key",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_press_key(key: str) -> dict[str, Any]:
+    """Press one allowed Android key such as back, home, enter, delete, or tab."""
+
+    try:
+        async with session.write_lock:
+            await session.require_controller().press_key(key)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("key press")
+    return OperationResult(success=True, message=f"Pressed Android key {key!r}.").model_dump(
+        mode="json"
+    )
+
+
+@mcp.tool(
+    name="android_launch_app",
+    title="Launch Android app",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_launch_app(
+    package: Annotated[str, Field(min_length=1, max_length=512)],
+) -> dict[str, Any]:
+    """Launch an installed package and wait until it reaches the foreground."""
+
+    try:
+        async with session.write_lock:
+            foreground = await session.require_controller().launch_app(package)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("app launch")
+    return OperationResult(
+        success=True,
+        message=f"Launched Android app {package!r}.",
+        data={"foreground_app": foreground.model_dump(mode="json")},
+    ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_terminate_app",
+    title="Terminate Android app",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_terminate_app(
+    package: Annotated[str, Field(min_length=1, max_length=512)],
+) -> dict[str, Any]:
+    """Force-stop one installed Android package."""
+
+    try:
+        async with session.write_lock:
+            await session.require_controller().terminate_app(package)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("app termination")
+    return OperationResult(success=True, message=f"Terminated Android app {package!r}.").model_dump(
+        mode="json"
+    )
+
+
+@mcp.tool(
+    name="android_open_url",
+    title="Open URL on Android",
+    annotations=OPEN_WORLD_WRITE,
+    structured_output=True,
+)
+async def android_open_url(
+    url: Annotated[str, Field(min_length=8, max_length=4_096)],
+) -> dict[str, Any]:
+    """Open one absolute HTTP or HTTPS URL in the Android default browser."""
+
+    try:
+        async with session.write_lock:
+            await session.require_controller().open_url(url)
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _unexpected_failure("URL open")
+    return OperationResult(success=True, message="Opened the URL on Android.").model_dump(
+        mode="json"
+    )
+
+
+@mcp.tool(
+    name="android_wait",
+    title="Wait for Android UI",
+    annotations=READ_ONLY,
+    structured_output=True,
+)
+async def android_wait(
+    milliseconds: Annotated[int, Field(ge=0, le=60_000)] = 1_000,
+) -> dict[str, Any]:
+    """Wait for a bounded delay before observing the Android UI again."""
+
+    await asyncio.sleep(milliseconds / 1_000)
+    return OperationResult(
+        success=True,
+        message=f"Waited {milliseconds} milliseconds.",
+        data={"milliseconds": milliseconds},
+    ).model_dump(mode="json")
 
 
 def main() -> None:
