@@ -46,6 +46,21 @@ class SessionManager:
                 "No Android device is connected to the MCP session.",
                 "Call android_connect before using device tools.",
             )
+        try:
+            current = self.registry.select(self._device.serial)
+        except MobileUseError as error:
+            if error.code in {
+                ErrorCode.DEVICE_NOT_FOUND,
+                ErrorCode.DEVICE_OFFLINE,
+            }:
+                raise MobileUseError(
+                    ErrorCode.DEVICE_DISCONNECTED,
+                    f"Android device {self._device.serial!r} is no longer connected and ready.",
+                    "Reconnect the device, verify `adb devices -l`, then call "
+                    "android_connect again.",
+                ) from error
+            raise
+        self._device = current
         return self._controller
 
     def disconnect(self) -> None:

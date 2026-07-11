@@ -91,3 +91,16 @@ async def test_snapshot_returns_image_and_structured_ui(
     assert result.structuredContent is not None
     assert result.structuredContent["element_count"] == 1
     assert any(isinstance(content, ImageContent) for content in result.content)
+
+
+async def test_snapshot_hides_internal_exception(monkeypatch: pytest.MonkeyPatch) -> None:
+    controller = Mock()
+    controller.snapshot = AsyncMock(side_effect=RuntimeError("secret internal detail"))
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    result = await android_snapshot()
+
+    assert result.isError is True
+    assert "secret internal detail" not in str(result)
+    assert result.structuredContent is not None
+    assert result.structuredContent["error_code"] == "OPERATION_FAILED"

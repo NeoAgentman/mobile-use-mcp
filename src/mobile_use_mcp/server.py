@@ -222,6 +222,13 @@ async def android_screenshot() -> CallToolResult:
             content=[TextContent(type="text", text=json.dumps(failure))],
             structuredContent=failure,
         )
+    except Exception:
+        failure = _observation_failure("capture the Android screenshot")
+        return CallToolResult(
+            isError=True,
+            content=[TextContent(type="text", text=json.dumps(failure))],
+            structuredContent=failure,
+        )
     metadata = {
         "success": True,
         "serial": snapshot.serial,
@@ -257,6 +264,8 @@ async def android_get_ui_elements(
         )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _observation_failure("read Android UI elements")
     return {
         "success": True,
         "serial": snapshot.serial,
@@ -280,6 +289,8 @@ async def android_get_foreground_app() -> dict[str, Any]:
         foreground = await session.require_controller().get_foreground_app()
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _observation_failure("read the foreground Android app")
     return {
         "success": True,
         "foreground_app": foreground.model_dump(mode="json"),
@@ -301,7 +312,18 @@ async def android_list_apps(query: str | None = None, limit: int = 100) -> dict[
         apps = await session.require_controller().list_apps(query=query, limit=limit)
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
+    except Exception:
+        return _observation_failure("list installed Android apps")
     return {"success": True, "count": len(apps), "apps": apps}
+
+
+def _observation_failure(action: str) -> dict[str, Any]:
+    return OperationResult(
+        success=False,
+        error_code="OPERATION_FAILED",
+        message=f"Failed to {action}.",
+        suggestion="Verify the device is connected, unlocked, and responsive, then retry.",
+    ).model_dump(mode="json")
 
 
 def _unexpected_failure(action: str) -> dict[str, Any]:
