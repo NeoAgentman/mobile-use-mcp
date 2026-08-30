@@ -6,6 +6,18 @@ from collections.abc import Sequence
 from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import DeviceInfo, DeviceState
+from mobile_use_mcp.processes import (
+    ProcessError,
+    ProcessOutputLimitError,
+    ProcessRunner,
+    ProcessStartError,
+    ProcessTimeoutError,
+)
+
+# Keep the module-level object as a compatibility patch seam for integrations
+# that used to replace ``mobile_use_mcp.devices.subprocess.run``.  Production
+# execution is delegated to ProcessRunner below.
+_SUBPROCESS_MODULE = subprocess
 
 
 def parse_adb_devices(output: str) -> list[DeviceInfo]:
@@ -52,6 +64,7 @@ class DeviceRegistry:
         adb_port: int | None = None,
         command_timeout: float | None = None,
         config: RuntimeConfig | None = None,
+        process_runner: ProcessRunner | None = None,
     ):
         """Create a registry using one immutable runtime configuration.
 
@@ -66,10 +79,9 @@ class DeviceRegistry:
         self.adb_host = adb_host if adb_host is not None else runtime.adb_host
         self.adb_port = adb_port if adb_port is not None else runtime.adb_port
         self.command_timeout = (
-            command_timeout
-            if command_timeout is not None
-            else runtime.subprocess_timeout_seconds
+            command_timeout if command_timeout is not None else runtime.subprocess_timeout_seconds
         )
+        self.process_runner = process_runner or ProcessRunner.from_config(runtime)
 
     def _adb_command(self, *arguments: str) -> list[str]:
         command = [self.adb_path]
@@ -85,26 +97,64 @@ class DeviceRegistry:
         """Run a bounded, value-free ADB availability probe."""
 
         try:
-            result = subprocess.run(
+            result = self.process_runner.run_sync(
                 self._adb_command("version"),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.command_timeout,
+                timeout_seconds=self.command_timeout,
             )
-        except FileNotFoundError as error:
+        except ProcessStartError as error:
             raise MobileUseError(
                 ErrorCode.ADB_UNAVAILABLE,
                 "ADB executable was not found.",
                 "Install Android platform-tools or configure a valid ADB executable.",
             ) from error
-        except subprocess.TimeoutExpired as error:
+        except ProcessTimeoutError as error:
             raise MobileUseError(
                 ErrorCode.TIMEOUT,
                 "Timed out while checking ADB availability.",
                 "Check the configured ADB endpoint and restart the ADB server.",
             ) from error
-        except OSError as error:
+        except (ProcessError, OSError) as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "The configured ADB executable could not be started.",
+                "Check the configured ADB executable permissions.",
+            ) from error
+        if result.returncode != 0:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "ADB did not respond successfully.",
+                "Check the configured ADB endpoint and run `adb version` manually.",
+            )
+        return "available"
+
+    async def acheck_adb(self) -> str:
+        """Cancellable ADB availability probe for async session callers."""
+
+        try:
+            result = await self.process_runner.run(
+                self._adb_command("version"),
+                timeout_seconds=self.command_timeout,
+            )
+        except ProcessStartError as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "ADB executable was not found.",
+                "Install Android platform-tools or configure a valid ADB executable.",
+            ) from error
+        except ProcessTimeoutError as error:
+            raise MobileUseError(
+                ErrorCode.TIMEOUT,
+                "Timed out while checking ADB availability.",
+                "Check the configured ADB endpoint and restart the ADB server.",
+            ) from error
+        except ProcessOutputLimitError as error:
+            raise MobileUseError(
+                ErrorCode.OPERATION_FAILED,
+                "ADB returned more data than the configured subprocess budget.",
+                "Increase the subprocess output budget only when the probe requires it.",
+                data={"stream": error.stream, "limit": error.limit},
+            ) from error
+        except (ProcessError, OSError) as error:
             raise MobileUseError(
                 ErrorCode.ADB_UNAVAILABLE,
                 "The configured ADB executable could not be started.",
@@ -123,24 +173,34 @@ class DeviceRegistry:
 
         command = self._adb_command("-s", serial, "shell", *arguments)
         try:
-            result = subprocess.run(
+            result = self.process_runner.run_sync(
                 command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.command_timeout,
+                timeout_seconds=self.command_timeout,
             )
-        except FileNotFoundError as error:
+        except ProcessStartError as error:
             raise MobileUseError(
                 ErrorCode.ADB_UNAVAILABLE,
                 "ADB executable was not found.",
                 "Install Android platform-tools or configure a valid ADB executable.",
             ) from error
-        except subprocess.TimeoutExpired as error:
+        except ProcessTimeoutError as error:
             raise MobileUseError(
                 ErrorCode.TIMEOUT,
                 "Timed out while running the Android capability probe.",
                 "Check the selected device and ADB endpoint, then retry.",
+            ) from error
+        except ProcessOutputLimitError as error:
+            raise MobileUseError(
+                ErrorCode.OPERATION_FAILED,
+                "ADB returned more data than the configured subprocess budget.",
+                "Increase the subprocess output budget only when the probe requires it.",
+                data={"stream": error.stream, "limit": error.limit},
+            ) from error
+        except (ProcessError, OSError) as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "The configured ADB executable could not be started.",
+                "Check the configured ADB executable permissions.",
             ) from error
         if result.returncode != 0:
             raise MobileUseError(
@@ -148,37 +208,76 @@ class DeviceRegistry:
                 "ADB could not run the Android capability probe.",
                 "Verify that the selected device is online and authorized.",
             )
-        output_size = len(result.stdout.encode("utf-8", errors="replace"))
-        if output_size > self.config.subprocess_max_output_bytes:
+        return result.stdout_text
+
+    async def ashell(self, serial: str, arguments: Sequence[str]) -> str:
+        """Cancellable parameterized ADB shell probe."""
+
+        command = self._adb_command("-s", serial, "shell", *arguments)
+        try:
+            result = await self.process_runner.run(
+                command,
+                timeout_seconds=self.command_timeout,
+            )
+        except ProcessStartError as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "ADB executable was not found.",
+                "Install Android platform-tools or configure a valid ADB executable.",
+            ) from error
+        except ProcessTimeoutError as error:
+            raise MobileUseError(
+                ErrorCode.TIMEOUT,
+                "Timed out while running the Android capability probe.",
+                "Check the selected device and ADB endpoint, then retry.",
+            ) from error
+        except ProcessOutputLimitError as error:
             raise MobileUseError(
                 ErrorCode.OPERATION_FAILED,
                 "ADB returned more data than the configured subprocess budget.",
                 "Increase the subprocess output budget only when the probe requires it.",
+                data={"stream": error.stream, "limit": error.limit},
+            ) from error
+        except (ProcessError, OSError) as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "The configured ADB executable could not be started.",
+                "Check the configured ADB executable permissions.",
+            ) from error
+        if result.returncode != 0:
+            raise MobileUseError(
+                ErrorCode.OPERATION_FAILED,
+                "ADB could not run the Android capability probe.",
+                "Verify that the selected device is online and authorized.",
             )
-        return result.stdout
+        return result.stdout_text
 
     def list_devices(self) -> list[DeviceInfo]:
         try:
-            result = subprocess.run(
+            result = self.process_runner.run_sync(
                 self._adb_command("devices", "-l"),
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=self.command_timeout,
+                timeout_seconds=self.command_timeout,
             )
-        except FileNotFoundError as error:
+        except ProcessStartError as error:
             raise MobileUseError(
                 ErrorCode.ADB_UNAVAILABLE,
                 "ADB executable was not found.",
                 "Install Android platform-tools and ensure adb is available on PATH.",
             ) from error
-        except subprocess.TimeoutExpired as error:
+        except ProcessTimeoutError as error:
             raise MobileUseError(
                 ErrorCode.TIMEOUT,
                 "Timed out while listing Android devices.",
                 "Restart the ADB server and try again.",
             ) from error
-        except OSError as error:
+        except ProcessOutputLimitError as error:
+            raise MobileUseError(
+                ErrorCode.OPERATION_FAILED,
+                "ADB returned more data than the configured subprocess budget.",
+                "Increase the subprocess output budget only when device discovery requires it.",
+                data={"stream": error.stream, "limit": error.limit},
+            ) from error
+        except (ProcessError, OSError) as error:
             raise MobileUseError(
                 ErrorCode.ADB_UNAVAILABLE,
                 "The configured ADB executable could not be started.",
@@ -191,14 +290,48 @@ class DeviceRegistry:
                 "ADB failed while listing devices.",
                 "Run `adb devices -l` manually and resolve the reported ADB error.",
             )
-        output_size = len(result.stdout.encode("utf-8", errors="replace"))
-        if output_size > self.config.subprocess_max_output_bytes:
+        return parse_adb_devices(result.stdout_text)
+
+    async def alist_devices(self) -> list[DeviceInfo]:
+        """Cancellable ADB device discovery for async session callers."""
+
+        try:
+            result = await self.process_runner.run(
+                self._adb_command("devices", "-l"),
+                timeout_seconds=self.command_timeout,
+            )
+        except ProcessStartError as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "ADB executable was not found.",
+                "Install Android platform-tools and ensure adb is available on PATH.",
+            ) from error
+        except ProcessTimeoutError as error:
+            raise MobileUseError(
+                ErrorCode.TIMEOUT,
+                "Timed out while listing Android devices.",
+                "Restart the ADB server and try again.",
+            ) from error
+        except ProcessOutputLimitError as error:
             raise MobileUseError(
                 ErrorCode.OPERATION_FAILED,
                 "ADB returned more data than the configured subprocess budget.",
                 "Increase the subprocess output budget only when device discovery requires it.",
+                data={"stream": error.stream, "limit": error.limit},
+            ) from error
+        except (ProcessError, OSError) as error:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "The configured ADB executable could not be started.",
+                "Check the configured ADB executable permissions.",
+            ) from error
+        if result.returncode != 0:
+            raise MobileUseError(
+                ErrorCode.ADB_UNAVAILABLE,
+                "ADB failed while listing devices.",
+                "Run `adb devices -l` manually and resolve the reported ADB error.",
             )
-        return parse_adb_devices(result.stdout)
+        return parse_adb_devices(result.stdout_text)
 
     def select(self, serial: str | None = None) -> DeviceInfo:
         devices = self.list_devices()

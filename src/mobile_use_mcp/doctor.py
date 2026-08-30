@@ -9,7 +9,6 @@ authorized device is online unless the caller supplies an exact serial.
 
 from __future__ import annotations
 
-import asyncio
 import shutil
 import time
 from collections.abc import Callable
@@ -21,6 +20,7 @@ from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.devices import DeviceRegistry
 from mobile_use_mcp.errors import MobileUseError
 from mobile_use_mcp.models import DeviceInfo, DeviceState, DoctorCheck, DoctorResult, DoctorStatus
+from mobile_use_mcp.processes import ProcessTimeoutError, run_blocking
 
 U2Connector = Callable[[str], AndroidDevice]
 
@@ -355,18 +355,16 @@ async def run_doctor_bounded(
 
     runtime = config or RuntimeConfig.defaults()
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                run_doctor,
-                runtime,
-                serial=serial,
-                registry=registry,
-                u2_connector=u2_connector,
-                operation_id=operation_id,
-            ),
-            timeout=runtime.operation_timeout_seconds,
+        return await run_blocking(
+            run_doctor,
+            runtime,
+            serial=serial,
+            registry=registry,
+            u2_connector=u2_connector,
+            operation_id=operation_id,
+            timeout_seconds=runtime.operation_timeout_seconds,
         )
-    except TimeoutError:
+    except ProcessTimeoutError:
         checks = [
             DoctorCheck(
                 name=name,

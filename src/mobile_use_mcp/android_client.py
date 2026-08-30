@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from io import BytesIO
+from threading import Lock
 from typing import Protocol, cast
 
 import uiautomator2  # pyright: ignore[reportMissingTypeStubs]
@@ -33,6 +34,25 @@ class AndroidDevice(Protocol):
 DeviceConnector = Callable[[str], AndroidDevice]
 
 
+def _close_device(device: AndroidDevice | None) -> None:
+    """Stop concrete uiautomator2 transports without requiring its private API."""
+
+    if device is None:
+        return
+    close = getattr(device, "close", None)
+    if callable(close):
+        with suppress(Exception):
+            close()
+        return
+    # Current uiautomator2 exposes ``stop_uiautomator`` rather than ``close``.
+    # ``wait=False`` avoids a second unbounded health-poll during cancellation;
+    # the adb socket timeout and process owner already bound the operation.
+    stop = getattr(device, "stop_uiautomator", None)
+    if callable(stop):
+        with suppress(Exception):
+            stop(wait=False)
+
+
 def _default_connector(serial: str, config: RuntimeConfig | None = None) -> AndroidDevice:
     """Connect uiautomator2 through the configured ADB endpoint.
 
@@ -46,7 +66,11 @@ def _default_connector(serial: str, config: RuntimeConfig | None = None) -> Andr
         return cast(AndroidDevice, uiautomator2.connect(serial))
     from adbutils import AdbClient  # pyright: ignore[reportMissingTypeStubs]
 
-    adb_device = AdbClient(host=config.adb_host, port=config.adb_port).device(serial=serial)
+    adb_device = AdbClient(
+        host=config.adb_host,
+        port=config.adb_port,
+        socket_timeout=config.subprocess_timeout_seconds,
+    ).device(serial=serial)
     return cast(AndroidDevice, uiautomator2.connect(adb_device))
 
 
@@ -66,6 +90,7 @@ class AndroidClient:
         if connector is not None:
             connector_impl = connector
         elif config is not None:
+
             def configured_connector(value: str) -> AndroidDevice:
                 return _default_connector(value, self.config)
 
@@ -74,23 +99,44 @@ class AndroidClient:
             connector_impl = _default_connector
         self._connector = connector_impl
         self._device: AndroidDevice | None = None
+        self._state_lock = Lock()
+        self._generation = 0
 
     def connect(self) -> None:
+        with self._state_lock:
+            generation = self._generation
         device = self._connector(self.serial)
         _ = device.info
-        self._device = device
+        # A timed-out/cancelled connect can finish after disconnect has
+        # already released the adapter.  Do not publish that stale device back
+        # into the client, and close it when the concrete adapter supports it.
+        with self._state_lock:
+            stale = generation != self._generation
+            if not stale:
+                self._device = device
+        if stale:
+            _close_device(device)
+            raise RuntimeError("Android connection was closed while it started")
 
     def ensure_connected(self) -> AndroidDevice:
-        if self._device is None:
+        with self._state_lock:
+            device = self._device
+        if device is None:
             self.connect()
-        assert self._device is not None
+            with self._state_lock:
+                device = self._device
+        assert device is not None
         try:
-            _ = self._device.info
+            _ = device.info
         except Exception:
-            self._device = None
+            with self._state_lock:
+                if self._device is device:
+                    self._device = None
             self.connect()
-        assert self._device is not None
-        return self._device
+            with self._state_lock:
+                device = self._device
+        assert device is not None
+        return device
 
     def get_screen(self) -> tuple[bytes, str, int, int]:
         device = self.ensure_connected()
@@ -132,13 +178,12 @@ class AndroidClient:
             device.set_input_ime(False)
 
     def disconnect(self) -> None:
-        device = self._device
-        self._device = None
+        with self._state_lock:
+            self._generation += 1
+            device = self._device
+            self._device = None
         # uiautomator2 currently exposes ``close`` on its concrete device in
         # some releases but not in its public protocol.  Close when present so
         # doctor probes and normal session shutdown do not retain a socket;
         # lightweight fakes remain compatible because this is optional.
-        close = getattr(device, "close", None)
-        if callable(close):
-            with suppress(Exception):
-                close()
+        _close_device(device)

@@ -6,6 +6,7 @@ lifecycle without knowing how ADB or uiautomator2 are initialized.
 """
 
 import asyncio
+import inspect
 from collections.abc import Callable
 from contextlib import suppress
 from threading import Lock, RLock
@@ -26,6 +27,7 @@ from mobile_use_mcp.models import (
     SessionLifecycle,
 )
 from mobile_use_mcp.operations import OperationContext, OperationGateway, current_operation
+from mobile_use_mcp.processes import run_blocking
 
 ControllerFactory = Callable[[str], AndroidController]
 
@@ -309,6 +311,50 @@ class DeviceSession:
                     with self._state_lock:
                         if self._active_operation_id == effective_operation_id:
                             self._active_operation_id = None
+
+    async def alist_devices(
+        self,
+        *,
+        operation_id: str | None = None,
+        operation: OperationContext | None = None,
+    ) -> list[DeviceInfo]:
+        """Cancellable device discovery for the async MCP boundary."""
+
+        active_operation = _effective_operation(operation)
+        effective_operation_id = operation_id or (
+            active_operation.operation_id if active_operation is not None else _new_operation_id()
+        )
+        _checkpoint(active_operation)
+        with self._state_lock:
+            self._active_operation_id = effective_operation_id
+        try:
+            # Preserve the deterministic fake seam used by embedders that
+            # replace the legacy sync method, while production registries use
+            # the cancellable process-runner path.
+            if (
+                "list_devices" not in vars(self.registry)
+                and type(self.registry).list_devices is DeviceRegistry.list_devices
+            ):
+                devices = await self.registry.alist_devices()
+            else:
+                devices = await run_blocking(
+                    self.registry.list_devices,
+                    timeout_seconds=self.config.subprocess_timeout_seconds,
+                )
+            _checkpoint(active_operation)
+            return devices
+        except MobileUseError as error:
+            _commit(
+                active_operation,
+                lambda error=error: self._set_last_error(_lifecycle_error(error)),
+                "error_commit",
+            )
+            raise
+        finally:
+            if active_operation is None:
+                with self._state_lock:
+                    if self._active_operation_id == effective_operation_id:
+                        self._active_operation_id = None
 
     def _set_last_error(self, error: LifecycleError | None) -> None:
         with self._state_lock:
@@ -754,14 +800,96 @@ class DeviceSession:
         operation_id = self.new_operation_id()
         return await self.run_operation(
             "disconnect",
-            lambda context: asyncio.to_thread(
-                self.disconnect,
-                operation_id=context.operation_id,
-            ),
+            self._disconnect_async,
             operation_id=operation_id,
             retry_safe=True,
             mutating=True,
         )
+
+    async def _disconnect_async(self, operation: OperationContext) -> DeviceDisconnectResult:
+        """Disconnect through the gateway while awaiting child-process reap."""
+
+        active_operation = _effective_operation(operation)
+        effective_operation_id = operation.operation_id
+        _checkpoint(active_operation)
+        with self._lifecycle_lock:
+            with self._state_lock:
+                closed_session_id, closed_generation, controller = _commit(
+                    active_operation,
+                    lambda: self._prepare_disconnect_locked(effective_operation_id),
+                    "session_commit",
+                )
+            cleanup_error: Exception | None = None
+            if controller is not None:
+                cleanup_task = asyncio.create_task(
+                    self._close_controller_async(controller),
+                    name="android-controller-close",
+                )
+                try:
+                    # The controller has already been detached from session
+                    # state. Cleanup must continue even if the operation
+                    # deadline/cancellation wins while the adapter closes.
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    # The caller may disappear while cleanup is in progress;
+                    # shield one final await so a recording process cannot be
+                    # left behind by MCP cancellation or EOF.
+                    with suppress(Exception):
+                        await asyncio.shield(cleanup_task)
+                    raise
+                except Exception as error:
+                    cleanup_error = error
+
+            with self._state_lock:
+                if cleanup_error is not None:
+                    failure = MobileUseError(
+                        ErrorCode.OPERATION_FAILED,
+                        "Failed to close the Android automation connection.",
+                        "Retry android_disconnect; if it persists, restart the local MCP server.",
+                    )
+                    return cast(
+                        DeviceDisconnectResult,
+                        _commit(
+                            active_operation,
+                            lambda: self._finish_disconnect_failure(
+                                effective_operation_id,
+                                closed_session_id,
+                                closed_generation,
+                                failure,
+                            ),
+                            "error_commit",
+                        ),
+                    )
+                return cast(
+                    DeviceDisconnectResult,
+                    _commit(
+                        active_operation,
+                        lambda: self._finish_disconnect_success(
+                            effective_operation_id,
+                            closed_session_id,
+                            closed_generation,
+                        ),
+                        "session_commit",
+                    ),
+                )
+
+    async def _close_controller_async(self, controller: AndroidController) -> None:
+        """Use the awaitable close hook while keeping injected legacy fakes valid."""
+
+        close_async = getattr(controller, "aclose", None)
+        if callable(close_async):
+            result = close_async()
+            if inspect.isawaitable(result):
+                await result
+                return
+        close_sync = getattr(controller, "disconnect", None)
+        if callable(close_sync):
+            result = await run_blocking(
+                close_sync,
+                timeout_seconds=self.config.subprocess_timeout_seconds,
+            )
+            if inspect.isawaitable(result):
+                await result
 
     async def aclose(self) -> DeviceDisconnectResult:
         """Alias for callers that use the conventional async-close spelling."""

@@ -1,8 +1,10 @@
 import asyncio
+import sys
 from pathlib import Path
 
 import pytest
 
+from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.recording import RecordingManager
 
@@ -30,9 +32,19 @@ class FakeProcess:
         self.finished.set()
 
 
+class StubbornProcess(FakeProcess):
+    def terminate(self) -> None:
+        self.terminated = True
+
+
 class FakeSync:
     def pull(self, src: str, dst: str) -> None:
         Path(dst).write_bytes(b"mp4-data")
+
+
+class FailingSync(FakeSync):
+    def pull(self, src: str, dst: str) -> None:
+        raise RuntimeError("pull failed")
 
 
 class FakeADB:
@@ -134,7 +146,7 @@ async def test_recording_rolls_over_and_returns_segments_without_ffmpeg(
     processes = iter([first, second])
     clock = iter([0.0, 0.0, 10.0, 10.0, 20.0, 20.0])
 
-    def missing_executable(name: str) -> None:
+    def missing_executable(name: str) -> str | None:
         return None
 
     monkeypatch.setattr("mobile_use_mcp.recording.shutil.which", missing_executable)
@@ -149,3 +161,74 @@ async def test_recording_rolls_over_and_returns_segments_without_ffmpeg(
 
     assert stopped["segment_count"] == 2
     assert "ffmpeg is unavailable" in str(stopped["warnings"])
+
+
+async def test_recording_pull_failure_is_reported_without_leaking_process() -> None:
+    process = FakeProcess()
+
+    async def factory(serial: str, path: str, duration: int, bit_rate: int | None) -> FakeProcess:
+        return process
+
+    manager = RecordingManager(
+        "ABC",
+        FakeADB(),
+        process_factory=factory,
+    )
+    manager.adb_device.sync = FailingSync()  # type: ignore[assignment]
+
+    await manager.start(60)
+    with pytest.raises(MobileUseError) as caught:
+        await manager.stop()
+
+    assert process.terminated
+    assert caught.value.code == ErrorCode.OPERATION_FAILED
+    assert "Failed to pull a recording segment" in str(caught.value.data["warnings"])
+
+
+async def test_recording_kill_fallback_cancels_stuck_rollover_task() -> None:
+    process = StubbornProcess()
+
+    async def factory(
+        serial: str, path: str, duration: int, bit_rate: int | None
+    ) -> StubbornProcess:
+        return process
+
+    config = RuntimeConfig(
+        subprocess_timeout_seconds=0.05,
+        subprocess_terminate_timeout_seconds=0.01,
+    )
+    manager = RecordingManager("ABC", FakeADB(), process_factory=factory, config=config)
+    await manager.start(60)
+    stopped = await manager.stop()
+
+    assert process.terminated
+    assert process.killed
+    assert stopped["segment_count"] == 1
+    assert not manager.active
+
+
+async def test_recording_ffmpeg_failure_returns_last_segment_with_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = FakeProcess()
+    first.returncode = 0
+    first.finished.set()
+    second = FakeProcess()
+    processes = iter([first, second])
+    clock = iter([0.0, 0.0, 10.0, 10.0, 20.0, 20.0])
+
+    def fake_which(name: str) -> str | None:
+        return sys.executable if name == "ffmpeg" else None
+
+    monkeypatch.setattr("mobile_use_mcp.recording.shutil.which", fake_which)
+
+    async def factory(serial: str, path: str, duration: int, bit_rate: int | None) -> FakeProcess:
+        return next(processes)
+
+    manager = RecordingManager("ABC", FakeADB(), process_factory=factory, clock=lambda: next(clock))
+    await manager.start(300)
+    await asyncio.sleep(0.6)
+    stopped = await manager.stop()
+
+    assert stopped["segment_count"] == 2
+    assert "ffmpeg could not merge" in str(stopped["warnings"])

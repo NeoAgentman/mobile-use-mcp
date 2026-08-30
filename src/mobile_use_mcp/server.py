@@ -1,7 +1,7 @@
 """stdio MCP server entry point and Android observation tools."""
 
-import asyncio
 import json
+import signal
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
@@ -37,6 +37,7 @@ from mobile_use_mcp.models import (
     Target,
     UIElement,
 )
+from mobile_use_mcp.processes import run_blocking
 from mobile_use_mcp.session import DeviceSession
 from mobile_use_mcp.version import __version__
 
@@ -239,10 +240,7 @@ async def android_list_devices(limit: int = 50, offset: int = 0) -> DeviceListRe
     try:
         devices = await session.run_operation(
             "list_devices",
-            lambda context: asyncio.to_thread(
-                session.list_devices,
-                operation_id=context.operation_id,
-            ),
+            lambda context: session.alist_devices(operation_id=context.operation_id),
             operation_id=operation_id,
             retry_safe=True,
             mutating=False,
@@ -361,7 +359,11 @@ async def android_connect(
             SessionConnection | DeviceInfo,
             await session.run_operation(
                 "connect",
-                lambda context: asyncio.to_thread(session.connect, serial),
+                lambda context: run_blocking(
+                    session.connect,
+                    serial,
+                    timeout_seconds=session.config.subprocess_timeout_seconds,
+                ),
                 operation_id=operation_id,
                 mutating=True,
             ),
@@ -1501,7 +1503,26 @@ def main() -> None:
         # non-zero exit also prevents a silent fallback to local defaults.
         print(format_startup_error(error), file=sys.stderr)
         raise SystemExit(2) from None
-    mcp.run(transport="stdio")
+
+    # FastMCP owns the asyncio lifespan context, so make SIGTERM unwind that
+    # context instead of letting the interpreter terminate immediately.  The
+    # lifespan's ``finally`` then awaits the session's idempotent close path,
+    # including recording-child termination and final reaping.  Restore the
+    # embedding process's handler after the synchronous runner returns.
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+    def request_shutdown(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, request_shutdown)
+    try:
+        mcp.run(transport="stdio")
+    except KeyboardInterrupt:
+        # SIGINT and SIGTERM both use the normal FastMCP lifespan unwind.  Do
+        # not emit a traceback after cleanup has completed.
+        return
+    finally:
+        signal.signal(signal.SIGTERM, previous_sigterm)
 
 
 if __name__ == "__main__":

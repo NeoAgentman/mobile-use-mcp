@@ -2,7 +2,8 @@
 
 import asyncio
 from collections.abc import Callable
-from typing import Protocol, cast
+from contextlib import suppress
+from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 from adbutils import AdbClient  # pyright: ignore[reportMissingTypeStubs]
@@ -17,6 +18,7 @@ from mobile_use_mcp.models import (
     ScreenSnapshot,
     Target,
 )
+from mobile_use_mcp.processes import ProcessTimeoutError, run_blocking
 from mobile_use_mcp.recording import RecordingADBDevice, RecordingManager
 from mobile_use_mcp.selectors import resolve_target
 from mobile_use_mcp.snapshot import parse_hierarchy
@@ -62,7 +64,11 @@ def _default_adb_connector(
     runtime = config or RuntimeConfig.defaults()
     return cast(
         ADBDevice,
-        AdbClient(host=runtime.adb_host, port=runtime.adb_port).device(serial=serial),
+        AdbClient(
+            host=runtime.adb_host,
+            port=runtime.adb_port,
+            socket_timeout=runtime.subprocess_timeout_seconds,
+        ).device(serial=serial),
     )
 
 
@@ -102,6 +108,32 @@ class AndroidController:
             config=self.config,
         )
 
+    def _close_adapters(self) -> None:
+        """Interrupt a blocking library call when its owner is cancelled."""
+
+        with suppress(Exception):
+            self.android_client.disconnect()
+        close = getattr(self.adb_device, "close", None)
+        if callable(close):
+            with suppress(Exception):
+                close()
+
+    async def _call_blocking(
+        self,
+        function: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Invoke adb/uiautomator2 under one finite, interruptible boundary."""
+
+        return await run_blocking(
+            function,
+            *args,
+            timeout_seconds=self.config.subprocess_timeout_seconds,
+            on_abort=self._close_adapters,
+            **kwargs,
+        )
+
     async def snapshot(
         self,
         *,
@@ -109,7 +141,7 @@ class AndroidController:
         max_elements: int | None = 200,
         max_text_length: int = 500,
     ) -> ScreenSnapshot:
-        screenshot, hierarchy, width, height = await asyncio.to_thread(
+        screenshot, hierarchy, width, height = await self._call_blocking(
             self.android_client.get_screen
         )
         elements = parse_hierarchy(
@@ -137,7 +169,7 @@ class AndroidController:
             screen_height=snapshot.height,
         )
         x, y = resolved.bounds.center
-        await asyncio.to_thread(self.adb_device.click, x, y)
+        await self._call_blocking(self.adb_device.click, x, y)
         return {
             "x": x,
             "y": y,
@@ -154,7 +186,7 @@ class AndroidController:
             screen_height=snapshot.height,
         )
         x, y = resolved.bounds.center
-        await asyncio.to_thread(self.adb_device.swipe, x, y, x, y, duration_ms / 1_000)
+        await self._call_blocking(self.adb_device.swipe, x, y, x, y, duration_ms / 1_000)
         return {
             "x": x,
             "y": y,
@@ -180,7 +212,7 @@ class AndroidController:
                     f"the {snapshot.width}x{snapshot.height} screen.",
                     "Call android_snapshot and choose coordinates inside the current screen.",
                 )
-        await asyncio.to_thread(
+        await self._call_blocking(
             self.adb_device.swipe,
             start_x,
             start_y,
@@ -228,21 +260,29 @@ class AndroidController:
         if target is not None:
             await self.focus(target)
         try:
-            await asyncio.to_thread(self.android_client.send_text, text)
+            await self._call_blocking(self.android_client.send_text, text)
             return "uiautomator2"
+        except ProcessTimeoutError:
+            raise
         except Exception:
-            await asyncio.to_thread(self.adb_device.shell, ["input", "text", text])
+            await self._call_blocking(
+                self.adb_device.shell,
+                ["input", "text", text],
+                timeout=self.config.subprocess_timeout_seconds,
+            )
             return "adb"
 
     async def clear_text(self, characters: int = 100, target: Target | None = None) -> str:
         if target is not None:
             await self.focus(target)
         try:
-            await asyncio.to_thread(self.android_client.clear_text)
+            await self._call_blocking(self.android_client.clear_text)
             return "uiautomator2"
+        except ProcessTimeoutError:
+            raise
         except Exception:
             for _ in range(characters):
-                await asyncio.to_thread(self.adb_device.keyevent, "DEL")
+                await self._call_blocking(self.adb_device.keyevent, "DEL")
             return "adb"
 
     async def press_key(self, key: str) -> None:
@@ -254,7 +294,7 @@ class AndroidController:
                 ErrorCode.OPERATION_FAILED,
                 f"Unsupported Android key {key!r}. Allowed keys: {allowed}.",
             )
-        await asyncio.to_thread(self.adb_device.keyevent, key_code)
+        await self._call_blocking(self.adb_device.keyevent, key_code)
 
     async def launch_app(
         self,
@@ -267,7 +307,7 @@ class AndroidController:
         last_foreground = ForegroundApp()
         for attempt_index in range(1, retries + 1):
             try:
-                await asyncio.to_thread(self.adb_device.app_start, package)
+                await self._call_blocking(self.adb_device.app_start, package)
             except Exception as error:
                 raise MobileUseError(
                     ErrorCode.OPERATION_FAILED,
@@ -325,7 +365,7 @@ class AndroidController:
         )
 
     async def terminate_app(self, package: str) -> None:
-        await asyncio.to_thread(self.adb_device.app_stop, package)
+        await self._call_blocking(self.adb_device.app_stop, package)
 
     async def open_url(self, url: str) -> None:
         parsed = urlparse(url)
@@ -334,19 +374,20 @@ class AndroidController:
                 ErrorCode.OPERATION_FAILED,
                 "Only absolute http:// and https:// URLs are supported.",
             )
-        await asyncio.to_thread(self.adb_device.open_browser, url)
+        await self._call_blocking(self.adb_device.open_browser, url)
 
     async def get_foreground_app(self) -> ForegroundApp:
         try:
-            current = await asyncio.to_thread(self.adb_device.app_current)
+            current = await self._call_blocking(self.adb_device.app_current)
         except Exception:
             return ForegroundApp()
         return ForegroundApp(package=current.package or None, activity=current.activity or None)
 
     async def list_apps(self, query: str | None = None, limit: int = 100) -> list[str]:
-        output = await asyncio.to_thread(
+        output = await self._call_blocking(
             self.adb_device.shell,
             ["pm", "list", "packages", "-3"],
+            timeout=self.config.subprocess_timeout_seconds,
         )
         if not isinstance(output, str):
             raise MobileUseError(ErrorCode.OPERATION_FAILED, "ADB returned invalid package data.")
@@ -373,3 +414,22 @@ class AndroidController:
     def disconnect(self) -> None:
         self.recording.abort()
         self.android_client.disconnect()
+
+    async def aclose(self) -> None:
+        """Await the same recording/process cleanup used by session shutdown."""
+
+        await self.recording.aclose()
+        try:
+            await run_blocking(
+                self.android_client.disconnect,
+                timeout_seconds=self.config.subprocess_timeout_seconds,
+            )
+        except ProcessTimeoutError:
+            # ``disconnect`` is best effort, but its owner must never retain a
+            # task that can outlive the session indefinitely.
+            pass
+        finally:
+            # adbutils owns a separate transport from uiautomator2.  Closing
+            # both adapters on the successful path prevents reconnects and
+            # stdio EOF from retaining an idle socket.
+            self._close_adapters()
