@@ -3,12 +3,13 @@
 import asyncio
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass, field
 from typing import Any, Protocol, cast
 from urllib.parse import urlparse
 
 from adbutils import AdbClient  # pyright: ignore[reportMissingTypeStubs]
 
-from mobile_use_mcp.android_client import AndroidClient
+from mobile_use_mcp.android_client import AndroidClient, InputCommandError
 from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
@@ -20,6 +21,7 @@ from mobile_use_mcp.models import (
     ScreenSnapshot,
     SwipePercentage,
     Target,
+    UIElement,
 )
 from mobile_use_mcp.processes import ProcessTimeoutError, run_blocking
 from mobile_use_mcp.recording import RecordingADBDevice, RecordingManager
@@ -58,6 +60,127 @@ class ADBDevice(Protocol):
 
 
 ADBConnector = Callable[[str], ADBDevice]
+
+
+@dataclass(frozen=True, slots=True)
+class InputOutcome:
+    """Safe, stage-separated result for text input and clearing.
+
+    The object intentionally contains no input value.  ``__eq__`` retains the
+    old controller contract where callers compared the returned method with a
+    string, while ``to_data`` exposes the richer status to MCP adapters.
+    """
+
+    method: str
+    command_status: str
+    effect_status: str
+    restoration_status: str
+    focus_status: str
+    verification_available: bool
+    requires_observation: bool
+    fallback_used: bool = False
+    attempts: int = 1
+    max_attempts: int | None = None
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, str):
+            return self.method == other
+        if not isinstance(other, InputOutcome):
+            return NotImplemented
+        return (
+            self.method,
+            self.command_status,
+            self.effect_status,
+            self.restoration_status,
+            self.focus_status,
+            self.verification_available,
+            self.requires_observation,
+            self.fallback_used,
+            self.attempts,
+            self.max_attempts,
+        ) == (
+            other.method,
+            other.command_status,
+            other.effect_status,
+            other.restoration_status,
+            other.focus_status,
+            other.verification_available,
+            other.requires_observation,
+            other.fallback_used,
+            other.attempts,
+            other.max_attempts,
+        )
+
+    def __str__(self) -> str:
+        return self.method
+
+    @property
+    def effect_verified(self) -> bool:
+        """Whether the observed field state proves the requested effect."""
+
+        return self.effect_status == "verified"
+
+    def to_data(self) -> dict[str, object]:
+        """Return an MCP-safe mapping with compatibility aliases."""
+
+        return {
+            "method": self.method,
+            "command_status": self.command_status,
+            "effect_status": self.effect_status,
+            "effect_verified": self.effect_verified,
+            "restoration_status": self.restoration_status,
+            "input_method_status": self.restoration_status,
+            "input_method_restoration": self.restoration_status,
+            "focus_status": self.focus_status,
+            "verification_available": self.verification_available,
+            "requires_observation": self.requires_observation,
+            "fallback_used": self.fallback_used,
+            "attempts": self.attempts,
+            "max_attempts": self.max_attempts,
+            "stages": {
+                "focus": {
+                    "status": self.focus_status,
+                    "verification_available": self.verification_available,
+                },
+                "execution": {
+                    "status": self.command_status,
+                    "method": self.method,
+                    "fallback_used": self.fallback_used,
+                },
+                "effect": {
+                    "status": self.effect_status,
+                    "verified": self.effect_verified,
+                    "verification_available": self.verification_available,
+                },
+                "input_method_restoration": {"status": self.restoration_status},
+            },
+        }
+
+    def __getitem__(self, key: str) -> object:
+        return self.to_data()[key]
+
+
+TextInputOutcome = InputOutcome
+ClearTextOutcome = InputOutcome
+
+
+@dataclass(frozen=True, slots=True)
+class _InputFieldState:
+    """In-memory focused-field observation; never serialized or logged."""
+
+    element: UIElement | None = field(repr=False)
+    available: bool
+    focused: bool
+    password_like: bool
+    text: str | None = field(default=None, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _CommandState:
+    method: str
+    status: str
+    fallback_used: bool = False
+    attempts: int = 1
 
 
 def normalized_coordinate_to_pixel(value: float, size: int) -> int:
@@ -425,39 +548,542 @@ class AndroidController:
                 return resolved.selector
             await asyncio.sleep(0.1)
         raise MobileUseError(
-            ErrorCode.OPERATION_FAILED,
+            ErrorCode.INPUT_FOCUS_FAILED,
             "The requested Android input target did not become focused.",
             "Call android_snapshot, verify the input element, and try a different selector.",
+            data={
+                "stage": "focus",
+                "focus_status": "unverified",
+                "verification_available": True,
+            },
         )
 
-    async def type_text(self, text: str, target: Target | None = None) -> str:
-        if target is not None:
-            await self.focus(target)
+    @staticmethod
+    def _same_input_element(expected: UIElement, candidate: UIElement) -> bool:
+        """Match a focused element without comparing potentially masked text."""
+
+        if expected.resource_id and candidate.resource_id:
+            if expected.resource_id.casefold() != candidate.resource_id.casefold():
+                return False
+            if expected.package and candidate.package:
+                return expected.package.casefold() == candidate.package.casefold()
+            return True
+        if expected.bounds is not None and candidate.bounds == expected.bounds:
+            if expected.class_name and candidate.class_name:
+                return expected.class_name.casefold() == candidate.class_name.casefold()
+            return True
+        if expected.content_description and candidate.content_description:
+            return expected.content_description.casefold() == (
+                candidate.content_description.casefold()
+            )
+        if expected.text and candidate.text:
+            return expected.text == candidate.text
+        return False
+
+    async def _capture_focused_field(self) -> _InputFieldState:
+        """Read one focused field while keeping its text inside this process."""
+
         try:
-            await self._call_blocking(self.android_client.send_text, text)
-            return "uiautomator2"
+            hierarchy_reader = _optional_method(self.android_client, "get_hierarchy")
+            if hierarchy_reader is not None:
+                hierarchy = await self._call_blocking(hierarchy_reader)
+                elements = parse_hierarchy(
+                    hierarchy,
+                    interactive_only=False,
+                    max_elements=None,
+                    max_text_length=min(2_000, self.config.snapshot_max_text_length),
+                )
+                unavailable = False
+            else:
+                # Compatibility path for injected clients predating the
+                # hierarchy-free AndroidClient component.
+                snapshot = await self.snapshot(
+                    interactive_only=False,
+                    max_elements=None,
+                    max_text_length=min(2_000, self.config.snapshot_max_text_length),
+                )
+                elements = snapshot.elements
+                unavailable = any(
+                    warning.startswith("HIERARCHY_UNAVAILABLE") for warning in snapshot.warnings
+                )
         except ProcessTimeoutError:
             raise
         except Exception:
+            return _InputFieldState(
+                element=None,
+                available=False,
+                focused=False,
+                password_like=False,
+            )
+        if unavailable:
+            return _InputFieldState(
+                element=None,
+                available=False,
+                focused=False,
+                password_like=False,
+            )
+        focused = [element for element in elements if element.focused]
+        if len(focused) != 1:
+            return _InputFieldState(
+                element=None,
+                available=True,
+                focused=False,
+                password_like=False,
+            )
+        element = focused[0]
+        return _InputFieldState(
+            element=element,
+            available=True,
+            focused=True,
+            password_like=element.is_password_like,
+            text=element.text,
+        )
+
+    async def verify_focused_element(
+        self,
+        expected: UIElement | None = None,
+        *,
+        timeout_seconds: float = 2,
+    ) -> _InputFieldState:
+        """Re-read accessibility focus immediately before text execution."""
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            state = await self._capture_focused_field()
+            if (
+                state.focused
+                and state.element is not None
+                and (expected is None or self._same_input_element(expected, state.element))
+            ):
+                return state
+            await asyncio.sleep(0.1)
+        raise MobileUseError(
+            ErrorCode.INPUT_FOCUS_FAILED,
+            "The Android input field was not focused at execution time.",
+            "Call android_snapshot, verify the input element, and try again.",
+            data={
+                "stage": "focus",
+                "focus_status": "unverified",
+                "verification_available": True,
+            },
+            retryable_override=False,
+        )
+
+    async def _dispatch_adb_text(self, text: str) -> _CommandState:
+        """Use the parameterized ADB fallback only after a definite failure."""
+
+        shell = getattr(self.adb_device, "shell", None)
+        if not callable(shell):
+            return _CommandState(method="adb", status="failed", fallback_used=True)
+        try:
             await self._call_blocking(
-                self.adb_device.shell,
+                shell,
                 ["input", "text", text],
                 timeout=self.config.subprocess_timeout_seconds,
             )
-            return "adb"
-
-    async def clear_text(self, characters: int = 100, target: Target | None = None) -> str:
-        if target is not None:
-            await self.focus(target)
-        try:
-            await self._call_blocking(self.android_client.clear_text)
-            return "uiautomator2"
         except ProcessTimeoutError:
             raise
         except Exception:
+            # A shell transport can fail after Android accepted the event.
+            # Never make a caller retry this payload blindly.
+            return _CommandState(method="adb", status="uncertain", fallback_used=True)
+        return _CommandState(method="adb", status="sent", fallback_used=True)
+
+    async def _dispatch_adb_clear(self, characters: int) -> _CommandState:
+        """Send a bounded number of delete key events through ADB."""
+
+        keyevent = getattr(self.adb_device, "keyevent", None)
+        if not callable(keyevent):
+            return _CommandState(
+                method="adb",
+                status="failed",
+                fallback_used=True,
+                attempts=0,
+            )
+        attempts = 0
+        try:
             for _ in range(characters):
-                await self._call_blocking(self.adb_device.keyevent, "DEL")
-            return "adb"
+                await self._call_blocking(keyevent, "DEL")
+                attempts += 1
+        except ProcessTimeoutError:
+            raise
+        except Exception:
+            return _CommandState(
+                method="adb",
+                status="uncertain",
+                fallback_used=True,
+                attempts=attempts,
+            )
+        return _CommandState(
+            method="adb",
+            status="sent",
+            fallback_used=True,
+            attempts=characters,
+        )
+
+    async def _dispatch_text_command(self, text: str) -> _CommandState:
+        command = _optional_method(self.android_client, "send_text_command")
+        if command is None:
+            # Older injected clients expose only the compatibility wrapper.
+            # That wrapper performs its own cleanup, so a failure is still
+            # treated as uncertain and is never sent again blindly.
+            command = _optional_method(self.android_client, "send_text")
+            if command is None:
+                return await self._dispatch_adb_text(text)
+            try:
+                await self._call_blocking(command, text)
+            except ProcessTimeoutError:
+                raise
+            except Exception:
+                return _CommandState(method="uiautomator2", status="uncertain")
+            return _CommandState(method="uiautomator2", status="sent")
+        try:
+            await self._call_blocking(command, text)
+        except ProcessTimeoutError:
+            raise
+        except InputCommandError as error:
+            if not error.may_have_succeeded:
+                return await self._dispatch_adb_text(text)
+            return _CommandState(method="uiautomator2", status="uncertain")
+        except AttributeError:
+            # The method was present when selected; an AttributeError from
+            # inside an injected adapter can occur after dispatch and is
+            # therefore still an uncertain outcome.
+            return _CommandState(method="uiautomator2", status="uncertain")
+        except Exception:
+            return _CommandState(method="uiautomator2", status="uncertain")
+        return _CommandState(method="uiautomator2", status="sent")
+
+    async def _dispatch_clear_command(self, characters: int) -> _CommandState:
+        command = _optional_method(self.android_client, "clear_text_command")
+        if command is None:
+            command = _optional_method(self.android_client, "clear_text")
+            if command is None:
+                return await self._dispatch_adb_clear(characters)
+            try:
+                await self._call_blocking(command)
+            except ProcessTimeoutError:
+                raise
+            except Exception:
+                return _CommandState(method="uiautomator2", status="uncertain")
+            return _CommandState(method="uiautomator2", status="sent")
+        try:
+            await self._call_blocking(command)
+        except ProcessTimeoutError:
+            raise
+        except InputCommandError as error:
+            if not error.may_have_succeeded:
+                return await self._dispatch_adb_clear(characters)
+            return _CommandState(method="uiautomator2", status="uncertain")
+        except AttributeError:
+            return _CommandState(method="uiautomator2", status="uncertain")
+        except Exception:
+            return _CommandState(method="uiautomator2", status="uncertain")
+        return _CommandState(method="uiautomator2", status="sent")
+
+    async def _restore_input_method(self, *, compatibility_wrapper: bool = False) -> str:
+        if compatibility_wrapper:
+            return "not_required"
+        restore = _optional_method(self.android_client, "restore_input_method")
+        if restore is None:
+            return "unavailable"
+        try:
+            await self._call_blocking(restore)
+        except ProcessTimeoutError:
+            raise
+        except Exception:
+            return "failed"
+        return "restored"
+
+    @staticmethod
+    def _verify_text_effect(
+        before: _InputFieldState,
+        after: _InputFieldState,
+        text: str,
+    ) -> tuple[str, bool]:
+        if not before.available or not after.available:
+            return "unverified", False
+        if before.element is None or after.element is None or not after.focused:
+            return "unverified", False
+        if not AndroidController._same_input_element(before.element, after.element):
+            return "unverified", False
+        if before.password_like or after.password_like:
+            return "unverified", False
+        if before.text is None or after.text is None:
+            return "unverified", False
+        expected = before.text + text
+        return ("verified", True) if after.text == expected else ("not_applied", True)
+
+    @staticmethod
+    def _text_effect_is_known_unchanged(
+        before: _InputFieldState,
+        after: _InputFieldState,
+    ) -> bool:
+        """Return true only when accessibility proves no input was applied."""
+
+        return (
+            before.available
+            and after.available
+            and before.element is not None
+            and after.element is not None
+            and AndroidController._same_input_element(before.element, after.element)
+            and before.focused
+            and after.focused
+            and not before.password_like
+            and not after.password_like
+            and before.text is not None
+            and before.text == after.text
+        )
+
+    @staticmethod
+    def _verify_clear_effect(
+        before: _InputFieldState,
+        after: _InputFieldState,
+    ) -> tuple[str, bool]:
+        if (
+            not before.available
+            or not after.available
+            or before.element is None
+            or after.element is None
+            or not before.focused
+            or not after.focused
+            or not AndroidController._same_input_element(before.element, after.element)
+        ):
+            return "unverified", False
+        if before.password_like or after.password_like or before.text is None or after.text is None:
+            return "unverified", False
+        return ("verified", True) if after.text == "" else ("not_empty", True)
+
+    @staticmethod
+    def _input_error(
+        code: ErrorCode,
+        message: str,
+        suggestion: str,
+        outcome: InputOutcome,
+        *,
+        stage: str,
+    ) -> MobileUseError:
+        details = outcome.to_data()
+        details["stage"] = stage
+        return MobileUseError(
+            code,
+            message,
+            suggestion,
+            data=details,
+            retryable_override=False,
+        )
+
+    async def type_text_detailed(
+        self,
+        text: str,
+        target: Target | None = None,
+        *,
+        expected_element: UIElement | None = None,
+        focus_status: str | None = None,
+    ) -> InputOutcome:
+        """Type text with independent focus, execution, effect, and cleanup stages."""
+
+        compatibility_wrapper = _optional_method(self.android_client, "send_text_command") is None
+        if target is not None:
+            await self.focus(target)
+            focus_status = "verified"
+        before = await self._capture_focused_field()
+        if expected_element is not None and (
+            not before.focused
+            or before.element is None
+            or not self._same_input_element(expected_element, before.element)
+        ):
+            raise MobileUseError(
+                ErrorCode.INPUT_FOCUS_FAILED,
+                "The Android input field changed before text execution.",
+                "Call android_snapshot, verify the input element, and try again.",
+                data={
+                    "stage": "focus",
+                    "focus_status": "unverified",
+                    "verification_available": before.available,
+                },
+                retryable_override=False,
+            )
+        if expected_element is not None:
+            focus_status = focus_status or "verified"
+        if focus_status is None:
+            focus_status = "current" if before.focused else "unverified"
+        command = await self._dispatch_text_command(text)
+        restoration = await self._restore_input_method(
+            compatibility_wrapper=compatibility_wrapper or command.method == "adb",
+        )
+        after = await self._capture_focused_field()
+        effect_status, verification_available = self._verify_text_effect(before, after, text)
+
+        # An adapter exception is conservatively uncertain. If accessibility
+        # proves that the field stayed byte-for-byte unchanged, a single ADB
+        # fallback is safe; otherwise the original command is never repeated.
+        if (
+            command.status == "uncertain"
+            and restoration == "restored"
+            and self._text_effect_is_known_unchanged(before, after)
+        ):
+            command = await self._dispatch_adb_text(text)
+            restoration = await self._restore_input_method(compatibility_wrapper=True)
+            after = await self._capture_focused_field()
+            effect_status, verification_available = self._verify_text_effect(before, after, text)
+
+        outcome = InputOutcome(
+            method=command.method,
+            command_status=command.status,
+            effect_status=effect_status,
+            restoration_status=restoration,
+            focus_status=focus_status,
+            verification_available=verification_available,
+            requires_observation=effect_status != "verified",
+            fallback_used=command.fallback_used,
+            attempts=command.attempts,
+        )
+        if restoration in {"failed", "unavailable"} and command.method == "uiautomator2":
+            raise self._input_error(
+                ErrorCode.INPUT_METHOD_RESTORE_FAILED,
+                "Android text input completed, but the temporary input method could not be "
+                "restored.",
+                "Do not resend the text. Inspect the device input method and observe the field.",
+                outcome,
+                stage="input_method_restoration",
+            )
+        if command.status == "failed":
+            raise self._input_error(
+                ErrorCode.INPUT_EXECUTION_FAILED,
+                "Android text input could not be dispatched.",
+                "Call android_snapshot and retry only after confirming that no text was entered.",
+                outcome,
+                stage="execution",
+            )
+        if command.status == "uncertain":
+            raise self._input_error(
+                ErrorCode.INPUT_EXECUTION_UNCERTAIN,
+                "Android text input may have been dispatched, but its command result is uncertain.",
+                "Do not resend the text; observe the field before deciding whether another "
+                "action is needed.",
+                outcome,
+                stage="execution",
+            )
+        return outcome
+
+    async def type_text(self, text: str, target: Target | None = None) -> InputOutcome:
+        """Compatibility entry point for stage-separated text input."""
+
+        return await self.type_text_detailed(text, target)
+
+    async def clear_text_detailed(
+        self,
+        characters: int = 100,
+        target: Target | None = None,
+        *,
+        expected_element: UIElement | None = None,
+        focus_status: str | None = None,
+    ) -> InputOutcome:
+        """Clear text with a bounded fallback and an explicit effect check."""
+
+        bounded_characters = max(1, min(characters, 2_000))
+        compatibility_wrapper = _optional_method(self.android_client, "clear_text_command") is None
+        if target is not None:
+            await self.focus(target)
+            focus_status = "verified"
+        before = await self._capture_focused_field()
+        if expected_element is not None and (
+            not before.focused
+            or before.element is None
+            or not self._same_input_element(expected_element, before.element)
+        ):
+            raise MobileUseError(
+                ErrorCode.INPUT_FOCUS_FAILED,
+                "The Android input field changed before text clearing.",
+                "Call android_snapshot, verify the input element, and try again.",
+                data={
+                    "stage": "focus",
+                    "focus_status": "unverified",
+                    "verification_available": before.available,
+                },
+                retryable_override=False,
+            )
+        if expected_element is not None:
+            focus_status = focus_status or "verified"
+        if focus_status is None:
+            focus_status = "current" if before.focused else "unverified"
+        command = await self._dispatch_clear_command(bounded_characters)
+        restoration = await self._restore_input_method(
+            compatibility_wrapper=compatibility_wrapper or command.method == "adb",
+        )
+        after = await self._capture_focused_field()
+        effect_status, verification_available = self._verify_clear_effect(before, after)
+
+        # A successful uiautomator2 command that is observably incomplete can
+        # safely be followed by bounded delete presses. This path never runs
+        # when the first command or its cleanup is uncertain.
+        if (
+            command.status == "sent"
+            and command.method == "uiautomator2"
+            and effect_status == "not_empty"
+            and restoration == "restored"
+        ):
+            command = await self._dispatch_adb_clear(bounded_characters)
+            restoration = await self._restore_input_method(compatibility_wrapper=True)
+            after = await self._capture_focused_field()
+            effect_status, verification_available = self._verify_clear_effect(before, after)
+
+        if (
+            command.status == "uncertain"
+            and restoration == "restored"
+            and effect_status == "not_empty"
+        ):
+            command = await self._dispatch_adb_clear(bounded_characters)
+            restoration = await self._restore_input_method(compatibility_wrapper=True)
+            after = await self._capture_focused_field()
+            effect_status, verification_available = self._verify_clear_effect(before, after)
+
+        outcome = InputOutcome(
+            method=command.method,
+            command_status=command.status,
+            effect_status=effect_status,
+            restoration_status=restoration,
+            focus_status=focus_status,
+            verification_available=verification_available,
+            requires_observation=effect_status != "verified",
+            fallback_used=command.fallback_used,
+            attempts=command.attempts,
+            max_attempts=bounded_characters,
+        )
+        if restoration in {"failed", "unavailable"} and command.method == "uiautomator2":
+            raise self._input_error(
+                ErrorCode.INPUT_METHOD_RESTORE_FAILED,
+                "Android text clearing completed, but the temporary input method could not be "
+                "restored.",
+                "Do not repeat the clear command blindly. Inspect the field and input method "
+                "first.",
+                outcome,
+                stage="input_method_restoration",
+            )
+        if command.status == "failed":
+            raise self._input_error(
+                ErrorCode.CLEAR_EXECUTION_FAILED,
+                "Android text clearing could not be dispatched.",
+                "Call android_snapshot and retry only after confirming the focused field.",
+                outcome,
+                stage="execution",
+            )
+        if command.status == "uncertain":
+            raise self._input_error(
+                ErrorCode.CLEAR_EXECUTION_UNCERTAIN,
+                "Android text clearing may have been dispatched, but its command result is "
+                "uncertain.",
+                "Observe the field before deciding whether another clear action is needed.",
+                outcome,
+                stage="execution",
+            )
+        return outcome
+
+    async def clear_text(self, characters: int = 100, target: Target | None = None) -> InputOutcome:
+        """Compatibility entry point for bounded, stage-separated text clearing."""
+
+        return await self.clear_text_detailed(characters, target)
 
     async def press_key(self, key: str) -> None:
         normalized = key.casefold()

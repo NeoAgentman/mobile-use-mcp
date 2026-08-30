@@ -125,6 +125,21 @@ async def test_type_text_does_not_echo_sensitive_content(controller: Mock) -> No
     controller.type_text.assert_awaited_once_with(secret, None)
 
 
+async def test_type_text_redacts_sensitive_failure_details(controller: Mock) -> None:
+    secret = "input-error-secret"
+    controller.type_text.side_effect = MobileUseError(
+        ErrorCode.INPUT_EXECUTION_FAILED,
+        f"adapter rejected {secret}",
+        f"inspect {secret}",
+        data={"text": secret, "nested": [secret]},
+    )
+
+    result = await android_type_text(secret)
+
+    assert result["success"] is False
+    assert secret not in str(result)
+
+
 async def test_key_app_and_url_tools(controller: Mock) -> None:
     key_result = await android_press_key("home")
     app_result = await android_launch_app("com.example")

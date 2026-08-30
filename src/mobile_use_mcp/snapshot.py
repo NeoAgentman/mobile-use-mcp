@@ -469,8 +469,14 @@ def _clean(value: str | None, max_length: int) -> str | None:
         return None
     stripped = value.strip()
     if not stripped:
-        return None
-    return stripped[:max_length]
+        # Keep an explicit empty accessibility value. Interactive input
+        # fields use it to prove that a clear command reached an empty state;
+        # whitespace-only structural nodes are still filtered by
+        # ``has_semantic_content``.
+        return ""
+    # Preserve leading/trailing spaces: they are observable text effects and
+    # must not make a successful input verification look like a mismatch.
+    return value[:max_length]
 
 
 def parse_hierarchy(
@@ -511,6 +517,7 @@ def parse_hierarchy(
                 if attributes.get("checkable") == "true"
                 else None
             ),
+            password=_as_bool(attributes.get("password")),
         )
         if element.bounds is None:
             continue

@@ -13,14 +13,14 @@ review_note = "This is a source ancestry and notice record, not a legal conclusi
 path = "src/mobile_use_mcp/android_client.py"
 upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
 kind = "adapted"
-sha256 = "1d1f1df45a5cce9a5b64c7a9bb9e8b4a7ef5f18ac84c120e6aee67654e99568f"
+sha256 = "6db4acdc352e03565c83630b0ee37a8dbf7b62d18f5930d60fa08c12d42c58a8"
 modification_statement = "Significantly rewritten for the local MCP session boundary, configured ADB endpoint, bounded reconnect, secret-safe text handling, and hierarchy-free screenshot capture."
 
 [[files]]
 path = "src/mobile_use_mcp/controller.py"
 upstream_path = "minitap/mobile_use/controllers/android_controller.py; minitap/mobile_use/tools/utils.py"
 kind = "adapted"
-sha256 = "76208e4d63136b7a9a72f44b5234a6d51594d71d41bd757ce550b5e6969616d5"
+sha256 = "5b510b72e9760d62971a955cf41a8bdba28c3538bed051bd7bb77cf10e91c4c8"
 modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, MCP-safe results, independent observation components, and screenshot-only capture."
 
 [[files]]
@@ -34,7 +34,7 @@ modification_statement = "Significantly rewritten into a small Android selector 
 path = "src/mobile_use_mcp/snapshot.py"
 upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
 kind = "adapted"
-sha256 = "04aaa9d0630bd572e32ec3321e94397d6f6a19fa4f0c64e216a8093fe1bbc590"
+sha256 = "041e4431b4b1de68112e6bdd0c0ddda57cc68bd1ce8c092564e136e98f24cff5"
 modification_statement = "Significantly rewritten to normalize and bound Android hierarchy output and retain immutable revision-aware observations for the MCP schema."
 
 [[files]]

@@ -3,9 +3,9 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 
 class StrictModel(BaseModel):
@@ -192,8 +192,14 @@ class UIElement(StrictModel):
         ge=0,
         description="Flattened hierarchy position used only to disambiguate identical nodes.",
     )
-    text: str | None = Field(default=None, max_length=2_000)
-    content_description: str | None = Field(default=None, max_length=2_000)
+    text: Annotated[
+        str | None,
+        StringConstraints(max_length=2_000, strip_whitespace=False),
+    ] = None
+    content_description: Annotated[
+        str | None,
+        StringConstraints(max_length=2_000, strip_whitespace=False),
+    ] = None
     resource_id: str | None = Field(default=None, max_length=512)
     class_name: str | None = Field(default=None, max_length=512)
     package: str | None = Field(default=None, max_length=512)
@@ -205,6 +211,26 @@ class UIElement(StrictModel):
     scrollable: bool = False
     selected: bool = False
     checked: bool | None = None
+    password: bool = Field(
+        default=False,
+        description=(
+            "Whether Android accessibility identifies this element as a password field. "
+            "Password fields are never content-verified by text equality."
+        ),
+    )
+
+    @property
+    def is_password_like(self) -> bool:
+        """Return whether accessibility text must be treated as masked content."""
+
+        if self.password:
+            return True
+        values = (
+            self.class_name or "",
+            self.resource_id or "",
+            self.content_description or "",
+        )
+        return any("password" in value.casefold() for value in values)
 
     def has_semantic_content(self) -> bool:
         return bool(self.text or self.content_description or self.resource_id)

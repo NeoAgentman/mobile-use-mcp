@@ -144,6 +144,9 @@ mobile-use-mcp/
 - [x] `android_swipe`
 - [x] `android_type_text`
 - [x] `android_clear_text`
+- [x] Text input reports focus, command, effect verification, and input-method restoration as
+  separate stages without echoing plaintext
+- [x] Text fallback avoids duplicate input after uncertain execution and clear fallback is bounded
 - [x] `android_press_key`
 - [x] `android_launch_app`
 - [x] `android_terminate_app`

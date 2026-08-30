@@ -12,7 +12,7 @@ from typing import Annotated, Any, Literal, cast
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
-from pydantic import Field
+from pydantic import BaseModel, Field
 
 from mobile_use_mcp.config import (
     ConfigurationError,
@@ -20,7 +20,7 @@ from mobile_use_mcp.config import (
     format_startup_error,
     load_runtime_config,
 )
-from mobile_use_mcp.controller import normalized_coordinate_to_pixel
+from mobile_use_mcp.controller import InputOutcome, normalized_coordinate_to_pixel
 from mobile_use_mcp.doctor import run_doctor_bounded
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
@@ -107,13 +107,53 @@ OPEN_WORLD_WRITE = ToolAnnotations(
 )
 
 
-def _failure(error: MobileUseError) -> OperationResult:
+def _redact_secret(value: Any, secret: str | None) -> Any:
+    """Replace a typed payload in nested diagnostics without logging it."""
+
+    if not secret:
+        return value
+    if isinstance(value, BaseModel):
+        return _redact_secret(value.model_dump(mode="json"), secret)
+    if isinstance(value, str):
+        return value.replace(secret, "[REDACTED]")
+    if isinstance(value, list):
+        items = cast(list[Any], value)
+        return [_redact_secret(item, secret) for item in items[:50]]
+    if isinstance(value, tuple):
+        items = cast(tuple[Any, ...], value)
+        return tuple(_redact_secret(item, secret) for item in items[:50])
+    if isinstance(value, dict):
+        mapping = cast(dict[Any, Any], value)
+        return {str(key): _redact_secret(item, secret) for key, item in mapping.items()}
+    return value
+
+
+def _redact_exact(value: Any, secret: str | None) -> Any:
+    """Redact exact values in a known schema without corrupting field names."""
+
+    if not secret:
+        return value
+    if isinstance(value, str):
+        return "[REDACTED]" if value == secret else value
+    if isinstance(value, list):
+        items = cast(list[Any], value)
+        return [_redact_exact(item, secret) for item in items[:50]]
+    if isinstance(value, tuple):
+        items = cast(tuple[Any, ...], value)
+        return tuple(_redact_exact(item, secret) for item in items[:50])
+    if isinstance(value, dict):
+        mapping = cast(dict[Any, Any], value)
+        return {str(key): _redact_exact(item, secret) for key, item in mapping.items()}
+    return value
+
+
+def _failure(error: MobileUseError, *, secret: str | None = None) -> OperationResult:
     return OperationResult(
         success=False,
         error_code=error.code,
-        message=error.message,
-        suggestion=error.suggestion,
-        data=error.data,
+        message=_redact_secret(error.message, secret),
+        suggestion=_redact_secret(error.suggestion, secret),
+        data=_redact_secret(error.data, secret),
     )
 
 
@@ -1079,6 +1119,134 @@ def _target_requires_validation(target: Target) -> bool:
     )
 
 
+def _safe_input_data(value: Any, *, secret: str | None = None) -> dict[str, object]:
+    """Normalize an input outcome without allowing payload values to escape."""
+
+    def unknown(method: str) -> dict[str, object]:
+        return InputOutcome(
+            method=method,
+            command_status="sent",
+            effect_status="unverified",
+            restoration_status="unknown",
+            focus_status="unverified",
+            verification_available=False,
+            requires_observation=True,
+            fallback_used=method == "adb",
+        ).to_data()
+
+    if isinstance(value, InputOutcome):
+        data = value.to_data()
+        method = data.get("method")
+        data["method"] = (
+            method if isinstance(method, str) and method in {"uiautomator2", "adb"} else "unknown"
+        )
+        return cast(dict[str, object], _redact_exact(data, secret))
+    if isinstance(value, str):
+        method = value if value in {"uiautomator2", "adb"} else "unknown"
+        return cast(dict[str, object], _redact_exact(unknown(method), secret))
+    if isinstance(value, dict):
+        sensitive_keys = {
+            "text",
+            "value",
+            "input",
+            "payload",
+            "plaintext",
+            "secret",
+            "password",
+        }
+
+        def redact(item: Any) -> Any:
+            if isinstance(item, BaseModel):
+                return redact(item.model_dump(mode="json"))
+            if isinstance(item, dict):
+                mapping = cast(dict[Any, Any], item)
+                return {
+                    str(key): redact(nested)
+                    for key, nested in mapping.items()
+                    if str(key).casefold() not in sensitive_keys
+                }
+            if isinstance(item, list):
+                items = cast(list[Any], item)
+                return [redact(nested) for nested in items[:50]]
+            if isinstance(item, tuple):
+                items = cast(tuple[Any, ...], item)
+                return tuple(redact(nested) for nested in items[:50])
+            return _redact_secret(item, secret)
+
+        mapping = cast(dict[Any, Any], value)
+        return {
+            str(key): redact(item)
+            for key, item in mapping.items()
+            if str(key).casefold() not in sensitive_keys
+        }
+    return cast(dict[str, object], _redact_secret(unknown("unknown"), secret))
+
+
+async def _resolve_and_focus_target(
+    context: Any,
+    target: Target,
+) -> tuple[dict[str, object], UIElement | None]:
+    """Resolve, dispatch, and re-check one input target through the session gateway."""
+
+    # Keep the callback seam source-compatible with lightweight injected
+    # controllers; the gateway context is passed explicitly to target
+    # resolution below and is also available through the operation contextvar.
+    controller = session.require_controller()
+    resolver = _configured_method(controller, "tap_resolved")
+    verifier = _configured_method(controller, "verify_focused_element")
+    if resolver is None or verifier is None:
+        raise MobileUseError(
+            ErrorCode.UNSUPPORTED,
+            "The active Android controller cannot perform stale-safe input focus.",
+            "Reconnect with the built-in Android controller and retry the action.",
+            data={"stage": "focus", "focus_status": "unverified"},
+        )
+
+    _snapshot, resolved = await session.resolve_target(
+        target,
+        operation=context,
+        controller=controller,
+    )
+    # Invalidate the copied target capability before dispatch. The focus
+    # re-check reads a fresh hierarchy directly and therefore does not reuse
+    # the stale target through the session resolver.
+    session.advance_screen_revision(operation=context)
+    context.checkpoint("focus_dispatch")
+    dispatch_result = resolver(resolved)
+    if isawaitable(dispatch_result):
+        await dispatch_result
+    context.checkpoint("focus_verify")
+    expected_element = resolved.element or UIElement(bounds=resolved.bounds)
+    verification = verifier(expected_element)
+    if isawaitable(verification):
+        verification = await verification
+    if verification is False:
+        raise MobileUseError(
+            ErrorCode.INPUT_FOCUS_FAILED,
+            "The Android input field was not focused at execution time.",
+            "Call android_snapshot, verify the input element, and try again.",
+            data={"stage": "focus", "focus_status": "unverified"},
+            retryable_override=False,
+        )
+    # Keep only the stable, scalar target audit fields. Adapter-specific
+    # payloads are deliberately not propagated because they may contain a
+    # field's plaintext or an opaque object whose serializer is not secret-safe.
+    details: dict[str, object] = {}
+    x, y = resolved.bounds.center
+    details.update(
+        {
+            "x": x,
+            "y": y,
+            "selector": resolved.selector,
+            "matched_selector": resolved.matched_selector or resolved.selector,
+            "attempts": [attempt.model_dump(mode="json") for attempt in resolved.attempts],
+            "focus_status": "verified",
+            "focus_verification_available": True,
+        }
+    )
+    return details, expected_element
+
+
 async def _resolve_and_dispatch_target(
     context: Any,
     target: Target,
@@ -1126,9 +1294,7 @@ async def _resolve_and_dispatch_target(
             details.setdefault("y", y)
             details["selector"] = resolved.selector
             details["matched_selector"] = resolved.matched_selector or resolved.selector
-            details["attempts"] = [
-                attempt.model_dump(mode="json") for attempt in resolved.attempts
-            ]
+            details["attempts"] = [attempt.model_dump(mode="json") for attempt in resolved.attempts]
             if long_press:
                 details.setdefault("duration_ms", duration_ms)
             return details
@@ -1538,10 +1704,10 @@ async def android_type_text(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Optionally focus a target, then type into the focused Android field.
+    """Focus and type while reporting command/effect/IME stages separately.
 
-    The returned method identifies uiautomator2 or the less reliable ADB fallback. Observe again to
-    verify the value, especially for Unicode text or bounds-only/Flutter-style input fields.
+    The text is used only inside the device operation and in-memory effect
+    comparison. It is never copied into result data, diagnostics, or logs.
     """
 
     operation_id = session.new_operation_id()
@@ -1550,14 +1716,23 @@ async def android_type_text(
         async def act(_context: Any) -> tuple[Any, dict[str, object] | None]:
             controller = session.require_controller()
             target_details: dict[str, object] | None = None
-            if target is not None and (
-                _configured_method(controller, "snapshot") is not None
-                or session.session_id is not None
-                or _target_requires_validation(target)
+            if (
+                target is not None
+                and session.session_id is not None
+                and _configured_method(controller, "tap_resolved") is not None
+                and _configured_method(controller, "verify_focused_element") is not None
             ):
-                target_details = await _resolve_and_dispatch_target(_context, target)
+                target_details, expected_element = await _resolve_and_focus_target(_context, target)
                 session.advance_screen_revision(operation=_context)
-                result = controller.type_text(text, None)
+                detailed = _configured_method(controller, "type_text_detailed")
+                if detailed is not None:
+                    result = detailed(
+                        text,
+                        expected_element=expected_element,
+                        focus_status="verified",
+                    )
+                else:
+                    result = controller.type_text(text, None)
             else:
                 session.clear_snapshot()
                 result = controller.type_text(text, target)
@@ -1572,18 +1747,26 @@ async def android_type_text(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return _failure(error, secret=text).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("text input")
-    data: dict[str, Any] = {"method": method, "character_count": len(text)}
+    data: dict[str, Any] = {
+        **_safe_input_data(method, secret=text),
+        "character_count": len(text),
+    }
     if target_details is not None:
-        data["target"] = target_details
+        safe_target_details = _redact_secret(target_details, text)
+        data["target"] = safe_target_details
         for key in ("selector", "matched_selector", "attempts"):
             if key in target_details:
-                data[key] = target_details[key]
+                data[key] = safe_target_details[key]
     return OperationResult(
         success=True,
-        message="Text was entered into the focused field.",
+        message=(
+            "Text input command completed; observe the field to verify the effect."
+            if not data.get("effect_verified", False)
+            else "Text was entered and verified in the focused field."
+        ),
         data=data,
     ).model_dump(mode="json")
 
@@ -1612,29 +1795,35 @@ async def android_clear_text(
         ),
     ] = None,
 ) -> dict[str, Any]:
-    """Optionally focus a target, then clear the focused Android text field.
+    """Focus and clear text with bounded attempts and an explicit empty check."""
 
-    Observe again to verify the field is empty, especially when the response reports the ADB
-    delete-key fallback.
-    """
-
+    bounded_max_characters = max(1, min(max_characters, 2_000))
     operation_id = session.new_operation_id()
     try:
 
         async def act(_context: Any) -> tuple[Any, dict[str, object] | None]:
             controller = session.require_controller()
             target_details: dict[str, object] | None = None
-            if target is not None and (
-                _configured_method(controller, "snapshot") is not None
-                or session.session_id is not None
-                or _target_requires_validation(target)
+            if (
+                target is not None
+                and session.session_id is not None
+                and _configured_method(controller, "tap_resolved") is not None
+                and _configured_method(controller, "verify_focused_element") is not None
             ):
-                target_details = await _resolve_and_dispatch_target(_context, target)
+                target_details, expected_element = await _resolve_and_focus_target(_context, target)
                 session.advance_screen_revision(operation=_context)
-                result = controller.clear_text(max_characters, None)
+                detailed = _configured_method(controller, "clear_text_detailed")
+                if detailed is not None:
+                    result = detailed(
+                        bounded_max_characters,
+                        expected_element=expected_element,
+                        focus_status="verified",
+                    )
+                else:
+                    result = controller.clear_text(bounded_max_characters, None)
             else:
                 session.clear_snapshot()
-                result = controller.clear_text(max_characters, target)
+                result = controller.clear_text(bounded_max_characters, target)
             if isawaitable(result):
                 result = await result
             return result, target_details
@@ -1649,7 +1838,10 @@ async def android_clear_text(
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("text clearing")
-    data = {"method": method, "fallback_max_characters": max_characters}
+    data = {
+        **_safe_input_data(method),
+        "fallback_max_characters": bounded_max_characters,
+    }
     if target_details is not None:
         data["target"] = target_details
         for key in ("selector", "matched_selector", "attempts"):
@@ -1657,7 +1849,11 @@ async def android_clear_text(
                 data[key] = target_details[key]
     return OperationResult(
         success=True,
-        message="Cleared the focused Android text field.",
+        message=(
+            "Text clear command completed and the field is empty."
+            if data.get("effect_verified", False)
+            else "Text clear command completed; observe the field to verify it is empty."
+        ),
         data=data,
     ).model_dump(mode="json")
 

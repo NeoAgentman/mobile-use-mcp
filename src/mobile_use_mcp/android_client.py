@@ -34,6 +34,19 @@ class AndroidDevice(Protocol):
 DeviceConnector = Callable[[str], AndroidDevice]
 
 
+class InputCommandError(RuntimeError):
+    """A text command failed without exposing adapter details or plaintext.
+
+    A device adapter can raise after it has already delivered an input event.
+    ``may_have_succeeded`` therefore defaults to ``True`` and callers must not
+    blindly send the full payload through a second input path.
+    """
+
+    def __init__(self, *, may_have_succeeded: bool = True):
+        super().__init__("Android input command outcome is uncertain.")
+        self.may_have_succeeded = may_have_succeeded
+
+
 def _close_device(device: AndroidDevice | None) -> None:
     """Stop concrete uiautomator2 transports without requiring its private API."""
 
@@ -168,27 +181,68 @@ class AndroidClient:
     def press_key(self, key: str) -> bool:
         return bool(self.ensure_connected().press(key))
 
-    def send_text(self, text: str) -> None:
-        """Send Unicode text and restore the user's input method after it settles."""
+    def send_text_command(self, text: str) -> None:
+        """Dispatch Unicode text without hiding an input-method cleanup error.
+
+        Input-method restoration is deliberately a separate call.  The
+        controller uses that boundary to distinguish a command that may have
+        reached Android from a cleanup failure, which prevents duplicate ADB
+        fallback input.
+        """
 
         device = self.ensure_connected()
         try:
-            device.send_keys(text)
-            # FastInputIME broadcasts asynchronously on some Android/HarmonyOS builds.
-            # Disabling it immediately can drop the beginning of the text.
+            send_keys = getattr(device, "send_keys", None)
+        except Exception:
+            raise InputCommandError() from None
+        if not callable(send_keys):
+            raise InputCommandError(may_have_succeeded=False)
+        try:
+            send_keys(text)
+            # FastInputIME broadcasts asynchronously on some Android/HarmonyOS
+            # builds. Disabling it immediately can drop the beginning of the
+            # text, so the wait remains part of command execution.
             time.sleep(0.3)
+        except Exception:
+            # Any adapter exception may happen after a broadcast was accepted.
+            raise InputCommandError() from None
+
+    def clear_text_command(self) -> None:
+        """Dispatch a clear command without performing input-method cleanup."""
+
+        device = self.ensure_connected()
+        try:
+            clear_text = getattr(device, "clear_text", None)
+        except Exception:
+            raise InputCommandError() from None
+        if not callable(clear_text):
+            raise InputCommandError(may_have_succeeded=False)
+        try:
+            clear_text()
+            time.sleep(0.2)
+        except Exception:
+            raise InputCommandError() from None
+
+    def restore_input_method(self) -> None:
+        """Disable the temporary input method used by uiautomator2."""
+
+        self.ensure_connected().set_input_ime(False)
+
+    def send_text(self, text: str) -> None:
+        """Compatibility wrapper that sends text and then restores the IME."""
+
+        try:
+            self.send_text_command(text)
         finally:
-            device.set_input_ime(False)
+            self.restore_input_method()
 
     def clear_text(self) -> None:
-        """Clear the focused field using uiautomator2's Unicode-aware input method."""
+        """Compatibility wrapper that clears text and then restores the IME."""
 
-        device = self.ensure_connected()
         try:
-            device.clear_text()
-            time.sleep(0.2)
+            self.clear_text_command()
         finally:
-            device.set_input_ime(False)
+            self.restore_input_method()
 
     def disconnect(self) -> None:
         with self._state_lock:

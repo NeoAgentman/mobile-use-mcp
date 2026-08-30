@@ -272,8 +272,8 @@ previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while capacity
 | `android_tap` | Tap using an opaque ref, provenance-bound bounds, or selector fallbacks |
 | `android_long_press` | Long press an opaque ref, provenance-bound bounds, or selector fallbacks |
 | `android_swipe` | Swipe between validated pixel coordinates or normalized percentages |
-| `android_type_text` | Optionally focus a target, then type text |
-| `android_clear_text` | Optionally focus a target, then clear text with a delete-key fallback |
+| `android_type_text` | Optionally focus a target, then type text with command/effect/IME status |
+| `android_clear_text` | Optionally focus a target, then bounded-clear text and verify emptiness |
 | `android_press_key` | Press back/home/enter/delete/tab/menu/volume keys |
 | `android_launch_app` | Launch a package and poll until foreground |
 | `android_terminate_app` | Force-stop a package |
@@ -439,6 +439,16 @@ device verification results.
   when the returned quality notice indicates that visual detail may be insufficient.
 - `android_type_text` and `android_clear_text` accept an optional target. Without one, they operate
   on the currently focused field.
+- Text operations keep the payload in the device call and in-memory verification only. Results
+  never echo plaintext and report `command_status`, `effect_status`, `focus_status`, and
+  `restoration_status` independently. `effect_status="unverified"` means accessibility data was
+  insufficient; observe the field before deciding whether another action is needed.
+- If a text command fails after it may have reached Android, the server reports an uncertain
+  execution and does not resend the payload blindly. A fallback is used only when accessibility
+  proves that no text changed (or the adapter reports a definitive pre-dispatch failure).
+- Clear-text attempts are bounded by `max_characters`. An empty-field result is marked verified
+  only when Android accessibility exposes a non-password field whose text is demonstrably empty;
+  masked or unavailable fields remain unverified.
 - App discovery currently returns package names rather than localized display names.
 - Screenshot tools return visible pixels as MCP image content; they do not extract or download an
   App's original remote media file.
