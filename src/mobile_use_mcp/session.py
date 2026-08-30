@@ -25,8 +25,30 @@ from mobile_use_mcp.models import (
     SessionConnection,
     SessionLifecycle,
 )
+from mobile_use_mcp.operations import OperationContext, OperationGateway, current_operation
 
 ControllerFactory = Callable[[str], AndroidController]
+
+
+def _effective_operation(operation: OperationContext | None) -> OperationContext | None:
+    """Use the gateway context propagated into callbacks and worker threads."""
+
+    return operation if operation is not None else current_operation()
+
+
+def _checkpoint(operation: OperationContext | None, stage: str = "execution") -> None:
+    if operation is not None:
+        operation.checkpoint(stage)
+
+
+def _commit(
+    operation: OperationContext | None,
+    callback: Callable[[], Any],
+    stage: str = "commit",
+) -> Any:
+    if operation is None:
+        return callback()
+    return operation.commit(callback, stage)
 
 
 def _new_operation_id() -> str:
@@ -114,9 +136,79 @@ class DeviceSession:
         self._state_lock = RLock()
         self._lifecycle_lock = Lock()
 
-        # Action tools use this existing public lock until all operations are
-        # migrated to the DeviceSession gateway in the follow-up tickets.
+        self.operation_gateway = OperationGateway(
+            operation_timeout_seconds=self.config.operation_timeout_seconds,
+            queue_timeout_seconds=self.config.queue_timeout_seconds,
+            on_start=self._operation_started,
+            on_finish=self._operation_finished,
+        )
+        # ``gateway`` is intentionally a short public alias for embedders and
+        # tests that use DeviceSession as the coordination seam directly.
+        self.gateway = self.operation_gateway
+
+        # Kept for source compatibility with integrations that acquired the
+        # old action lock directly.  Public MCP tools use operation_gateway;
+        # retaining this lock does not create a second scheduling path.
         self.write_lock = asyncio.Lock()
+
+    def _operation_started(self, operation: OperationContext) -> None:
+        with self._state_lock:
+            self._active_operation_id = operation.operation_id
+
+    def _operation_finished(self, operation: OperationContext) -> None:
+        with self._state_lock:
+            if self._active_operation_id == operation.operation_id:
+                self._active_operation_id = None
+            # Connect/disconnect detach their old references before entering
+            # a potentially blocking Android adapter.  If the gateway cancels
+            # that adapter, leave the session in a safe terminal state rather
+            # than exposing a permanent connecting/closing lifecycle.
+            if not operation.active and operation.name == "connect":
+                if self._state == SessionLifecycle.CONNECTING:
+                    self._state = SessionLifecycle.FAILED
+                    self._last_error = _lifecycle_error(
+                        operation.state_error(cancelled=operation.cancelled)
+                    )
+                    self._device = None
+                    self._controller = None
+                    self._session_id = None
+                    self._generation = None
+                    self._clear_snapshot_unchecked()
+            elif (
+                not operation.active
+                and operation.name == "disconnect"
+                and self._state == SessionLifecycle.CLOSING
+            ):
+                self._state = SessionLifecycle.DISCONNECTED
+                self._last_error = _lifecycle_error(
+                    operation.state_error(cancelled=operation.cancelled)
+                )
+
+    async def run_operation(
+        self,
+        name: str,
+        callback: Callable[[OperationContext], Any],
+        *,
+        operation_id: str | None = None,
+        timeout_seconds: float | None = None,
+        retry_safe: bool = False,
+        mutating: bool = True,
+    ) -> Any:
+        """Run one Android operation through the session's FIFO gateway."""
+
+        return await self.operation_gateway.run(
+            name,
+            callback,
+            operation_id=operation_id,
+            timeout_seconds=timeout_seconds,
+            retry_safe=retry_safe,
+            mutating=mutating,
+        )
+
+    async def execute_operation(self, *args: Any, **kwargs: Any) -> Any:
+        """Compatibility alias for callers that name the seam ``execute``."""
+
+        return await self.run_operation(*args, **kwargs)
 
     @property
     def device(self) -> DeviceInfo | None:
@@ -185,25 +277,50 @@ class DeviceSession:
 
         return _new_operation_id()
 
-    def list_devices(self) -> list[DeviceInfo]:
+    def list_devices(
+        self,
+        *,
+        operation_id: str | None = None,
+        operation: OperationContext | None = None,
+    ) -> list[DeviceInfo]:
         """List every ADB device, preserving offline and unauthorized states."""
 
-        operation_id = _new_operation_id()
+        active_operation = _effective_operation(operation)
+        effective_operation_id = operation_id or (
+            active_operation.operation_id if active_operation is not None else _new_operation_id()
+        )
+        _checkpoint(active_operation)
         with self._lifecycle_lock:
             with self._state_lock:
-                self._active_operation_id = operation_id
+                self._active_operation_id = effective_operation_id
             try:
-                return self.registry.list_devices()
+                devices = self.registry.list_devices()
+                _checkpoint(active_operation)
+                return devices
             except MobileUseError as error:
-                with self._state_lock:
-                    self._last_error = _lifecycle_error(error)
+                _commit(
+                    active_operation,
+                    lambda error=error: self._set_last_error(_lifecycle_error(error)),
+                    "error_commit",
+                )
                 raise
             finally:
-                with self._state_lock:
-                    if self._active_operation_id == operation_id:
-                        self._active_operation_id = None
+                if active_operation is None:
+                    with self._state_lock:
+                        if self._active_operation_id == effective_operation_id:
+                            self._active_operation_id = None
 
-    def connect(self, serial: str | None = None) -> SessionConnection:
+    def _set_last_error(self, error: LifecycleError | None) -> None:
+        with self._state_lock:
+            self._last_error = error
+
+    def connect(
+        self,
+        serial: str | None = None,
+        *,
+        operation_id: str | None = None,
+        operation: OperationContext | None = None,
+    ) -> SessionConnection:
         """Connect one selected device and return a new session generation.
 
         A reconnect first detaches the previous controller. If any stage of
@@ -211,19 +328,27 @@ class DeviceSession:
         session references are cleared, leaving no connected controller behind.
         """
 
-        operation_id = _new_operation_id()
+        active_operation = _effective_operation(operation)
+        effective_operation_id = operation_id or (
+            active_operation.operation_id if active_operation is not None else _new_operation_id()
+        )
+        _checkpoint(active_operation)
         with self._lifecycle_lock:
             with self._state_lock:
-                self._active_operation_id = operation_id
-                self._state = SessionLifecycle.CONNECTING
-                self._last_error = None
-                old_controller = self._detach_controller_locked()
+                old_controller = _commit(
+                    active_operation,
+                    lambda: self._prepare_connect_locked(effective_operation_id),
+                    "session_commit",
+                )
             if old_controller is not None:
                 self._safe_disconnect(old_controller)
             try:
+                _checkpoint(active_operation)
                 selected = self.registry.select(serial)
+                _checkpoint(active_operation)
                 controller = self.controller_factory(selected.serial)
                 try:
+                    _checkpoint(active_operation)
                     controller.android_client.connect()
                 except Exception:
                     # The Android client can have acquired a transport before
@@ -232,48 +357,80 @@ class DeviceSession:
                     self._safe_disconnect(controller)
                     raise
             except MobileUseError as error:
-                with self._state_lock:
-                    self._state = SessionLifecycle.FAILED
-                    self._last_error = _lifecycle_error(error)
-                    self._device = None
-                    self._controller = None
-                    self.clear_snapshot()
+                if active_operation is None or active_operation.active:
+                    _commit(
+                        active_operation,
+                        lambda error=error: self._mark_connection_failed(error),
+                        "error_commit",
+                    )
                 raise
             except Exception:
-                with self._state_lock:
-                    self._state = SessionLifecycle.FAILED
-                    self._last_error = _lifecycle_error(
-                        MobileUseError(
-                            ErrorCode.OPERATION_FAILED,
-                            "Failed to initialize the Android automation connection.",
-                            "Check `adb devices -l`, unlock the device, and try again.",
-                        )
+                failure = MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Failed to initialize the Android automation connection.",
+                    "Check `adb devices -l`, unlock the device, and try again.",
+                )
+                if active_operation is None or active_operation.active:
+                    _commit(
+                        active_operation,
+                        lambda: self._mark_connection_failed(failure),
+                        "error_commit",
                     )
-                    self._device = None
-                    self._controller = None
-                    self.clear_snapshot()
                 raise
             else:
                 with self._state_lock:
-                    self._generation_counter += 1
-                    self._generation = self._generation_counter
-                    self._session_id = _new_session_id()
-                    self._device = selected
-                    self._controller = controller
-                    self._state = SessionLifecycle.READY
-                    self._last_error = None
-                    self.clear_snapshot()
-                    result = SessionConnection(
-                        session_id=self._session_id,
-                        generation=self._generation,
-                        state=self._state,
-                        device=selected,
-                    )
+                    try:
+                        result = _commit(
+                            active_operation,
+                            lambda: self._commit_connection_locked(selected, controller),
+                            "session_commit",
+                        )
+                    except MobileUseError:
+                        # A deadline/cancellation can win just after the
+                        # adapter connected.  Release the new controller but
+                        # never publish it as the active session.
+                        self._safe_disconnect(controller)
+                        raise
                 return result
             finally:
-                with self._state_lock:
-                    if self._active_operation_id == operation_id:
-                        self._active_operation_id = None
+                if active_operation is None:
+                    with self._state_lock:
+                        if self._active_operation_id == effective_operation_id:
+                            self._active_operation_id = None
+
+    def _prepare_connect_locked(self, operation_id: str) -> AndroidController | None:
+        self._active_operation_id = operation_id
+        self._state = SessionLifecycle.CONNECTING
+        self._last_error = None
+        return self._detach_controller_locked()
+
+    def _mark_connection_failed(self, error: MobileUseError) -> None:
+        with self._state_lock:
+            self._state = SessionLifecycle.FAILED
+            self._last_error = _lifecycle_error(error)
+            self._device = None
+            self._controller = None
+            self._clear_snapshot_unchecked()
+
+    def _commit_connection_locked(
+        self,
+        selected: DeviceInfo,
+        controller: AndroidController,
+    ) -> SessionConnection:
+        self._generation_counter += 1
+        self._generation = self._generation_counter
+        self._session_id = _new_session_id()
+        self._device = selected
+        self._controller = controller
+        self._state = SessionLifecycle.READY
+        self._last_error = None
+        self._clear_snapshot_unchecked()
+        return SessionConnection(
+            session_id=self._session_id,
+            generation=self._generation,
+            state=self._state,
+            device=selected,
+        )
 
     def _detach_controller_locked(self) -> AndroidController | None:
         """Release the current controller while the lifecycle lock is held."""
@@ -283,7 +440,7 @@ class DeviceSession:
         self._device = None
         self._session_id = None
         self._generation = None
-        self.clear_snapshot()
+        self._clear_snapshot_unchecked()
         return controller
 
     @staticmethod
@@ -291,17 +448,34 @@ class DeviceSession:
         with suppress(Exception):
             controller.disconnect()
 
-    def store_snapshot(self, snapshot: ScreenSnapshot) -> str:
+    def store_snapshot(
+        self,
+        snapshot: ScreenSnapshot,
+        *,
+        operation: OperationContext | None = None,
+    ) -> str:
         """Replace the one-entry snapshot cache and return its opaque identifier."""
 
-        with self._state_lock:
-            self._snapshot_id = f"s-{uuid4().hex}"
-            self._snapshot = snapshot
-            return self._snapshot_id
+        active_operation = _effective_operation(operation)
 
-    def get_snapshot(self, snapshot_id: str) -> ScreenSnapshot:
+        def store() -> str:
+            with self._state_lock:
+                self._snapshot_id = f"s-{uuid4().hex}"
+                self._snapshot = snapshot
+                return self._snapshot_id
+
+        return cast(str, _commit(active_operation, store, "snapshot_commit"))
+
+    def get_snapshot(
+        self,
+        snapshot_id: str,
+        *,
+        operation: OperationContext | None = None,
+    ) -> ScreenSnapshot:
         """Return the cached snapshot or reject an expired/unknown identifier."""
 
+        active_operation = _effective_operation(operation)
+        _checkpoint(active_operation, "snapshot_read")
         with self._state_lock:
             if self._snapshot_id != snapshot_id or self._snapshot is None:
                 raise MobileUseError(
@@ -310,17 +484,34 @@ class DeviceSession:
                     "Call android_snapshot to capture the current screen and use its new "
                     "snapshot_id.",
                 )
-            return self._snapshot
+            snapshot = self._snapshot
+        _checkpoint(active_operation, "snapshot_read")
+        return snapshot
 
-    def clear_snapshot(self) -> None:
+    def clear_snapshot(self, *, operation: OperationContext | None = None) -> None:
+        """Invalidate cached observation state for the current operation."""
+
+        active_operation = _effective_operation(operation)
+        _commit(active_operation, self._clear_snapshot_unchecked, "snapshot_invalidate")
+
+    def _clear_snapshot_unchecked(self) -> None:
         with self._state_lock:
             self._snapshot_id = None
             self._snapshot = None
 
-    def require_controller(self) -> AndroidController:
+    def require_controller(
+        self,
+        *,
+        operation_id: str | None = None,
+        operation: OperationContext | None = None,
+    ) -> AndroidController:
         """Return the active controller after probing the selected serial."""
 
-        operation_id = _new_operation_id()
+        active_operation = _effective_operation(operation)
+        effective_operation_id = operation_id or (
+            active_operation.operation_id if active_operation is not None else _new_operation_id()
+        )
+        _checkpoint(active_operation)
         with self._lifecycle_lock:
             with self._state_lock:
                 if self._controller is None or self._device is None:
@@ -331,9 +522,11 @@ class DeviceSession:
                     )
                 selected_device = self._device
                 controller = self._controller
-                self._active_operation_id = operation_id
+                self._active_operation_id = effective_operation_id
             try:
+                _checkpoint(active_operation)
                 current = self.registry.select(selected_device.serial)
+                _checkpoint(active_operation)
             except MobileUseError as error:
                 if error.code in {
                     ErrorCode.DEVICE_NOT_FOUND,
@@ -347,24 +540,44 @@ class DeviceSession:
                         "Reconnect the device, verify `adb devices -l`, then call "
                         "android_connect again.",
                     )
-                    with self._state_lock:
-                        self._state = SessionLifecycle.DEGRADED
-                        self._last_error = _lifecycle_error(disconnected)
+                    if active_operation is None or active_operation.active:
+                        _commit(
+                            active_operation,
+                            lambda: self._mark_degraded(disconnected),
+                            "error_commit",
+                        )
                     raise disconnected from error
-                with self._state_lock:
-                    self._state = SessionLifecycle.DEGRADED
-                    self._last_error = _lifecycle_error(error)
+                if active_operation is None or active_operation.active:
+                    _commit(
+                        active_operation,
+                        lambda error=error: self._mark_degraded(error),
+                        "error_commit",
+                    )
                 raise
             else:
-                with self._state_lock:
-                    self._device = current
-                    self._state = SessionLifecycle.READY
-                    self._last_error = None
+                _commit(
+                    active_operation,
+                    lambda: self._mark_ready(current),
+                    "session_commit",
+                )
+                _checkpoint(active_operation)
                 return controller
             finally:
-                with self._state_lock:
-                    if self._active_operation_id == operation_id:
-                        self._active_operation_id = None
+                if active_operation is None:
+                    with self._state_lock:
+                        if self._active_operation_id == effective_operation_id:
+                            self._active_operation_id = None
+
+    def _mark_degraded(self, error: MobileUseError) -> None:
+        with self._state_lock:
+            self._state = SessionLifecycle.DEGRADED
+            self._last_error = _lifecycle_error(error)
+
+    def _mark_ready(self, device: DeviceInfo) -> None:
+        with self._state_lock:
+            self._device = device
+            self._state = SessionLifecycle.READY
+            self._last_error = None
 
     def status(self, operation_id: str | None = None) -> DeviceStatusResult:
         """Return a safe typed status snapshot without probing the device."""
@@ -416,25 +629,30 @@ class DeviceSession:
 
         return self.status(operation_id)
 
-    def disconnect(self) -> DeviceDisconnectResult:
+    def disconnect(
+        self,
+        *,
+        operation_id: str | None = None,
+        operation: OperationContext | None = None,
+    ) -> DeviceDisconnectResult:
         """Close the current session; repeated calls are safe and successful."""
 
-        operation_id = _new_operation_id()
+        active_operation = _effective_operation(operation)
+        effective_operation_id = operation_id or (
+            active_operation.operation_id if active_operation is not None else _new_operation_id()
+        )
+        _checkpoint(active_operation)
         with self._lifecycle_lock:
             with self._state_lock:
-                self._active_operation_id = operation_id
-                closed_session_id = self._session_id
-                closed_generation = self._generation
-                self._state = SessionLifecycle.CLOSING
-                controller = self._controller
-                self._controller = None
-                self._device = None
-                self._session_id = None
-                self._generation = None
-                self.clear_snapshot()
+                closed_session_id, closed_generation, controller = _commit(
+                    active_operation,
+                    lambda: self._prepare_disconnect_locked(effective_operation_id),
+                    "session_commit",
+                )
             cleanup_error: Exception | None = None
             if controller is not None:
                 try:
+                    _checkpoint(active_operation, "cleanup")
                     controller.disconnect()
                 except Exception as error:
                     cleanup_error = error
@@ -446,46 +664,104 @@ class DeviceSession:
                     "Retry android_disconnect; if it persists, restart the local MCP server.",
                 )
                 with self._state_lock:
-                    self._state = SessionLifecycle.FAILED
-                    self._last_error = _lifecycle_error(failure)
-                    last_error = self._last_error
-                    failure_state = self._state
-                result = DeviceDisconnectResult(
-                    success=False,
-                    operation_id=operation_id,
-                    message=failure.message,
-                    state=failure_state,
-                    closed_session_id=closed_session_id,
-                    closed_generation=closed_generation,
-                    error_code=failure.code.value,
-                    category=failure.category.value,
-                    retryable=failure.retryable,
-                    suggestion=failure.suggestion,
-                    details={},
-                    error=last_error,
-                )
+                    result = _commit(
+                        active_operation,
+                        lambda: self._finish_disconnect_failure(
+                            effective_operation_id,
+                            closed_session_id,
+                            closed_generation,
+                            failure,
+                        ),
+                        "error_commit",
+                    )
             else:
                 with self._state_lock:
-                    self._state = SessionLifecycle.DISCONNECTED
-                    self._last_error = None
-                    disconnected_state = self._state
-                result = DeviceDisconnectResult(
-                    success=True,
-                    operation_id=operation_id,
-                    message="Android device disconnected.",
-                    state=disconnected_state,
-                    closed_session_id=closed_session_id,
-                    closed_generation=closed_generation,
-                )
-            with self._state_lock:
-                if self._active_operation_id == operation_id:
-                    self._active_operation_id = None
+                    result = _commit(
+                        active_operation,
+                        lambda: self._finish_disconnect_success(
+                            effective_operation_id,
+                            closed_session_id,
+                            closed_generation,
+                        ),
+                        "session_commit",
+                    )
+            if active_operation is None:
+                with self._state_lock:
+                    if self._active_operation_id == effective_operation_id:
+                        self._active_operation_id = None
             return result
+
+    def _prepare_disconnect_locked(
+        self,
+        operation_id: str,
+    ) -> tuple[str | None, int | None, AndroidController | None]:
+        closed_session_id = self._session_id
+        closed_generation = self._generation
+        self._active_operation_id = operation_id
+        self._state = SessionLifecycle.CLOSING
+        controller = self._controller
+        self._controller = None
+        self._device = None
+        self._session_id = None
+        self._generation = None
+        self._clear_snapshot_unchecked()
+        return closed_session_id, closed_generation, controller
+
+    def _finish_disconnect_failure(
+        self,
+        operation_id: str,
+        closed_session_id: str | None,
+        closed_generation: int | None,
+        failure: MobileUseError,
+    ) -> DeviceDisconnectResult:
+        self._state = SessionLifecycle.FAILED
+        self._last_error = _lifecycle_error(failure)
+        return DeviceDisconnectResult(
+            success=False,
+            operation_id=operation_id,
+            message=failure.message,
+            state=self._state,
+            closed_session_id=closed_session_id,
+            closed_generation=closed_generation,
+            error_code=failure.code.value,
+            category=failure.category.value,
+            retryable=failure.retryable,
+            suggestion=failure.suggestion,
+            details={},
+            error=self._last_error,
+        )
+
+    def _finish_disconnect_success(
+        self,
+        operation_id: str,
+        closed_session_id: str | None,
+        closed_generation: int | None,
+    ) -> DeviceDisconnectResult:
+        self._state = SessionLifecycle.DISCONNECTED
+        self._last_error = None
+        return DeviceDisconnectResult(
+            success=True,
+            operation_id=operation_id,
+            message="Android device disconnected.",
+            state=self._state,
+            closed_session_id=closed_session_id,
+            closed_generation=closed_generation,
+        )
 
     async def close(self) -> DeviceDisconnectResult:
         """Awaitable shutdown hook backed by the explicit disconnect path."""
 
-        return await asyncio.to_thread(self.disconnect)
+        operation_id = self.new_operation_id()
+        return await self.run_operation(
+            "disconnect",
+            lambda context: asyncio.to_thread(
+                self.disconnect,
+                operation_id=context.operation_id,
+            ),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=True,
+        )
 
     async def aclose(self) -> DeviceDisconnectResult:
         """Alias for callers that use the conventional async-close spelling."""

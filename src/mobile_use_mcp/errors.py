@@ -19,6 +19,8 @@ class ErrorCode(StrEnum):
     INVALID_COORDINATES = "INVALID_COORDINATES"
     OPERATION_FAILED = "OPERATION_FAILED"
     TIMEOUT = "TIMEOUT"
+    CANCELLED = "CANCELLED"
+    BUSY = "BUSY"
     UNSUPPORTED = "UNSUPPORTED"
     SNAPSHOT_NOT_FOUND = "SNAPSHOT_NOT_FOUND"
 
@@ -44,6 +46,8 @@ _ERROR_CATEGORIES: dict[ErrorCode, ErrorCategory] = {
     ErrorCode.SNAPSHOT_NOT_FOUND: ErrorCategory.SESSION,
     ErrorCode.OPERATION_FAILED: ErrorCategory.OPERATION,
     ErrorCode.TIMEOUT: ErrorCategory.OPERATION,
+    ErrorCode.CANCELLED: ErrorCategory.OPERATION,
+    ErrorCode.BUSY: ErrorCategory.OPERATION,
     ErrorCode.INVALID_TARGET: ErrorCategory.VALIDATION,
     ErrorCode.ELEMENT_NOT_FOUND: ErrorCategory.VALIDATION,
     ErrorCode.INVALID_COORDINATES: ErrorCategory.VALIDATION,
@@ -69,12 +73,15 @@ class MobileUseError(Exception):
         message: str,
         suggestion: str | None = None,
         data: dict[str, Any] | None = None,
+        *,
+        retryable_override: bool | None = None,
     ):
         super().__init__(message)
         self.code = code
         self.message = message
         self.suggestion = suggestion
         self.data = data or {}
+        self._retryable_override = retryable_override
 
     @property
     def category(self) -> ErrorCategory:
@@ -86,4 +93,6 @@ class MobileUseError(Exception):
     def retryable(self) -> bool:
         """Whether retrying may succeed without changing the request."""
 
+        if self._retryable_override is not None:
+            return self._retryable_override
         return self.code in _RETRYABLE_CODES

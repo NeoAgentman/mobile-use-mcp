@@ -91,6 +91,14 @@ Call `android_doctor` before a workflow to receive independent `ready`, `degrade
 screen recording, and ffmpeg. If more than one device is online, pass the exact serial from
 `android_list_devices`; the doctor never picks one implicitly.
 
+All `android_` calls share one FIFO session operation gateway. The configured operation budget is
+a total deadline that includes queue time; the queue budget is an additional upper bound for time
+spent waiting behind an active call. A timeout reports its operation ID, stage (`queue` or
+`execution`), elapsed time, and whether retrying is safe. Cancelling a queued call removes only
+that call. Cancelling or timing out a running call invalidates its session/snapshot commit, while
+the gateway keeps later calls in submission order. The gateway never retries a callback; callers
+must not blindly retry a non-idempotent action after an uncertain device outcome.
+
 ## Installation
 
 Clone the repository and install the locked environment:
@@ -329,6 +337,8 @@ Stable error codes include:
 - `INVALID_COORDINATES`
 - `OPERATION_FAILED`
 - `TIMEOUT`
+- `CANCELLED`
+- `BUSY`
 - `UNSUPPORTED`
 - `SNAPSHOT_NOT_FOUND`
 

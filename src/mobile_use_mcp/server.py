@@ -28,6 +28,7 @@ from mobile_use_mcp.models import (
     DeviceListResult,
     DeviceStatusResult,
     DoctorResult,
+    DoctorStatus,
     LifecycleError,
     LifecycleResult,
     OperationResult,
@@ -236,7 +237,16 @@ async def android_list_devices(limit: int = 50, offset: int = 0) -> DeviceListRe
         raise ValueError("offset must be non-negative")
     operation_id = session.new_operation_id()
     try:
-        devices = await asyncio.to_thread(session.list_devices)
+        devices = await session.run_operation(
+            "list_devices",
+            lambda context: asyncio.to_thread(
+                session.list_devices,
+                operation_id=context.operation_id,
+            ),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
     except MobileUseError as error:
         return cast(
             DeviceListResult,
@@ -290,12 +300,36 @@ async def android_doctor(
     """
 
     operation_id = session.new_operation_id()
-    return await run_doctor_bounded(
-        session.config,
-        serial=serial,
-        registry=session.registry,
-        operation_id=operation_id,
-    )
+    try:
+        return await session.run_operation(
+            "doctor",
+            lambda context: run_doctor_bounded(
+                session.config,
+                serial=serial,
+                registry=session.registry,
+                operation_id=context.operation_id,
+            ),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
+    except MobileUseError as error:
+        return DoctorResult(
+            success=False,
+            operation_id=operation_id,
+            overall_status=DoctorStatus.UNAVAILABLE,
+            message=error.message,
+            serial=serial,
+            error_code=error.code.value,
+            category=error.category.value,
+            retryable=error.retryable,
+            suggestion=error.suggestion,
+            details=error.data,
+            config={
+                "adb_host": session.config.adb_host,
+                "adb_port": session.config.adb_port,
+            },
+        )
 
 
 @mcp.tool(
@@ -325,7 +359,12 @@ async def android_connect(
     try:
         connection = cast(
             SessionConnection | DeviceInfo,
-            await asyncio.to_thread(session.connect, serial),
+            await session.run_operation(
+                "connect",
+                lambda context: asyncio.to_thread(session.connect, serial),
+                operation_id=operation_id,
+                mutating=True,
+            ),
         )
     except MobileUseError as error:
         return cast(
@@ -398,7 +437,27 @@ async def android_status() -> DeviceStatusResult:
     """Return the lifecycle and safe device status of this MCP session."""
 
     operation_id = session.new_operation_id()
-    return await asyncio.to_thread(session.status, operation_id)
+    try:
+        return await session.run_operation(
+            "status",
+            lambda context: session.status(context.operation_id),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
+    except MobileUseError as error:
+        return cast(
+            DeviceStatusResult,
+            _lifecycle_failure(
+                DeviceStatusResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+            ),
+        )
 
 
 @mcp.tool(
@@ -412,6 +471,19 @@ async def android_disconnect() -> DeviceDisconnectResult:
 
     try:
         result = await session.close()
+    except MobileUseError as error:
+        return cast(
+            DeviceDisconnectResult,
+            _lifecycle_failure(
+                DeviceDisconnectResult,
+                operation_id=str(error.data.get("operation_id", session.new_operation_id())),
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+            ),
+        )
     except Exception:
         error = MobileUseError(
             ErrorCode.OPERATION_FAILED,
@@ -503,12 +575,26 @@ async def android_snapshot(
     # operator control without changing the public schema defaults.
     effective_max_elements = min(max_elements, session.config.snapshot_max_elements)
     effective_max_text_length = min(max_text_length, session.config.snapshot_max_text_length)
+    operation_id = session.new_operation_id()
     try:
-        controller = session.require_controller()
-        snapshot = await controller.snapshot(
-            interactive_only=interactive_only,
-            max_elements=None,
-            max_text_length=effective_max_text_length,
+        async def capture(context: Any) -> tuple[Any, str]:
+            context.checkpoint("observation")
+            controller = session.require_controller()
+            snapshot = await controller.snapshot(
+                interactive_only=interactive_only,
+                max_elements=None,
+                max_text_length=effective_max_text_length,
+            )
+            context.checkpoint("snapshot_commit")
+            snapshot_id = session.store_snapshot(snapshot)
+            return snapshot, snapshot_id
+
+        snapshot, snapshot_id = await session.run_operation(
+            "snapshot",
+            capture,
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
         )
     except MobileUseError as error:
         failure = _failure(error).model_dump(mode="json")
@@ -530,7 +616,6 @@ async def android_snapshot(
             structuredContent=failure,
         )
 
-    snapshot_id = session.store_snapshot(snapshot)
     total_elements = len(snapshot.elements)
     returned_elements = (
         snapshot.elements
@@ -597,11 +682,21 @@ async def android_screenshot(
     reading UI text; use this tool for visual-only inspection with lower structured context.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        snapshot = await session.require_controller().snapshot(
-            interactive_only=True,
-            max_elements=1,
-            max_text_length=1,
+        async def capture(_context: Any) -> Any:
+            return await session.require_controller().snapshot(
+                interactive_only=True,
+                max_elements=1,
+                max_text_length=1,
+            )
+
+        snapshot = await session.run_operation(
+            "screenshot",
+            capture,
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
         )
     except MobileUseError as error:
         failure = _failure(error).model_dump(mode="json")
@@ -684,17 +779,28 @@ async def android_get_ui_elements(
     to 2000 characters per node. Actions and android_wait invalidate prior snapshot IDs.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        if snapshot_id is None:
-            snapshot = await session.require_controller().snapshot(
-                interactive_only=False,
-                max_elements=None,
-                max_text_length=min(2_000, session.config.snapshot_max_text_length),
-            )
-            resolved_snapshot_id = session.store_snapshot(snapshot)
-        else:
-            snapshot = session.get_snapshot(snapshot_id)
-            resolved_snapshot_id = snapshot_id
+        async def read_snapshot(_context: Any) -> tuple[Any, str]:
+            if snapshot_id is None:
+                snapshot = await session.require_controller().snapshot(
+                    interactive_only=False,
+                    max_elements=None,
+                    max_text_length=min(2_000, session.config.snapshot_max_text_length),
+                )
+                resolved_snapshot_id = session.store_snapshot(snapshot)
+            else:
+                snapshot = session.get_snapshot(snapshot_id)
+                resolved_snapshot_id = snapshot_id
+            return snapshot, resolved_snapshot_id
+
+        snapshot, resolved_snapshot_id = await session.run_operation(
+            "get_ui_elements",
+            read_snapshot,
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -759,8 +865,15 @@ async def android_get_ui_elements(
 async def android_get_foreground_app() -> dict[str, Any]:
     """Return the package and activity currently in the foreground."""
 
+    operation_id = session.new_operation_id()
     try:
-        foreground = await session.require_controller().get_foreground_app()
+        foreground = await session.run_operation(
+            "get_foreground_app",
+            lambda _context: session.require_controller().get_foreground_app(),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -800,8 +913,15 @@ async def android_list_apps(
 
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")
+    operation_id = session.new_operation_id()
     try:
-        apps = await session.require_controller().list_apps(query=query, limit=limit)
+        apps = await session.run_operation(
+            "list_apps",
+            lambda _context: session.require_controller().list_apps(query=query, limit=limit),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -840,10 +960,18 @@ async def android_tap(target: Target) -> dict[str, Any]:
     Observe again afterward; wait briefly first when the page animates or loads asynchronously.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            details = await session.require_controller().tap(target)
+            return await session.require_controller().tap(target)
+
+        details = await session.run_operation(
+            "tap",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -873,10 +1001,18 @@ async def android_long_press(
     Observe again afterward to verify the resulting UI state.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            details = await session.require_controller().long_press(target, duration_ms)
+            return await session.require_controller().long_press(target, duration_ms)
+
+        details = await session.run_operation(
+            "long_press",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -910,8 +1046,9 @@ async def android_swipe(
     height, and observe again after the swipe because old bounds and snapshots become stale.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().swipe(
                 start_x,
@@ -920,6 +1057,13 @@ async def android_swipe(
                 end_y,
                 duration_ms,
             )
+
+        await session.run_operation(
+            "swipe",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -966,10 +1110,18 @@ async def android_type_text(
     verify the value, especially for Unicode text or bounds-only/Flutter-style input fields.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            method = await session.require_controller().type_text(text, target)
+            return await session.require_controller().type_text(text, target)
+
+        method = await session.run_operation(
+            "type_text",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1011,10 +1163,18 @@ async def android_clear_text(
     delete-key fallback.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            method = await session.require_controller().clear_text(max_characters, target)
+            return await session.require_controller().clear_text(max_characters, target)
+
+        method = await session.run_operation(
+            "clear_text",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1045,10 +1205,18 @@ async def android_press_key(
     Success means the key command was sent; observe again to verify any UI transition.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().press_key(key)
+
+        await session.run_operation(
+            "press_key",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1081,10 +1249,18 @@ async def android_launch_app(
     needed.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            launch = await session.require_controller().launch_app(package)
+            return await session.require_controller().launch_app(package)
+
+        launch = await session.run_operation(
+            "launch_app",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1114,10 +1290,18 @@ async def android_terminate_app(
 ) -> dict[str, Any]:
     """Force-stop one exact installed Android package and invalidate cached UI state."""
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().terminate_app(package)
+
+        await session.run_operation(
+            "terminate_app",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1149,10 +1333,18 @@ async def android_open_url(
     browser loading state, or another foreground result.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().open_url(url)
+
+        await session.run_operation(
+            "open_url",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1192,13 +1384,21 @@ async def android_start_recording(
     while one is active; disconnect aborts and cleans up unfinished recording state.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            details = await session.require_controller().start_recording(
+            return await session.require_controller().start_recording(
                 max_duration_seconds,
                 bit_rate,
             )
+
+        details = await session.run_operation(
+            "start_recording",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1223,10 +1423,18 @@ async def android_stop_recording() -> dict[str, Any]:
     sensitive screen content.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        async with session.write_lock:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            details = await session.require_controller().stop_recording()
+            return await session.require_controller().stop_recording()
+
+        details = await session.run_operation(
+            "stop_recording",
+            act,
+            operation_id=operation_id,
+            mutating=True,
+        )
     except MobileUseError as error:
         return _failure(error).model_dump(mode="json")
     except Exception:
@@ -1260,8 +1468,21 @@ async def android_wait(
     android_snapshot afterward and do not reuse an earlier snapshot_id.
     """
 
-    session.clear_snapshot()
-    await asyncio.sleep(milliseconds / 1_000)
+    operation_id = session.new_operation_id()
+    try:
+        async def wait_fixed(context: Any) -> None:
+            session.clear_snapshot()
+            await context.sleep(milliseconds / 1_000)
+
+        await session.run_operation(
+            "wait",
+            wait_fixed,
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=True,
+        )
+    except MobileUseError as error:
+        return _failure(error).model_dump(mode="json")
     return OperationResult(
         success=True,
         message=f"Waited {milliseconds} milliseconds.",

@@ -307,6 +307,11 @@ class DoctorResult(ResultMappingMixin, StrictModel):
     serial: str | None = Field(default=None, max_length=256)
     checks: list[DoctorCheck] = Field(default_factory=lambda: [])
     config: dict[str, Any] = Field(default_factory=dict)
+    error_code: str | None = None
+    category: str | None = None
+    retryable: bool | None = None
+    suggestion: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def healthy(self) -> bool:

@@ -1,7 +1,9 @@
+import asyncio
 from unittest.mock import Mock
 
 import pytest
 
+from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
     DeviceInfo,
@@ -180,3 +182,40 @@ async def test_async_close_uses_idempotent_disconnect_path() -> None:
     assert repeated.success is True
     assert repeated.state == SessionLifecycle.DISCONNECTED
     controller.disconnect.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_observation_cannot_publish_a_late_snapshot() -> None:
+    manager = SessionManager(
+        config=RuntimeConfig(operation_timeout_seconds=0.02, queue_timeout_seconds=1)
+    )
+    snapshot = ScreenSnapshot(
+        serial="ABC",
+        width=1080,
+        height=2400,
+        screenshot_png=b"png",
+        elements=[],
+        foreground_app=ForegroundApp(),
+    )
+    committed = False
+
+    async def slow_observation(_context: object) -> None:
+        nonlocal committed
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            # A late adapter completion must be rejected by the session's
+            # operation context rather than replacing a newer observation.
+            await asyncio.sleep(0)
+            manager.store_snapshot(snapshot)
+            committed = True
+
+    with pytest.raises(MobileUseError) as caught:
+        await manager.run_operation("snapshot", slow_observation, retry_safe=True, mutating=False)
+
+    await asyncio.sleep(0.01)
+    assert caught.value.code == ErrorCode.TIMEOUT
+    assert committed is False
+    with pytest.raises(MobileUseError) as missing:
+        manager.get_snapshot("s-late")
+    assert missing.value.code == ErrorCode.SNAPSHOT_NOT_FOUND
