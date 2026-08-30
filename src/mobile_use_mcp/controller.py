@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 from adbutils import AdbClient  # pyright: ignore[reportMissingTypeStubs]
 
 from mobile_use_mcp.android_client import AndroidClient
+from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
     AppLaunchAttempt,
@@ -54,8 +55,15 @@ class ADBDevice(Protocol):
 ADBConnector = Callable[[str], ADBDevice]
 
 
-def _default_adb_connector(serial: str) -> ADBDevice:
-    return cast(ADBDevice, AdbClient(host="127.0.0.1", port=5037).device(serial=serial))
+def _default_adb_connector(
+    serial: str,
+    config: RuntimeConfig | None = None,
+) -> ADBDevice:
+    runtime = config or RuntimeConfig.defaults()
+    return cast(
+        ADBDevice,
+        AdbClient(host=runtime.adb_host, port=runtime.adb_port).device(serial=serial),
+    )
 
 
 class AndroidController:
@@ -77,12 +85,22 @@ class AndroidController:
         serial: str,
         *,
         android_client: AndroidClient | None = None,
-        adb_connector: ADBConnector = _default_adb_connector,
+        adb_connector: ADBConnector | None = None,
+        config: RuntimeConfig | None = None,
     ):
         self.serial = serial
-        self.android_client = android_client or AndroidClient(serial)
-        self.adb_device = adb_connector(serial)
-        self.recording = RecordingManager(serial, cast(RecordingADBDevice, self.adb_device))
+        self.config = config or RuntimeConfig.defaults()
+        self.android_client = android_client or AndroidClient(serial, config=self.config)
+        self.adb_device = (
+            adb_connector(serial)
+            if adb_connector is not None
+            else _default_adb_connector(serial, self.config)
+        )
+        self.recording = RecordingManager(
+            serial,
+            cast(RecordingADBDevice, self.adb_device),
+            config=self.config,
+        )
 
     async def snapshot(
         self,

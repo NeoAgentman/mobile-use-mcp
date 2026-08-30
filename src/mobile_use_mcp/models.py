@@ -20,6 +20,14 @@ class DeviceState(StrEnum):
     UNKNOWN = "unknown"
 
 
+class DoctorStatus(StrEnum):
+    """Health state of one independent Android runtime capability probe."""
+
+    READY = "ready"
+    DEGRADED = "degraded"
+    UNAVAILABLE = "unavailable"
+
+
 class SessionLifecycle(StrEnum):
     """Observable lifecycle of the one Android session owned by the server."""
 
@@ -272,3 +280,36 @@ class DeviceDisconnectResult(LifecycleResult):
 
     closed_session_id: str | None = Field(default=None, max_length=128)
     closed_generation: int | None = Field(default=None, ge=1)
+
+
+class DoctorCheck(StrictModel):
+    """One bounded, privacy-safe Android doctor probe result."""
+
+    name: str = Field(min_length=1, max_length=64)
+    status: DoctorStatus
+    message: str = Field(max_length=1_000)
+    duration_ms: float = Field(ge=0)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class DoctorResult(ResultMappingMixin, StrictModel):
+    """Result of an Android environment diagnosis.
+
+    ``success`` describes whether all required checks were ready.  The doctor
+    itself still returns normally when a capability is degraded or unavailable
+    so operators receive the complete independent matrix in one call.
+    """
+
+    success: bool
+    operation_id: str = Field(min_length=1, max_length=128)
+    overall_status: DoctorStatus
+    message: str = Field(max_length=1_000)
+    serial: str | None = Field(default=None, max_length=256)
+    checks: list[DoctorCheck] = Field(default_factory=lambda: [])
+    config: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def healthy(self) -> bool:
+        """Whether all doctor capabilities are ready."""
+
+        return self.success

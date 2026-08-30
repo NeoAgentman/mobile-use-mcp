@@ -10,6 +10,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Protocol
 
+from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 
 ANDROID_SEGMENT_LIMIT_SECONDS = 170
@@ -53,8 +54,14 @@ async def _start_adb_screenrecord(
     device_path: str,
     duration_seconds: int,
     bit_rate: int | None,
+    config: RuntimeConfig | None = None,
 ) -> AsyncProcess:
-    adb = shutil.which("adb")
+    if config is None:
+        adb = shutil.which("adb")
+    elif Path(config.adb_executable).is_absolute():
+        adb = config.adb_executable
+    else:
+        adb = shutil.which(config.adb_executable)
     if adb is None:
         raise MobileUseError(
             ErrorCode.ADB_UNAVAILABLE,
@@ -63,13 +70,21 @@ async def _start_adb_screenrecord(
         )
     command = [
         adb,
-        "-s",
-        serial,
-        "shell",
-        "screenrecord",
-        "--time-limit",
-        str(duration_seconds),
     ]
+    if config is not None and (
+        config.adb_host != "127.0.0.1" or config.adb_port != 5037
+    ):
+        command.extend(["-H", config.adb_host, "-P", str(config.adb_port)])
+    command.extend(
+        [
+            "-s",
+            serial,
+            "shell",
+            "screenrecord",
+            "--time-limit",
+            str(duration_seconds),
+        ]
+    )
     if bit_rate is not None:
         command.extend(["--bit-rate", str(bit_rate)])
     command.append(device_path)
@@ -89,10 +104,32 @@ class RecordingManager:
         adb_device: RecordingADBDevice,
         process_factory: ProcessFactory = _start_adb_screenrecord,
         clock: Clock = time.monotonic,
+        *,
+        config: RuntimeConfig | None = None,
     ):
         self.serial = serial
         self.adb_device = adb_device
-        self.process_factory = process_factory
+        self.config = config or RuntimeConfig.defaults()
+        process_impl: ProcessFactory
+        if config is not None and process_factory is _start_adb_screenrecord:
+            async def configured_process(
+                record_serial: str,
+                path: str,
+                duration: int,
+                rate: int | None,
+            ) -> AsyncProcess:
+                return await _start_adb_screenrecord(
+                    record_serial,
+                    path,
+                    duration,
+                    rate,
+                    self.config,
+                )
+
+            process_impl = configured_process
+        else:
+            process_impl = process_factory
+        self.process_factory = process_impl
         self.clock = clock
         self._process: AsyncProcess | None = None
         self._task: asyncio.Task[None] | None = None
@@ -130,7 +167,20 @@ class RecordingManager:
                 "includes screenrecord.",
                 data={"serial": self.serial},
             )
-        self._directory = Path(tempfile.mkdtemp(prefix="mobile-use-mcp-recording-"))
+        try:
+            self.config.artifact_root.mkdir(parents=True, exist_ok=True)
+            self._directory = Path(
+                tempfile.mkdtemp(
+                    prefix="mobile-use-mcp-recording-",
+                    dir=str(self.config.artifact_root),
+                )
+            )
+        except OSError as error:
+            raise MobileUseError(
+                ErrorCode.OPERATION_FAILED,
+                "The configured recording artifact directory is not writable.",
+                "Choose a writable artifact root and retry recording.",
+            ) from error
         self._segments = []
         self._errors = []
         self._started_at = self.clock()

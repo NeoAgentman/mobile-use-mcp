@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, Literal, cast
@@ -11,6 +12,13 @@ from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
+from mobile_use_mcp.config import (
+    ConfigurationError,
+    RuntimeConfig,
+    format_startup_error,
+    load_runtime_config,
+)
+from mobile_use_mcp.doctor import run_doctor_bounded
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
 from mobile_use_mcp.models import (
@@ -19,6 +27,7 @@ from mobile_use_mcp.models import (
     DeviceInfo,
     DeviceListResult,
     DeviceStatusResult,
+    DoctorResult,
     LifecycleError,
     LifecycleResult,
     OperationResult,
@@ -35,9 +44,20 @@ phone or an installed mobile app. This includes requests phrased as 手机, 安�
 screen recording. Connect the device, resolve the installed package with android_list_apps when
 possible, and compose snapshot/tap/swipe/input tools for multi-step mobile workflows.
 Observe again after actions. The tools operate Android only, not iOS. Screenshots capture visible
-pixels but do not download an app's original remote media file unless another tool provides it."""
+pixels but do not download an app's original remote media file unless another tool provides it.
+Call android_doctor to diagnose the local ADB, device, uiautomator2, and capability state before
+starting a workflow."""
 
-session = DeviceSession()
+runtime_config = RuntimeConfig.defaults()
+session = DeviceSession(config=runtime_config)
+
+
+def configure_runtime(config: RuntimeConfig) -> None:
+    """Install the one frozen configuration before serving stdio requests."""
+
+    global runtime_config, session
+    runtime_config = config
+    session = DeviceSession(config=config)
 
 
 @asynccontextmanager
@@ -235,6 +255,41 @@ async def android_list_devices(limit: int = 50, offset: int = 0) -> DeviceListRe
         has_more=offset + len(page) < len(devices),
         next_offset=offset + len(page) if offset + len(page) < len(devices) else None,
         devices=page,
+    )
+
+
+@mcp.tool(
+    name="android_doctor",
+    title="Diagnose Android runtime",
+    annotations=READ_ONLY,
+    structured_output=True,
+)
+async def android_doctor(
+    serial: Annotated[
+        str | None,
+        Field(
+            max_length=256,
+            description=(
+                "Optional exact serial from android_list_devices. Required to probe a device "
+                "when more than one authorized device is online."
+            ),
+        ),
+    ] = None,
+) -> DoctorResult:
+    """Diagnose ADB, device authorization, uiautomator2, and device capabilities.
+
+    Every check is independent and bounded.  The doctor never silently chooses
+    among multiple online devices; pass an exact serial when that is required.
+    Missing optional capabilities are reported as degraded rather than hiding
+    the rest of the matrix behind one generic failure.
+    """
+
+    operation_id = session.new_operation_id()
+    return await run_doctor_bounded(
+        session.config,
+        serial=serial,
+        registry=session.registry,
+        operation_id=operation_id,
     )
 
 
@@ -438,12 +493,17 @@ async def android_snapshot(
         raise ValueError("max_elements must be between 1 and 500")
     if not 1 <= max_text_length <= 2_000:
         raise ValueError("max_text_length must be between 1 and 2000")
+    # Runtime configuration is an upper bound even when a caller uses the
+    # backwards-compatible tool defaults.  This keeps payload growth under
+    # operator control without changing the public schema defaults.
+    effective_max_elements = min(max_elements, session.config.snapshot_max_elements)
+    effective_max_text_length = min(max_text_length, session.config.snapshot_max_text_length)
     try:
         controller = session.require_controller()
         snapshot = await controller.snapshot(
             interactive_only=interactive_only,
             max_elements=None,
-            max_text_length=max_text_length,
+            max_text_length=effective_max_text_length,
         )
     except MobileUseError as error:
         failure = _failure(error).model_dump(mode="json")
@@ -468,7 +528,9 @@ async def android_snapshot(
     snapshot_id = session.store_snapshot(snapshot)
     total_elements = len(snapshot.elements)
     returned_elements = (
-        snapshot.elements if detail_level == "full" else snapshot.elements[:max_elements]
+        snapshot.elements
+        if detail_level == "full"
+        else snapshot.elements[:effective_max_elements]
     )
     truncated = len(returned_elements) < total_elements
     image_data, image_width, image_height = encode_screenshot(
@@ -622,7 +684,7 @@ async def android_get_ui_elements(
             snapshot = await session.require_controller().snapshot(
                 interactive_only=False,
                 max_elements=None,
-                max_text_length=2_000,
+                max_text_length=min(2_000, session.config.snapshot_max_text_length),
             )
             resolved_snapshot_id = session.store_snapshot(snapshot)
         else:
@@ -1203,7 +1265,16 @@ async def android_wait(
 
 
 def main() -> None:
-    """Run the MCP server over stdio."""
+    """Validate runtime settings and run the MCP server over stdio."""
+
+    try:
+        configure_runtime(load_runtime_config())
+    except ConfigurationError as error:
+        # Do not let pydantic include invalid values (which may be paths,
+        # credentials, or endpoint details) in the startup diagnostic.  A
+        # non-zero exit also prevents a silent fallback to local defaults.
+        print(format_startup_error(error), file=sys.stderr)
+        raise SystemExit(2) from None
     mcp.run(transport="stdio")
 
 

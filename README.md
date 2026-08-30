@@ -67,6 +67,30 @@ ABC123 device product:... model:... transport_id:1
 If the state is `unauthorized`, unlock the phone and accept the USB debugging prompt. If it is
 `offline`, reconnect the device or restart the ADB server.
 
+### Runtime configuration and diagnostics
+
+The stdio process reads one frozen, validated runtime configuration at startup. Defaults keep the
+normal local ADB server (`127.0.0.1:5037`), original snapshot limits, temporary recording files,
+and warning-level logging. Every setting is optional; malformed values stop startup with a
+value-free stderr diagnostic rather than falling back silently.
+
+The supported `MOBILE_USE_*` variables are:
+
+| Variable | Purpose |
+|---|---|
+| `MOBILE_USE_ADB_EXECUTABLE` (`MOBILE_USE_ADB_PATH`) | ADB executable path or command |
+| `MOBILE_USE_ADB_HOST`, `MOBILE_USE_ADB_PORT` | ADB server endpoint |
+| `MOBILE_USE_OPERATION_TIMEOUT_SECONDS`, `MOBILE_USE_QUEUE_TIMEOUT_SECONDS` | Operation and queue budgets |
+| `MOBILE_USE_SNAPSHOT_MAX_ELEMENTS`, `MOBILE_USE_SNAPSHOT_MAX_TEXT_LENGTH`, `MOBILE_USE_PAYLOAD_MAX_BYTES` | Snapshot and response budgets |
+| `MOBILE_USE_SUBPROCESS_TIMEOUT_SECONDS`, `MOBILE_USE_SUBPROCESS_MAX_OUTPUT_BYTES`, `MOBILE_USE_SUBPROCESS_TERMINATE_TIMEOUT_SECONDS` | External process limits |
+| `MOBILE_USE_ARTIFACT_ROOT`, `MOBILE_USE_ARTIFACT_RETENTION_SECONDS`, `MOBILE_USE_ARTIFACT_MAX_COUNT`, `MOBILE_USE_ARTIFACT_MAX_BYTES` | Recording artifact ownership and retention |
+| `MOBILE_USE_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
+
+Call `android_doctor` before a workflow to receive independent `ready`, `degraded`, or
+`unavailable` checks for ADB, device authorization/state, uiautomator2, screenshots, hierarchy,
+screen recording, and ffmpeg. If more than one device is online, pass the exact serial from
+`android_list_devices`; the doctor never picks one implicitly.
+
 ## Installation
 
 Clone the repository and install the locked environment:
@@ -147,6 +171,7 @@ and report the device model. Observe the screen again after every action.
 | Tool | Purpose |
 |---|---|
 | `android_list_devices` | List online, offline, and unauthorized ADB devices |
+| `android_doctor` | Diagnose ADB, device authorization, uiautomator2, screenshot, hierarchy, screen recording, and ffmpeg |
 | `android_connect` | Select and initialize one device |
 | `android_status` | Read current MCP session state |
 | `android_disconnect` | Release the active session |

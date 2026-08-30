@@ -12,6 +12,7 @@ from threading import Lock, RLock
 from typing import Any, cast
 from uuid import uuid4
 
+from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.devices import DeviceRegistry
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
@@ -85,9 +86,20 @@ class DeviceSession:
         self,
         registry: DeviceRegistry | None = None,
         controller_factory: ControllerFactory = AndroidController,
+        *,
+        config: RuntimeConfig | None = None,
     ):
-        self.registry = registry or DeviceRegistry()
-        self.controller_factory = controller_factory
+        self.config = config or RuntimeConfig.defaults()
+        self.registry = registry or DeviceRegistry(config=self.config)
+        # Keep injected factories source-compatible for deterministic core
+        # tests.  The production default receives the same frozen config as
+        # discovery and therefore cannot drift to another ADB endpoint.
+        controller_impl: ControllerFactory = (
+            controller_factory
+            if controller_factory is not AndroidController
+            else lambda serial: AndroidController(serial, config=self.config)
+        )
+        self.controller_factory = controller_impl
         self._device: DeviceInfo | None = None
         self._controller: AndroidController | None = None
         self._snapshot_id: str | None = None
