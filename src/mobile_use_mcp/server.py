@@ -37,6 +37,7 @@ from mobile_use_mcp.models import (
     UIElement,
 )
 from mobile_use_mcp.session import DeviceSession
+from mobile_use_mcp.version import __version__
 
 MCP_INSTRUCTIONS = """Use this MCP whenever the user asks to interact with a physical Android
 phone or an installed mobile app. This includes requests phrased as 手机, 安卓手机, 手机 App,
@@ -71,6 +72,10 @@ async def server_lifespan(_server: Any) -> AsyncGenerator[None, None]:
 
 
 mcp = FastMCP("mobile_use_mcp", instructions=MCP_INSTRUCTIONS, lifespan=server_lifespan)
+# FastMCP currently derives ``serverInfo.version`` from the MCP SDK package and
+# does not expose a constructor argument for an application version. Override
+# the low-level value so initialize identifies this distribution consistently.
+mcp._mcp_server.version = __version__  # pyright: ignore[reportPrivateUsage]
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,

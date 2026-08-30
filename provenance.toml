@@ -1,0 +1,45 @@
+# Machine-readable source inventory for the Android implementation.
+# Keep this file in sync with PROVENANCE.md and refresh sha256 after an
+# intentional change to an upstream-derived file.
+schema = 1
+upstream_project = "minitap-ai/mobile-use"
+upstream_url = "https://github.com/minitap-ai/mobile-use"
+upstream_revision = "cc20e3d52bf6dac1dff07f7b894520b8aeb051b7"
+upstream_revision_date = "2026-06-27"
+provenance_document = "PROVENANCE.md"
+review_note = "This is a source ancestry and notice record, not a legal conclusion. Human legal review remains open."
+
+[[files]]
+path = "src/mobile_use_mcp/android_client.py"
+upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
+kind = "adapted"
+sha256 = "500077f644972550f884fafce32b53bc388e6dcda2594621de24e223f1e1eeb7"
+modification_statement = "Significantly rewritten for the local MCP session boundary, configured ADB endpoint, bounded reconnect, and secret-safe text handling."
+
+[[files]]
+path = "src/mobile_use_mcp/controller.py"
+upstream_path = "minitap/mobile_use/controllers/android_controller.py; minitap/mobile_use/tools/utils.py"
+kind = "adapted"
+sha256 = "b7c2a88e3c3ed1a2e2d9f6ccb16a08fb9930c93c383fcd8d2b6d5ad58ce85d4a"
+modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, and MCP-safe results."
+
+[[files]]
+path = "src/mobile_use_mcp/selectors.py"
+upstream_path = "minitap/mobile_use/tools/utils.py; minitap/mobile_use/utils/ui_hierarchy.py"
+kind = "adapted"
+sha256 = "66b6e36ab3191d410c7d3194d7f10f5699eb00c99bd394d24dcf14008c4c9710"
+modification_statement = "Significantly rewritten into a small Android selector resolver with bounded normalized targets and an explicit fallback ledger."
+
+[[files]]
+path = "src/mobile_use_mcp/snapshot.py"
+upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
+kind = "adapted"
+sha256 = "7cf052f972ffcecc9fff7f017ad0b67fae249831436391e3ac9745642bef5359"
+modification_statement = "Significantly rewritten to normalize and bound Android hierarchy output for the MCP schema."
+
+[[files]]
+path = "src/mobile_use_mcp/recording.py"
+upstream_path = "minitap/mobile_use/utils/video.py; minitap/mobile_use/tools/mobile/video_recording.py"
+kind = "adapted"
+sha256 = "2757e848768948b5795730d21faa0c57e34a79506d88befc73b4fd8265b71dbf"
+modification_statement = "Significantly rewritten for owned bounded screen-recording processes, segment cleanup, and local artifact limits."

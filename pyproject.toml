@@ -1,6 +1,6 @@
 [project]
 name = "mobile-use-mcp"
-version = "0.3.1"
+dynamic = ["version"]
 description = "MCP server that lets coding agents observe and operate Android devices."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -22,6 +22,9 @@ mobile-use-mcp = "mobile_use_mcp.server:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.version]
+path = "src/mobile_use_mcp/version.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/mobile_use_mcp"]
 
@@ -35,6 +38,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 addopts = ["-q", "--strict-markers", "-m", "not android"]
 asyncio_mode = "auto"
 markers = [

@@ -109,6 +109,30 @@ uv run mobile-use-mcp
 
 It uses stdio and is intended to be started by an MCP client, not used as an interactive CLI.
 
+### Release artifact checks
+
+The package version is maintained once in `src/mobile_use_mcp/version.py`. Hatchling reads that
+source for project metadata, and the runtime MCP initialize response reports the same value. To
+repeat the local release checks after building:
+
+```bash
+uv build
+uv run python scripts/release_audit.py
+```
+
+The audit checks the version source, release-tag convention when `--tag` is supplied, wheel and
+sdist metadata, the `mobile-use-mcp` console entry point, `LICENSE`, `NOTICE`, and the hashed
+upstream inventory in [`provenance.toml`](provenance.toml). The clean-environment stdio smoke
+check used by CI can be run against a wheel-installed command with:
+
+```bash
+smoke_env="$(mktemp -d)"
+python -m venv "$smoke_env"
+"$smoke_env/bin/python" -m pip install dist/mobile_use_mcp-*.whl
+"$smoke_env/bin/python" scripts/stdio_smoke.py \
+  --command "$smoke_env/bin/mobile-use-mcp"
+```
+
 ## Codex configuration
 
 Add the local server with the Codex CLI, replacing the path with your clone location:
@@ -372,4 +396,9 @@ device verification results.
 
 Android controller and selector behavior is derived from
 [`minitap-ai/mobile-use`](https://github.com/minitap-ai/mobile-use), licensed under the Apache
-License 2.0. See `LICENSE` and `NOTICE` for attribution and license details.
+License 2.0. The Android-derived implementation was significantly modified and reorganized for
+this standalone local stdio server. See [`LICENSE`](LICENSE), [`NOTICE`](NOTICE), and the
+auditable [`PROVENANCE.md`](PROVENANCE.md) inventory for attribution and review boundaries.
+
+`mobile-use-mcp` is independently maintained and is not affiliated with, sponsored by, or
+endorsed by Minitap, Inc. or the `minitap-ai/mobile-use` project.

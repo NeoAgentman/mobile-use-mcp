@@ -1,3 +1,5 @@
 """Android device automation tools exposed through MCP."""
 
-__version__ = "0.1.0"
+from mobile_use_mcp.version import __version__
+
+__all__ = ["__version__"]

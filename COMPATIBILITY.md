@@ -1,5 +1,9 @@
 # Host compatibility
 
+`mobile-use-mcp` is independently maintained and is not affiliated with, sponsored by, or
+endorsed by Minitap, Inc. or the `minitap-ai/mobile-use` project. See
+[`PROVENANCE.md`](PROVENANCE.md) for the source inventory and attribution review boundary.
+
 Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3.0.0).
 
 ## Generic MCP clients

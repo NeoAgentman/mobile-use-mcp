@@ -5,6 +5,8 @@ from pathlib import Path
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
+from mobile_use_mcp import __version__
+
 
 async def test_stdio_server_initialize_list_and_call() -> None:
     project_root = Path(__file__).resolve().parents[1]
@@ -26,6 +28,7 @@ async def test_stdio_server_initialize_list_and_call() -> None:
         )
 
     assert initialized.serverInfo.name == "mobile_use_mcp"
+    assert initialized.serverInfo.version == __version__
     assert initialized.instructions is not None
     assert "手机 App" in initialized.instructions
     assert "android_snapshot" in {tool.name for tool in tools.tools}

@@ -40,6 +40,26 @@ jobs:
       - name: Build distributions
         run: uv build
 
+      - name: Audit release artifacts
+        run: |
+          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
+          sdist="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          test -n "$wheel"
+          test -n "$sdist"
+          uv run python scripts/release_audit.py \
+            --wheel "$wheel" \
+            --sdist "$sdist" \
+            --provenance provenance.toml
+
+      - name: Install wheel in a clean environment
+        run: |
+          smoke_env="$(mktemp -d)"
+          python -m venv "$smoke_env"
+          "$smoke_env/bin/python" -m pip install --disable-pip-version-check --no-input \
+            dist/*.whl
+          "$smoke_env/bin/python" scripts/stdio_smoke.py \
+            --command "$smoke_env/bin/mobile-use-mcp"
+
       - name: Inspect MCP tool schema
         run: >-
           npx -y @modelcontextprotocol/inspector --cli

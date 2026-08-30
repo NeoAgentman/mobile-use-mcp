@@ -7,3 +7,7 @@ https://github.com/minitap-ai/mobile-use
 mobile-use is Copyright Minitap, Inc. and is licensed under the Apache License 2.0.
 The original copyright, attribution, and license notices are preserved in this repository.
 
+The Android implementation identified in PROVENANCE.md was significantly modified and
+reorganized for this standalone local stdio MCP server. PROVENANCE.md records source ancestry
+and notice handling; it is not a legal conclusion. mobile-use-mcp is independently maintained
+and is not affiliated with, sponsored by, or endorsed by Minitap, Inc. or minitap-ai/mobile-use.
