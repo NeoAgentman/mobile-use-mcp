@@ -21,6 +21,7 @@ from mobile_use_mcp.models import (
     AndroidSystemSurface,
     BoundsProvenance,
     DeviceDisconnectResult,
+    DeviceHealthSummary,
     DeviceInfo,
     DeviceStatusResult,
     ForegroundApp,
@@ -37,6 +38,11 @@ from mobile_use_mcp.models import (
     SnapshotContext,
     Target,
     UIElement,
+)
+from mobile_use_mcp.observability import (
+    OperationMetadata,
+    PrivacySafeOperationLogger,
+    hash_device_serial,
 )
 from mobile_use_mcp.operations import OperationContext, OperationGateway, current_operation
 from mobile_use_mcp.processes import run_blocking
@@ -171,6 +177,8 @@ class DeviceSession:
         self._generation_counter = 0
         self._active_operation_id: str | None = None
         self._last_error: LifecycleError | None = None
+        self.observability = PrivacySafeOperationLogger(self.config.log_level)
+        self._operation_metadata: dict[str, OperationMetadata] = {}
         # An explicit close request is observable by long-running read waits
         # even while the close operation is queued behind the current FIFO
         # item. This lets condition waits terminate promptly without allowing
@@ -197,9 +205,17 @@ class DeviceSession:
     def _operation_started(self, operation: OperationContext) -> None:
         with self._state_lock:
             self._active_operation_id = operation.operation_id
+            self._operation_metadata[operation.operation_id] = OperationMetadata(
+                session_id=self._session_id,
+                generation=self._generation,
+                device_serial=self._device.serial if self._device is not None else None,
+            )
+            metadata = self._operation_metadata[operation.operation_id]
+        self.observability.operation_started(operation, metadata)
 
     def _operation_finished(self, operation: OperationContext) -> None:
         with self._state_lock:
+            started_metadata = self._operation_metadata.pop(operation.operation_id, None)
             if self._active_operation_id == operation.operation_id:
                 self._active_operation_id = None
             # Connect/disconnect detach their old references before entering
@@ -226,6 +242,13 @@ class DeviceSession:
                 self._last_error = _lifecycle_error(
                     operation.state_error(cancelled=operation.cancelled)
                 )
+            current_metadata = OperationMetadata(
+                session_id=self._session_id,
+                generation=self._generation,
+                device_serial=self._device.serial if self._device is not None else None,
+            )
+            metadata = current_metadata.merge(started_metadata)
+        self.observability.operation_finished(operation, metadata)
 
     async def run_operation(
         self,
@@ -2017,6 +2040,15 @@ class DeviceSession:
             else:
                 message = "The Android device session failed to initialize."
             last_error = self._last_error
+            device_health = DeviceHealthSummary(
+                state=device.state if device is not None else None,
+                adb_state=device.state if device is not None else None,
+                connected=connected,
+                serial_hash=hash_device_serial(device.serial) if device is not None else None,
+                model=device.model if device is not None else None,
+                product=device.product if device is not None else None,
+                transport_id=device.transport_id if device is not None else None,
+            )
             return DeviceStatusResult(
                 success=True,
                 operation_id=op_id,
@@ -2030,6 +2062,7 @@ class DeviceSession:
                 screen_revision=self._screen_revision,
                 current_snapshot_id=self._snapshot_id,
                 snapshot_store=self._snapshot_store.stats(),
+                device_health=device_health,
                 last_error=last_error,
                 error_code=last_error.code if last_error else None,
                 category=last_error.category if last_error else None,

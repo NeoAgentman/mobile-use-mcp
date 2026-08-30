@@ -85,7 +85,16 @@ The supported `MOBILE_USE_*` variables are:
 | `MOBILE_USE_SNAPSHOT_MAX_ELEMENTS`, `MOBILE_USE_SNAPSHOT_MAX_TEXT_LENGTH`, `MOBILE_USE_SNAPSHOT_MAX_ENTRIES`, `MOBILE_USE_SNAPSHOT_MAX_BYTES`, `MOBILE_USE_SNAPSHOT_TTL_SECONDS`, `MOBILE_USE_PAYLOAD_MAX_BYTES` | Snapshot store and response budgets |
 | `MOBILE_USE_SUBPROCESS_TIMEOUT_SECONDS`, `MOBILE_USE_SUBPROCESS_MAX_OUTPUT_BYTES`, `MOBILE_USE_SUBPROCESS_TERMINATE_TIMEOUT_SECONDS` | External process limits |
 | `MOBILE_USE_ARTIFACT_ROOT`, `MOBILE_USE_ARTIFACT_RETENTION_SECONDS`, `MOBILE_USE_ARTIFACT_MAX_COUNT`, `MOBILE_USE_ARTIFACT_MAX_BYTES` | Recording artifact ownership and retention |
-| `MOBILE_USE_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
+| `MOBILE_USE_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`; structured operation diagnostics remain local and are written to stderr |
+| `MOBILE_USE_CONTENT_TRACE_ENABLED`, `MOBILE_USE_CONTENT_TRACE_REDACTION`, `MOBILE_USE_CONTENT_TRACE_RETENTION_SECONDS`, `MOBILE_USE_CONTENT_TRACE_MAX_BYTES` | Optional content-trace policy; disabled by default and enabling it requires `strict` redaction plus positive retention and size limits |
+
+Operation diagnostics are content-minimized JSON lines written only to stderr. Each terminal event
+contains an operation ID, session ID when available, generation, a SHA-256 device-serial digest,
+stage, duration, result, and stable error code. Typed text, UI content, screenshots, credentials,
+complete serials, environment values, local paths, and raw adapter exceptions are not included.
+The stdout stream remains reserved for MCP JSON-RPC frames. Content-level tracing is not part of
+the default operation logger and cannot be enabled without the bounded redaction and retention
+settings above.
 
 Call `android_doctor` before a workflow to receive independent `ready`, `degraded`, or
 `unavailable` checks for ADB, device authorization/state, uiautomator2, screenshots, hierarchy,
@@ -209,7 +218,7 @@ and report the device model. Observe the screen again after every action.
 | `android_list_devices` | List online, offline, and unauthorized ADB devices |
 | `android_doctor` | Diagnose ADB, device authorization, uiautomator2, screenshot, hierarchy, screen recording, and ffmpeg |
 | `android_connect` | Select and initialize one device |
-| `android_status` | Read current MCP session state |
+| `android_status` | Read current MCP session lifecycle, bounded device health, active operation, recording substate, and last structured error |
 | `android_disconnect` | Release the active session |
 
 `android_connect` accepts an optional strict package policy. Use `allowed_packages` (or the

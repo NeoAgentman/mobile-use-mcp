@@ -14,9 +14,17 @@ import shutil
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, ClassVar, cast
+from typing import Any, ClassVar, Literal, cast
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 DEFAULT_ADB_HOST = "127.0.0.1"
 DEFAULT_ADB_PORT = 5037
@@ -35,6 +43,10 @@ DEFAULT_ARTIFACT_RETENTION_SECONDS = 24 * 60 * 60
 DEFAULT_ARTIFACT_MAX_COUNT = 20
 DEFAULT_ARTIFACT_MAX_BYTES = 512 * 1024 * 1024
 DEFAULT_LOG_LEVEL = "WARNING"
+DEFAULT_CONTENT_TRACE_ENABLED = False
+DEFAULT_CONTENT_TRACE_REDACTION: Literal["strict"] = "strict"
+DEFAULT_CONTENT_TRACE_RETENTION_SECONDS = 0
+DEFAULT_CONTENT_TRACE_MAX_BYTES = 0
 
 
 class ConfigurationError(ValueError):
@@ -146,6 +158,26 @@ class RuntimeConfig(BaseModel):
 
     log_level: str = Field(default=DEFAULT_LOG_LEVEL)
 
+    # Content tracing is intentionally a separate, fail-closed setting.  The
+    # default operation diagnostics below never include request content.  A
+    # future content-trace implementation may only be enabled when an
+    # explicit redaction profile and bounded local retention policy are also
+    # configured; this model validates that policy at the process boundary.
+    content_trace_enabled: bool = Field(default=DEFAULT_CONTENT_TRACE_ENABLED)
+    content_trace_redaction: Literal["strict"] = Field(
+        default=DEFAULT_CONTENT_TRACE_REDACTION,
+    )
+    content_trace_retention_seconds: int = Field(
+        default=DEFAULT_CONTENT_TRACE_RETENTION_SECONDS,
+        ge=0,
+        le=31_536_000,
+    )
+    content_trace_max_bytes: int = Field(
+        default=DEFAULT_CONTENT_TRACE_MAX_BYTES,
+        ge=0,
+        le=100 * 1024 * 1024,
+    )
+
     # The aliases make deployments tolerant of the two names used by older
     # local wrappers while keeping one actual frozen model.
     _environment_aliases: ClassVar[dict[str, tuple[str, ...]]] = {
@@ -241,6 +273,30 @@ class RuntimeConfig(BaseModel):
             "MOBILE_USE_MCP_ARTIFACT_MAX_BYTES",
         ),
         "log_level": ("MOBILE_USE_LOG_LEVEL", "MOBILE_USE_MCP_LOG_LEVEL"),
+        "content_trace_enabled": (
+            "MOBILE_USE_CONTENT_TRACE_ENABLED",
+            "MOBILE_USE_CONTENT_TRACING_ENABLED",
+            "MOBILE_USE_CONTENT_TRACE",
+            "MOBILE_USE_CONTENT_TRACING",
+            "MOBILE_USE_MCP_CONTENT_TRACE_ENABLED",
+        ),
+        "content_trace_redaction": (
+            "MOBILE_USE_CONTENT_TRACE_REDACTION",
+            "MOBILE_USE_CONTENT_TRACE_REDACTION_POLICY",
+            "MOBILE_USE_MCP_CONTENT_TRACE_REDACTION",
+        ),
+        "content_trace_retention_seconds": (
+            "MOBILE_USE_CONTENT_TRACE_RETENTION_SECONDS",
+            "MOBILE_USE_CONTENT_TRACE_RETENTION",
+            "MOBILE_USE_MCP_CONTENT_TRACE_RETENTION_SECONDS",
+        ),
+        "content_trace_max_bytes": (
+            "MOBILE_USE_CONTENT_TRACE_MAX_BYTES",
+            "MOBILE_USE_CONTENT_TRACE_MAX_SIZE_BYTES",
+            "MOBILE_USE_CONTENT_TRACE_SIZE_LIMIT_BYTES",
+            "MOBILE_USE_CONTENT_TRACE_SIZE_BYTES",
+            "MOBILE_USE_MCP_CONTENT_TRACE_MAX_BYTES",
+        ),
     }
 
     @field_validator("adb_executable")
@@ -278,6 +334,40 @@ class RuntimeConfig(BaseModel):
         if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("must be one of DEBUG, INFO, WARNING, ERROR, CRITICAL")
         return normalized
+
+    @field_validator("content_trace_enabled", mode="before")
+    @classmethod
+    def validate_content_trace_enabled(cls, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+        raise ValueError("must be true or false")
+
+    @field_validator("content_trace_redaction")
+    @classmethod
+    def validate_content_trace_redaction(cls, value: str) -> str:
+        normalized = value.strip().casefold()
+        if normalized != "strict":
+            raise ValueError("must be strict")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_content_trace_policy(self) -> RuntimeConfig:
+        if self.content_trace_enabled:
+            if self.content_trace_redaction != "strict":
+                raise ValueError("enabled content tracing requires strict redaction")
+            if self.content_trace_retention_seconds <= 0:
+                raise ValueError(
+                    "enabled content tracing requires a positive retention limit"
+                )
+            if self.content_trace_max_bytes <= 0:
+                raise ValueError("enabled content tracing requires a positive size limit")
+        return self
 
     @classmethod
     def defaults(cls) -> RuntimeConfig:
@@ -349,6 +439,24 @@ class RuntimeConfig(BaseModel):
         """Compatibility alias for TTL terminology."""
 
         return self.snapshot_ttl_seconds
+
+    @property
+    def content_tracing_enabled(self) -> bool:
+        """Compatibility alias for callers that use the longer setting name."""
+
+        return self.content_trace_enabled
+
+    @property
+    def content_trace_retention(self) -> int:
+        """Compatibility alias for the bounded content-trace retention."""
+
+        return self.content_trace_retention_seconds
+
+    @property
+    def content_trace_size_limit_bytes(self) -> int:
+        """Compatibility alias for the bounded content-trace size limit."""
+
+        return self.content_trace_max_bytes
 
 
 def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:

@@ -61,6 +61,8 @@ class OperationContext:
     _cancelled: bool = field(default=False, init=False, repr=False)
     _timed_out: bool = field(default=False, init=False, repr=False)
     _stage: str = field(default="queue", init=False, repr=False)
+    _outcome: str | None = field(default=None, init=False, repr=False)
+    _error_code: str | None = field(default=None, init=False, repr=False)
     _lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     @property
@@ -91,6 +93,20 @@ class OperationContext:
         with self._lock:
             return not self._cancelled and not self._timed_out and time.monotonic() < self.deadline
 
+    @property
+    def outcome(self) -> str | None:
+        """Terminal result used by local operation diagnostics."""
+
+        with self._lock:
+            return self._outcome
+
+    @property
+    def error_code(self) -> str | None:
+        """Stable error code associated with the terminal result, if any."""
+
+        with self._lock:
+            return self._error_code
+
     def remaining_seconds(self) -> float:
         return max(0.0, self.deadline - time.monotonic())
 
@@ -113,6 +129,19 @@ class OperationContext:
             self._timed_out = True
             if stage is not None:
                 self._stage = stage
+
+    def mark_outcome(self, outcome: str, error_code: str | None = None) -> None:
+        """Record the first terminal outcome without retaining exception text.
+
+        A caller can time out or cancel while the callback is unwinding.  The
+        first terminal state therefore wins, keeping diagnostics faithful to
+        the result delivered at the MCP boundary.
+        """
+
+        with self._lock:
+            if self._outcome is None:
+                self._outcome = outcome
+                self._error_code = error_code
 
     def state_error(self, *, cancelled: bool) -> MobileUseError:
         stage = self.stage
@@ -196,6 +225,7 @@ class _QueuedOperation[T]:
     task: asyncio.Task[Any] | None = None
     running: bool = False
     cancelled: bool = False
+    finished_notified: bool = False
 
 
 class OperationGateway:
@@ -276,6 +306,23 @@ class OperationGateway:
             with suppress(BaseException):
                 task.exception()
 
+    def _notify_start(self, item: _QueuedOperation[Any]) -> None:
+        """Invoke the diagnostic hook without making it part of the operation."""
+
+        if self._on_start is not None:
+            with suppress(Exception):
+                self._on_start(item.context)
+
+    def _notify_finish(self, item: _QueuedOperation[Any]) -> None:
+        """Invoke the terminal hook exactly once, including queued cancellation."""
+
+        if item.finished_notified:
+            return
+        item.finished_notified = True
+        if self._on_finish is not None:
+            with suppress(Exception):
+                self._on_finish(item.context)
+
     async def _invoke(self, item: _QueuedOperation[Any]) -> Any:
         token: Token[OperationContext | None] = _current_operation.set(item.context)
         try:
@@ -297,11 +344,11 @@ class OperationGateway:
                 item.running = True
                 item.context.mark_running()
                 item.started.set()
-                if self._on_start is not None:
-                    self._on_start(item.context)
+                self._notify_start(item)
                 try:
                     if item.context.remaining_seconds() <= 0:
                         item.context.timeout("execution")
+                        item.context.mark_outcome("timeout", ErrorCode.TIMEOUT.value)
                         self._set_future_error(item, item.context.state_error(cancelled=False))
                         continue
                     item.task = asyncio.create_task(
@@ -317,10 +364,15 @@ class OperationGateway:
                         )
                         if not done:
                             item.context.timeout("execution")
+                            item.context.mark_outcome("timeout", ErrorCode.TIMEOUT.value)
                             item.task.cancel()
                             self._set_future_error(item, item.context.state_error(cancelled=False))
                         elif abort_wait in done:
                             item.task.cancel()
+                            if item.context.cancelled:
+                                item.context.mark_outcome("cancelled", ErrorCode.CANCELLED.value)
+                            else:
+                                item.context.mark_outcome("timeout", ErrorCode.TIMEOUT.value)
                             self._set_future_error(
                                 item,
                                 item.context.state_error(cancelled=item.context.cancelled),
@@ -330,18 +382,37 @@ class OperationGateway:
                                 value = item.task.result()
                             except asyncio.CancelledError:
                                 item.context.cancel("execution")
+                                item.context.mark_outcome("cancelled", ErrorCode.CANCELLED.value)
                                 self._set_future_error(
                                     item,
                                     item.context.state_error(cancelled=True),
                                 )
                             except MobileUseError as error:
+                                if error.code == ErrorCode.CANCELLED:
+                                    item.context.mark_outcome("cancelled", error.code.value)
+                                elif error.code == ErrorCode.TIMEOUT:
+                                    item.context.mark_outcome("timeout", error.code.value)
+                                else:
+                                    item.context.mark_outcome("failure", error.code.value)
                                 self._set_future_error(item, self._annotate_error(item, error))
                             except Exception as error:
+                                item.context.mark_outcome(
+                                    "failure", ErrorCode.OPERATION_FAILED.value
+                                )
                                 self._set_future_error(item, error)
                             else:
                                 if item.context.active:
+                                    item.context.mark_outcome("success")
                                     self._set_future_result(item, value)
                                 else:
+                                    if item.context.cancelled:
+                                        item.context.mark_outcome(
+                                            "cancelled", ErrorCode.CANCELLED.value
+                                        )
+                                    else:
+                                        item.context.mark_outcome(
+                                            "timeout", ErrorCode.TIMEOUT.value
+                                        )
                                     self._set_future_error(
                                         item,
                                         item.context.state_error(
@@ -352,32 +423,39 @@ class OperationGateway:
                         abort_wait.cancel()
                 finally:
                     item.running = False
-                    if self._on_finish is not None:
-                        self._on_finish(item.context)
+                    self._notify_finish(item)
             self._wake.clear()
 
     async def _cancel_item(self, item: _QueuedOperation[Any]) -> None:
         item.cancelled = True
         item.context.cancel("queue" if not item.running else "execution")
+        item.context.mark_outcome("cancelled", ErrorCode.CANCELLED.value)
         if not item.running:
             self._remove_queued(item)
+            self._notify_finish(item)
         elif item.task is not None and not item.task.done():
             item.abort_signal.set()
             item.task.cancel()
+            self._notify_finish(item)
         elif item.running:
             item.abort_signal.set()
+            self._notify_finish(item)
         self._set_future_error(item, item.context.state_error(cancelled=True))
 
     async def _timeout_item(self, item: _QueuedOperation[Any], stage: str) -> MobileUseError:
         if item.running:
             item.context.timeout("execution")
+            item.context.mark_outcome("timeout", ErrorCode.TIMEOUT.value)
             item.abort_signal.set()
             if item.task is not None and not item.task.done():
                 item.task.cancel()
+            self._notify_finish(item)
         else:
             item.cancelled = True
             item.context.timeout(stage)
+            item.context.mark_outcome("timeout", ErrorCode.TIMEOUT.value)
             self._remove_queued(item)
+            self._notify_finish(item)
         error = item.context.state_error(cancelled=False)
         self._set_future_error(item, error)
         return error

@@ -83,6 +83,34 @@ class DeviceInfo(StrictModel):
     transport_id: str | None = Field(default=None, max_length=64)
 
 
+class DeviceHealthSummary(StrictModel):
+    """Bounded device health metadata suitable for session status.
+
+    The full ADB serial remains available in the established ``device``
+    compatibility field.  This operator-facing summary uses a digest so it
+    can also be reused by local diagnostics without turning the serial into a
+    log identifier.
+    """
+
+    state: DeviceState | None = None
+    adb_state: DeviceState | None = None
+    connected: bool = False
+    serial_hash: str | None = Field(default=None, max_length=64)
+    model: str | None = Field(default=None, max_length=256)
+    product: str | None = Field(default=None, max_length=256)
+    transport_id: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def normalize_state_alias(self) -> "DeviceHealthSummary":
+        """Keep both state spellings synchronized for status consumers."""
+
+        if self.state is None:
+            object.__setattr__(self, "state", self.adb_state)
+        if self.adb_state is None:
+            object.__setattr__(self, "adb_state", self.state)
+        return self
+
+
 _ANDROID_PACKAGE_PATTERN = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\Z")
 
 # These are deliberately named surfaces rather than a free-form escape hatch.
@@ -982,6 +1010,7 @@ class DeviceStatusResult(LifecycleResult):
     screen_revision: int = Field(default=0, ge=0)
     current_snapshot_id: str | None = Field(default=None, max_length=128)
     snapshot_store: dict[str, int | float] = Field(default_factory=dict)
+    device_health: DeviceHealthSummary = Field(default_factory=DeviceHealthSummary)
     last_error: LifecycleError | None = None
     policy: PackagePolicySummary = Field(
         default_factory=lambda: PackagePolicySummary(enabled=False, mode="unrestricted")
@@ -993,6 +1022,12 @@ class DeviceStatusResult(LifecycleResult):
     # nested summaries while ``recording`` remains the canonical grouping.
     recording_state: RecordingState = RecordingState.IDLE
     recording_artifact_id: str | None = Field(default=None, max_length=128)
+
+    @property
+    def health(self) -> DeviceHealthSummary:
+        """Compatibility alias for the bounded device health summary."""
+
+        return self.device_health
 
 
 class DeviceDisconnectResult(LifecycleResult):

@@ -1,3 +1,4 @@
+import os
 import sys
 from datetime import timedelta
 from pathlib import Path
@@ -75,6 +76,30 @@ async def test_stdio_server_initialize_list_and_call() -> None:
     assert status.isError is False
     assert status.structuredContent is not None
     assert status.structuredContent["connected"] is False
+
+
+async def test_stdio_info_diagnostics_do_not_corrupt_json_rpc_frames() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mobile_use_mcp"],
+        cwd=project_root,
+        env={**os.environ, "MOBILE_USE_LOG_LEVEL": "INFO"},
+    )
+
+    async with (
+        stdio_client(parameters) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as client,
+    ):
+        await client.initialize()
+        result = await client.call_tool(
+            "android_status",
+            read_timeout_seconds=timedelta(seconds=5),
+        )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["operation_id"]
 
 
 async def test_stdio_server_returns_actionable_adb_failure() -> None:
