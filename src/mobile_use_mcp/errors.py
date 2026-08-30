@@ -23,6 +23,43 @@ class ErrorCode(StrEnum):
     SNAPSHOT_NOT_FOUND = "SNAPSHOT_NOT_FOUND"
 
 
+class ErrorCategory(StrEnum):
+    """Stable high-level categories used by structured lifecycle failures."""
+
+    DEVICE = "device"
+    CONNECTION = "connection"
+    SESSION = "session"
+    VALIDATION = "validation"
+    OPERATION = "operation"
+
+
+_ERROR_CATEGORIES: dict[ErrorCode, ErrorCategory] = {
+    ErrorCode.ADB_UNAVAILABLE: ErrorCategory.DEVICE,
+    ErrorCode.DEVICE_NOT_FOUND: ErrorCategory.DEVICE,
+    ErrorCode.DEVICE_UNAUTHORIZED: ErrorCategory.DEVICE,
+    ErrorCode.DEVICE_OFFLINE: ErrorCategory.DEVICE,
+    ErrorCode.DEVICE_DISCONNECTED: ErrorCategory.DEVICE,
+    ErrorCode.MULTIPLE_DEVICES: ErrorCategory.CONNECTION,
+    ErrorCode.NOT_CONNECTED: ErrorCategory.SESSION,
+    ErrorCode.SNAPSHOT_NOT_FOUND: ErrorCategory.SESSION,
+    ErrorCode.OPERATION_FAILED: ErrorCategory.OPERATION,
+    ErrorCode.TIMEOUT: ErrorCategory.OPERATION,
+    ErrorCode.INVALID_TARGET: ErrorCategory.VALIDATION,
+    ErrorCode.ELEMENT_NOT_FOUND: ErrorCategory.VALIDATION,
+    ErrorCode.INVALID_COORDINATES: ErrorCategory.VALIDATION,
+    ErrorCode.UNSUPPORTED: ErrorCategory.OPERATION,
+}
+
+_RETRYABLE_CODES = {
+    ErrorCode.ADB_UNAVAILABLE,
+    ErrorCode.DEVICE_NOT_FOUND,
+    ErrorCode.DEVICE_OFFLINE,
+    ErrorCode.DEVICE_DISCONNECTED,
+    ErrorCode.TIMEOUT,
+    ErrorCode.OPERATION_FAILED,
+}
+
+
 class MobileUseError(Exception):
     """Expected operational failure safe to expose to an MCP client."""
 
@@ -38,3 +75,15 @@ class MobileUseError(Exception):
         self.message = message
         self.suggestion = suggestion
         self.data = data or {}
+
+    @property
+    def category(self) -> ErrorCategory:
+        """Return a stable category without exposing exception implementation details."""
+
+        return _ERROR_CATEGORIES.get(self.code, ErrorCategory.OPERATION)
+
+    @property
+    def retryable(self) -> bool:
+        """Whether retrying may succeed without changing the request."""
+
+        return self.code in _RETRYABLE_CODES

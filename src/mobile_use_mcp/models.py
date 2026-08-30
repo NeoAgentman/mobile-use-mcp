@@ -1,5 +1,6 @@
 """Validated data models shared by the Android core and MCP tools."""
 
+from collections.abc import Iterator
 from enum import StrEnum
 from typing import Any
 
@@ -17,6 +18,25 @@ class DeviceState(StrEnum):
     OFFLINE = "offline"
     UNAUTHORIZED = "unauthorized"
     UNKNOWN = "unknown"
+
+
+class SessionLifecycle(StrEnum):
+    """Observable lifecycle of the one Android session owned by the server."""
+
+    DISCONNECTED = "disconnected"
+    CONNECTING = "connecting"
+    READY = "ready"
+    DEGRADED = "degraded"
+    CLOSING = "closing"
+    FAILED = "failed"
+
+
+# These aliases keep the vocabulary convenient for callers that refer to the
+# value as either a lifecycle or a session state.  They are aliases rather
+# than separate enums, so JSON and equality semantics remain identical.
+LifecycleState = SessionLifecycle
+SessionState = SessionLifecycle
+DeviceSessionState = SessionLifecycle
 
 
 class DeviceInfo(StrictModel):
@@ -155,3 +175,100 @@ class OperationResult(StrictModel):
     error_code: str | None = None
     suggestion: str | None = None
     data: dict[str, Any] = {}
+
+
+class LifecycleError(StrictModel):
+    """Safe, machine-readable details for a lifecycle business failure."""
+
+    code: str
+    category: str
+    retryable: bool
+    message: str
+    suggestion: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class ResultMappingMixin:
+    """Allow the new typed results to remain source-compatible with old dict callers."""
+
+    def __getitem__(self, key: str) -> Any:
+        return self.model_dump(mode="json")[key]  # type: ignore[attr-defined]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.model_dump(mode="json").get(key, default)  # type: ignore[attr-defined]
+
+    def __contains__(self, key: object) -> bool:
+        return key in self.model_dump(mode="json")  # type: ignore[attr-defined]
+
+    def keys(self) -> Iterator[str]:
+        return iter(self.model_dump(mode="json"))  # type: ignore[attr-defined]
+
+
+class LifecycleResult(ResultMappingMixin, StrictModel):
+    """Common typed envelope for Android session lifecycle tools."""
+
+    success: bool
+    operation_id: str = Field(min_length=1, max_length=128)
+    message: str
+    state: SessionLifecycle
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    device: DeviceInfo | None = None
+    connected: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    error_code: str | None = None
+    category: str | None = None
+    retryable: bool | None = None
+    suggestion: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    error: LifecycleError | None = None
+    # Kept as a compatibility envelope for callers of the pre-lifecycle
+    # dictionaries. New lifecycle fields remain available at the top level.
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class SessionConnection(StrictModel):
+    """Core-level connection context returned after a device is ready."""
+
+    session_id: str = Field(min_length=1, max_length=128)
+    generation: int = Field(ge=1)
+    state: SessionLifecycle
+    device: DeviceInfo
+
+    @property
+    def serial(self) -> str:
+        """Compatibility convenience for callers that previously received DeviceInfo."""
+
+        return self.device.serial
+
+
+class DeviceListResult(LifecycleResult):
+    """Typed result for Android device discovery and pagination."""
+
+    total: int = Field(default=0, ge=0)
+    count: int = Field(default=0, ge=0)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=50, ge=1, le=100)
+    has_more: bool = False
+    next_offset: int | None = Field(default=None, ge=0)
+    devices: list[DeviceInfo] = Field(default_factory=lambda: [])
+
+
+class DeviceConnectResult(LifecycleResult):
+    """Typed result for a successful or failed Android connection attempt."""
+
+    connected: bool = False
+
+
+class DeviceStatusResult(LifecycleResult):
+    """Typed, privacy-safe view of the current Android session state."""
+
+    active_operation_id: str | None = Field(default=None, max_length=128)
+    last_error: LifecycleError | None = None
+
+
+class DeviceDisconnectResult(LifecycleResult):
+    """Typed result for idempotent Android session close."""
+
+    closed_session_id: str | None = Field(default=None, max_length=128)
+    closed_generation: int | None = Field(default=None, ge=1)

@@ -2,17 +2,32 @@
 
 import asyncio
 import json
-from typing import Annotated, Any, Literal
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.utilities.types import Image
 from mcp.types import CallToolResult, TextContent, ToolAnnotations
 from pydantic import Field
 
-from mobile_use_mcp.errors import MobileUseError
+from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
-from mobile_use_mcp.models import OperationResult, Target, UIElement
-from mobile_use_mcp.session import SessionManager
+from mobile_use_mcp.models import (
+    DeviceConnectResult,
+    DeviceDisconnectResult,
+    DeviceInfo,
+    DeviceListResult,
+    DeviceStatusResult,
+    LifecycleError,
+    LifecycleResult,
+    OperationResult,
+    SessionConnection,
+    SessionLifecycle,
+    Target,
+    UIElement,
+)
+from mobile_use_mcp.session import DeviceSession
 
 MCP_INSTRUCTIONS = """Use this MCP whenever the user asks to interact with a physical Android
 phone or an installed mobile app. This includes requests phrased as 手机, 安卓手机, 手机 App,
@@ -22,8 +37,20 @@ possible, and compose snapshot/tap/swipe/input tools for multi-step mobile workf
 Observe again after actions. The tools operate Android only, not iOS. Screenshots capture visible
 pixels but do not download an app's original remote media file unless another tool provides it."""
 
-mcp = FastMCP("mobile_use_mcp", instructions=MCP_INSTRUCTIONS)
-session = SessionManager()
+session = DeviceSession()
+
+
+@asynccontextmanager
+async def server_lifespan(_server: Any) -> AsyncGenerator[None, None]:
+    """Close the owned Android session when the MCP server exits or is cancelled."""
+
+    try:
+        yield None
+    finally:
+        await session.close()
+
+
+mcp = FastMCP("mobile_use_mcp", instructions=MCP_INSTRUCTIONS, lifespan=server_lifespan)
 
 READ_ONLY = ToolAnnotations(
     readOnlyHint=True,
@@ -52,6 +79,93 @@ def _failure(error: MobileUseError) -> OperationResult:
         message=error.message,
         suggestion=error.suggestion,
         data=error.data,
+    )
+
+
+class _LifecycleCallToolResult(CallToolResult):
+    """MCP error result that also supports legacy direct-call mapping access."""
+
+    def __getitem__(self, key: str) -> Any:
+        if self.structuredContent is None:
+            raise KeyError(key)
+        return self.structuredContent[key]
+
+
+def _lifecycle_failure(
+    output_type: type[LifecycleResult],
+    *,
+    operation_id: str,
+    error: MobileUseError,
+    state: SessionLifecycle,
+    session_id: str | None = None,
+    generation: int | None = None,
+    device: DeviceInfo | None = None,
+    connected: bool = False,
+    data: dict[str, Any] | None = None,
+) -> _LifecycleCallToolResult:
+    """Build one typed lifecycle failure and mark it as an MCP business error."""
+
+    def safe_value(value: Any, depth: int = 0) -> Any:
+        if depth > 2:
+            return None
+        if isinstance(value, str):
+            return value[:512]
+        if isinstance(value, int | float | bool) or value is None:
+            return value
+        if isinstance(value, list):
+            items = cast(list[Any], value)
+            return [safe_value(item, depth + 1) for item in items[:50]]
+        if isinstance(value, dict):
+            nested = cast(dict[Any, Any], value)
+            return {
+                str(key): safe_value(item, depth + 1)
+                for key, item in list(nested.items())[:50]
+            }
+        return None
+
+    safe_details = {
+        str(key): safe_value(value)
+        for key, value in error.data.items()
+    }
+    lifecycle_error = LifecycleError(
+        code=error.code.value,
+        category=error.category.value,
+        retryable=error.retryable,
+        message=error.message,
+        suggestion=error.suggestion,
+        details=safe_details,
+    )
+    result = output_type(
+        success=False,
+        operation_id=operation_id,
+        message=error.message,
+        state=state,
+        session_id=session_id,
+        generation=generation,
+        device=device,
+        connected=connected,
+        error_code=error.code.value,
+        category=error.category.value,
+        retryable=error.retryable,
+        suggestion=error.suggestion,
+        details=lifecycle_error.details,
+        error=lifecycle_error,
+        data=data or {},
+    )
+    payload = result.model_dump(mode="json")
+    return _LifecycleCallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        structuredContent=payload,
+    )
+
+
+def _as_lifecycle_error_result(result: LifecycleResult) -> _LifecycleCallToolResult:
+    payload = result.model_dump(mode="json")
+    return _LifecycleCallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        structuredContent=payload,
     )
 
 
@@ -88,27 +202,40 @@ def _image_delivery_metadata(
     annotations=READ_ONLY,
     structured_output=True,
 )
-async def android_list_devices(limit: int = 50, offset: int = 0) -> dict[str, Any]:
+async def android_list_devices(limit: int = 50, offset: int = 0) -> DeviceListResult:
     """List Android devices known to ADB, including offline and unauthorized devices."""
 
     if not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
     if offset < 0:
         raise ValueError("offset must be non-negative")
+    operation_id = session.new_operation_id()
     try:
-        devices = await asyncio.to_thread(session.registry.list_devices)
+        devices = await asyncio.to_thread(session.list_devices)
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            DeviceListResult,
+            _lifecycle_failure(
+                DeviceListResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+            ),
+        )
     page = devices[offset : offset + limit]
-    return {
-        "success": True,
-        "total": len(devices),
-        "count": len(page),
-        "offset": offset,
-        "has_more": offset + len(page) < len(devices),
-        "next_offset": offset + len(page) if offset + len(page) < len(devices) else None,
-        "devices": [device.model_dump(mode="json") for device in page],
-    }
+    return DeviceListResult(
+        success=True,
+        operation_id=operation_id,
+        message=f"Found {len(devices)} Android device(s).",
+        state=session.state,
+        total=len(devices),
+        count=len(page),
+        offset=offset,
+        limit=limit,
+        has_more=offset + len(page) < len(devices),
+        next_offset=offset + len(page) if offset + len(page) < len(devices) else None,
+        devices=page,
+    )
 
 
 @mcp.tool(
@@ -127,29 +254,78 @@ async def android_connect(
             ),
         ),
     ] = None,
-) -> dict[str, Any]:
+) -> DeviceConnectResult:
     """Connect this single-device MCP session to one authorized Android device.
 
     Specify serial when multiple devices are online. Reconnecting replaces the current device and
     invalidates any cached snapshot; a new MCP process does not inherit this session.
     """
 
+    operation_id = session.new_operation_id()
     try:
-        device = await asyncio.to_thread(session.connect, serial)
+        connection = cast(
+            SessionConnection | DeviceInfo,
+            await asyncio.to_thread(session.connect, serial),
+        )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            DeviceConnectResult,
+            _lifecycle_failure(
+                DeviceConnectResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+            ),
+        )
     except Exception:
-        return OperationResult(
-            success=False,
-            error_code="OPERATION_FAILED",
-            message="Failed to initialize the Android automation connection.",
-            suggestion="Check `adb devices -l`, unlock the device, and try again.",
-        ).model_dump(mode="json")
-    return OperationResult(
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Failed to initialize the Android automation connection.",
+            "Check `adb devices -l`, unlock the device, and try again.",
+        )
+        return cast(
+            DeviceConnectResult,
+            _lifecycle_failure(
+                DeviceConnectResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+            ),
+        )
+
+    if isinstance(connection, SessionConnection):
+        device = connection.device
+        connection_session_id = connection.session_id
+        connection_generation = connection.generation
+        connection_state = connection.state
+    else:
+        # Compatibility for embedders that replaced the old core method with
+        # a DeviceInfo-returning adapter.
+        device = connection
+        connection_session_id = session.session_id
+        connection_generation = session.generation
+        connection_state = session.state
+    return DeviceConnectResult(
         success=True,
+        operation_id=operation_id,
         message=f"Connected to Android device {device.serial}.",
-        data={"device": device.model_dump(mode="json")},
-    ).model_dump(mode="json")
+        state=connection_state,
+        session_id=connection_session_id,
+        generation=connection_generation,
+        device=device,
+        connected=True,
+        data={
+            "device": device.model_dump(mode="json"),
+            "session_id": connection_session_id,
+            "generation": connection_generation,
+        },
+    )
 
 
 @mcp.tool(
@@ -158,22 +334,11 @@ async def android_connect(
     annotations=READ_ONLY,
     structured_output=True,
 )
-async def android_status() -> dict[str, Any]:
-    """Return the currently selected Android device without changing session state."""
+async def android_status() -> DeviceStatusResult:
+    """Return the lifecycle and safe device status of this MCP session."""
 
-    if session.device is None:
-        return {
-            "success": True,
-            "connected": False,
-            "device": None,
-            "message": "No Android device is connected.",
-        }
-    return {
-        "success": True,
-        "connected": True,
-        "device": session.device.model_dump(mode="json"),
-        "message": f"Connected to Android device {session.device.serial}.",
-    }
+    operation_id = session.new_operation_id()
+    return await asyncio.to_thread(session.status, operation_id)
 
 
 @mcp.tool(
@@ -182,13 +347,29 @@ async def android_status() -> dict[str, Any]:
     annotations=SESSION_WRITE,
     structured_output=True,
 )
-async def android_disconnect() -> dict[str, Any]:
+async def android_disconnect() -> DeviceDisconnectResult:
     """Disconnect the current session and clear cached snapshots and recording state."""
 
-    await asyncio.to_thread(session.disconnect)
-    return OperationResult(success=True, message="Android device disconnected.").model_dump(
-        mode="json"
-    )
+    try:
+        result = await session.close()
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Failed to close the Android automation connection.",
+            "Retry android_disconnect; if it persists, restart the local MCP server.",
+        )
+        return cast(
+            DeviceDisconnectResult,
+            _lifecycle_failure(
+                DeviceDisconnectResult,
+                operation_id=session.new_operation_id(),
+                error=error,
+                state=session.state,
+            ),
+        )
+    if result.success:
+        return result
+    return cast(DeviceDisconnectResult, _as_lifecycle_error_result(result))
 
 
 @mcp.tool(

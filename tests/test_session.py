@@ -3,7 +3,13 @@ from unittest.mock import Mock
 import pytest
 
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
-from mobile_use_mcp.models import DeviceInfo, DeviceState, ForegroundApp, ScreenSnapshot
+from mobile_use_mcp.models import (
+    DeviceInfo,
+    DeviceState,
+    ForegroundApp,
+    ScreenSnapshot,
+    SessionLifecycle,
+)
 from mobile_use_mcp.session import SessionManager
 
 
@@ -98,3 +104,79 @@ def test_session_caches_only_latest_snapshot() -> None:
     manager.clear_snapshot()
     with pytest.raises(MobileUseError):
         manager.get_snapshot(second_id)
+
+
+def test_connection_returns_opaque_context_and_advances_generation() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    first_controller = Mock()
+    second_controller = Mock()
+    controllers = iter([first_controller, second_controller])
+    manager = SessionManager(registry=registry, controller_factory=lambda _: next(controllers))
+
+    first = manager.connect("ABC")
+    second = manager.connect("ABC")
+
+    assert first.session_id.startswith("session-")
+    assert second.session_id.startswith("session-")
+    assert second.session_id != first.session_id
+    assert second.generation > first.generation
+    assert second.state == SessionLifecycle.READY
+    assert manager.status().state == SessionLifecycle.READY
+    first_controller.disconnect.assert_called_once()
+
+
+def test_partial_connection_failure_rolls_back_new_controller_and_marks_failed() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    controller = Mock()
+    controller.android_client.connect.side_effect = RuntimeError("transport unavailable")
+    manager = SessionManager(registry=registry, controller_factory=lambda _: controller)
+
+    with pytest.raises(RuntimeError, match="transport unavailable"):
+        manager.connect("ABC")
+
+    assert manager.controller is None
+    assert manager.device is None
+    assert manager.status().state == SessionLifecycle.FAILED
+    assert manager.status().last_error is not None
+    assert "transport unavailable" not in manager.status().message
+    controller.disconnect.assert_called_once()
+
+
+def test_device_loss_is_observable_as_degraded() -> None:
+    registry = Mock()
+    registry.select.side_effect = [
+        DeviceInfo(serial="ABC", state=DeviceState.DEVICE),
+        MobileUseError(ErrorCode.DEVICE_OFFLINE, "offline"),
+    ]
+    controller = Mock()
+    manager = SessionManager(registry=registry, controller_factory=lambda _: controller)
+    manager.connect("ABC")
+
+    with pytest.raises(MobileUseError) as caught:
+        manager.require_controller()
+
+    assert caught.value.code == ErrorCode.DEVICE_DISCONNECTED
+    status = manager.status()
+    assert status.state == SessionLifecycle.DEGRADED
+    assert status.device is not None
+    assert status.connected is False
+
+
+@pytest.mark.asyncio
+async def test_async_close_uses_idempotent_disconnect_path() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    controller = Mock()
+    manager = SessionManager(registry=registry, controller_factory=lambda _: controller)
+    manager.connect("ABC")
+
+    closed = await manager.close()
+    repeated = manager.disconnect()
+
+    assert closed.success is True
+    assert closed.state == SessionLifecycle.DISCONNECTED
+    assert repeated.success is True
+    assert repeated.state == SessionLifecycle.DISCONNECTED
+    controller.disconnect.assert_called_once()
