@@ -212,6 +212,19 @@ and report the device model. Observe the screen again after every action.
 | `android_status` | Read current MCP session state |
 | `android_disconnect` | Release the active session |
 
+`android_connect` accepts an optional strict package policy. Use `allowed_packages` (or the
+equivalent `policy.allowed_packages`) for exact app package names, and list any required
+`allowed_system_packages` or named `allowed_system_surfaces` explicitly. Supported surfaces are
+`permission_dialog`, `chooser`, `system_ui`, `launcher`, and `browser`; an instantiated empty
+policy denies every package. The policy is shown in `android_status` as a bounded summary and is
+retained across reconnects unless `allow_unrestricted=true` is explicitly requested.
+
+For a policy-scoped session, every action checks the foreground package and any target package
+before dispatch. A foreground read failure or missing foreground fails closed, and a policy
+denial issues no device command. Permission dialogs, Chooser surfaces, and other system surfaces
+are never allowed because the host Agent reasons that they are safe; they must be declared in the
+connection policy.
+
 ### Observation
 
 | Tool | Purpose |
@@ -419,6 +432,8 @@ Stable error codes include:
 - `ELEMENT_DISABLED`
 - `TARGET_OFF_SCREEN`
 - `SELECTOR_CONFLICT`
+- `PACKAGE_POLICY_DENIED`
+- `PACKAGE_POLICY_FOREGROUND_UNAVAILABLE`
 
 ## Development and verification
 

@@ -1,11 +1,21 @@
 """Validated data models shared by the Android core and MCP tools."""
 
+import re
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictStr,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -54,6 +64,233 @@ class DeviceInfo(StrictModel):
     model: str | None = Field(default=None, max_length=256)
     product: str | None = Field(default=None, max_length=256)
     transport_id: str | None = Field(default=None, max_length=64)
+
+
+_ANDROID_PACKAGE_PATTERN = re.compile(r"[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*\Z")
+
+# These are deliberately named surfaces rather than a free-form escape hatch.
+# A host may explicitly allow one of these well-known Android-owned surfaces,
+# but model reasoning can never add an exception at execution time.
+AndroidSystemSurface = Literal[
+    "permission_dialog",
+    "chooser",
+    "system_ui",
+    "launcher",
+    "browser",
+]
+
+# Keep the same constraint in the JSON schema and in runtime validation. The
+# anchors are intentional because Pydantic's string pattern checks are
+# substring-based unless the pattern anchors itself.
+AndroidPackageName = Annotated[
+    StrictStr,
+    StringConstraints(max_length=512, pattern=r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)*$"),
+]
+
+_SYSTEM_SURFACE_ALIASES: dict[str, AndroidSystemSurface] = {
+    "permission": "permission_dialog",
+    "permissions": "permission_dialog",
+    "permission_controller": "permission_dialog",
+    "permission-dialog": "permission_dialog",
+    "permission_dialog": "permission_dialog",
+    "chooser": "chooser",
+    "intent_chooser": "chooser",
+    "intent-chooser": "chooser",
+    "system_ui": "system_ui",
+    "system-ui": "system_ui",
+    "launcher": "launcher",
+    "home": "launcher",
+    "browser": "browser",
+}
+
+_SYSTEM_SURFACE_PACKAGES: dict[AndroidSystemSurface, frozenset[str]] = {
+    "permission_dialog": frozenset(
+        {
+            "com.android.permissioncontroller",
+            "com.google.android.permissioncontroller",
+        }
+    ),
+    "chooser": frozenset(
+        {
+            "android",
+            "com.android.intentresolver",
+            "com.google.android.intentresolver",
+        }
+    ),
+    "system_ui": frozenset({"com.android.systemui"}),
+    "launcher": frozenset(
+        {
+            "com.android.launcher",
+            "com.android.launcher3",
+            "com.google.android.apps.nexuslauncher",
+        }
+    ),
+    # A browser is not assumed to be an Android system package.  It is an
+    # action surface that must be explicitly opted into because the URL tool
+    # cannot know the user's default browser package before dispatch.
+    "browser": frozenset(),
+}
+
+
+class PackagePolicySummary(StrictModel):
+    """Safe, bounded description of the active session package policy."""
+
+    enabled: bool
+    mode: Literal["unrestricted", "allowlist"]
+    allowed_packages: list[str] = Field(default_factory=list, max_length=100)
+    allowed_system_packages: list[str] = Field(default_factory=list, max_length=100)
+    allowed_system_surfaces: list[AndroidSystemSurface] = Field(
+        default_factory=lambda: list[AndroidSystemSurface](),
+        max_length=20,
+    )
+
+
+class PackagePolicy(StrictModel):
+    """Deterministic allowlist for foreground and target Android packages.
+
+    ``None`` at the session boundary means that policy enforcement is disabled.
+    An instantiated policy, including one with empty lists, is restrictive and
+    therefore denies every package until an explicit package or system surface
+    is listed. Package matching is exact and case-insensitive.
+    """
+
+    allowed_packages: list[AndroidPackageName] = Field(
+        default_factory=list,
+        max_length=100,
+        validation_alias=AliasChoices("allowed_packages", "allowed_app_packages"),
+    )
+    allowed_system_packages: list[AndroidPackageName] = Field(
+        default_factory=list,
+        max_length=100,
+        validation_alias=AliasChoices("allowed_system_packages", "system_packages"),
+    )
+    allowed_system_surfaces: list[AndroidSystemSurface] = Field(
+        default_factory=lambda: list[AndroidSystemSurface](),
+        max_length=20,
+        validation_alias=AliasChoices("allowed_system_surfaces", "system_surfaces"),
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_surface_aliases(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        source: dict[str, Any] = cast(dict[str, Any], value)
+        if "allowed_packages" in source and "allowed_app_packages" in source:
+            raise ValueError("allowed_packages and allowed_app_packages cannot both be provided")
+        if "allowed_system_packages" in source and "system_packages" in source:
+            raise ValueError(
+                "allowed_system_packages and system_packages cannot both be provided"
+            )
+        if "allowed_system_surfaces" in source and "system_surfaces" in source:
+            raise ValueError(
+                "allowed_system_surfaces and system_surfaces cannot both be provided"
+            )
+        raw: Any = source.get("allowed_system_surfaces", source.get("system_surfaces"))
+        if raw is None:
+            return source
+        if not isinstance(raw, list):
+            return source
+        items: list[Any] = cast(list[Any], raw)
+        normalized: list[AndroidSystemSurface] = []
+        seen: set[AndroidSystemSurface] = set()
+        for item in items:
+            if not isinstance(item, str):
+                return source
+            surface = _SYSTEM_SURFACE_ALIASES.get(item.strip().casefold())
+            if surface is None:
+                allowed = ", ".join(sorted(set(_SYSTEM_SURFACE_ALIASES.values())))
+                raise ValueError(f"allowed_system_surfaces must be one of: {allowed}")
+            if surface not in seen:
+                normalized.append(surface)
+                seen.add(surface)
+        normalized_value: dict[str, Any] = dict(source)
+        normalized_value["allowed_system_surfaces"] = normalized
+        normalized_value.pop("system_surfaces", None)
+        return normalized_value
+
+    @field_validator("allowed_packages", "allowed_system_packages")
+    @classmethod
+    def validate_package_names(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            candidate = value.strip()
+            if not candidate or not _ANDROID_PACKAGE_PATTERN.fullmatch(candidate):
+                raise ValueError("must contain valid Android package names")
+            folded = candidate.casefold()
+            if folded not in seen:
+                normalized.append(candidate)
+                seen.add(folded)
+        return normalized
+
+    @model_validator(mode="after")
+    def reject_overlapping_entries(self) -> "PackagePolicy":
+        # Keeping app and system package lists disjoint makes the policy
+        # summary auditable and avoids hiding a system exception in the app
+        # allowlist. Matching remains exact in either case.
+        app_packages = {value.casefold() for value in self.allowed_packages}
+        overlap = [
+            value for value in self.allowed_system_packages if value.casefold() in app_packages
+        ]
+        if overlap:
+            raise ValueError("allowed_packages and allowed_system_packages must not overlap")
+        return self
+
+    def summary(self) -> PackagePolicySummary:
+        """Return only policy inputs; never enumerate installed device apps."""
+
+        return PackagePolicySummary(
+            enabled=True,
+            mode="allowlist",
+            allowed_packages=list(self.allowed_packages),
+            allowed_system_packages=list(self.allowed_system_packages),
+            allowed_system_surfaces=list(self.allowed_system_surfaces),
+        )
+
+    @staticmethod
+    def _matches(value: str, allowed: list[str]) -> bool:
+        folded = value.casefold()
+        return any(folded == candidate.casefold() for candidate in allowed)
+
+    def allows_surface(self, surface: str) -> bool:
+        """Whether one named system/action surface was explicitly enabled."""
+
+        normalized = _SYSTEM_SURFACE_ALIASES.get(surface.strip().casefold())
+        if normalized is None:
+            return False
+        if normalized in self.allowed_system_surfaces:
+            return True
+        # A caller may authorize a known Android-owned surface by naming its
+        # exact package instead of using the convenience surface name.
+        return any(
+            self._matches(package, self.allowed_system_packages)
+            for package in _SYSTEM_SURFACE_PACKAGES[normalized]
+        )
+
+    def allows_package(self, package: str | None, activity: str | None = None) -> bool:
+        """Check one exact package or a package mapped to an allowed surface."""
+
+        del activity  # Reserved for future surface-specific activity matching.
+        if package is None or not package.strip():
+            return False
+        candidate = package.strip()
+        if self._matches(candidate, self.allowed_packages):
+            return True
+        if self._matches(candidate, self.allowed_system_packages):
+            return True
+        for surface in self.allowed_system_surfaces:
+            if candidate.casefold() in {
+                item.casefold() for item in _SYSTEM_SURFACE_PACKAGES[surface]
+            }:
+                return True
+        return False
+
+
+# Descriptive aliases keep integrations from depending on one naming choice.
+AndroidPackagePolicy = PackagePolicy
+SessionPackagePolicy = PackagePolicy
+AllowedPackagePolicy = PackagePolicy
 
 
 class Bounds(StrictModel):
@@ -600,6 +837,7 @@ class SessionConnection(StrictModel):
     generation: int = Field(ge=1)
     state: SessionLifecycle
     device: DeviceInfo
+    policy: PackagePolicySummary | None = None
 
     @property
     def serial(self) -> str:
@@ -624,6 +862,7 @@ class DeviceConnectResult(LifecycleResult):
     """Typed result for a successful or failed Android connection attempt."""
 
     connected: bool = False
+    policy: PackagePolicySummary | None = None
 
 
 class DeviceStatusResult(LifecycleResult):
@@ -634,6 +873,11 @@ class DeviceStatusResult(LifecycleResult):
     current_snapshot_id: str | None = Field(default=None, max_length=128)
     snapshot_store: dict[str, int | float] = Field(default_factory=dict)
     last_error: LifecycleError | None = None
+    policy: PackagePolicySummary = Field(
+        default_factory=lambda: PackagePolicySummary(enabled=False, mode="unrestricted")
+    )
+    # Alias retained for callers that use the explicit package-policy name.
+    package_policy: PackagePolicySummary | None = None
 
 
 class DeviceDisconnectResult(LifecycleResult):

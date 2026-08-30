@@ -36,6 +36,8 @@ async def test_stdio_server_initialize_list_and_call() -> None:
     screenshot_tool = next(tool for tool in tools.tools if tool.name == "android_screenshot")
     ui_elements_tool = next(tool for tool in tools.tools if tool.name == "android_get_ui_elements")
     tap_tool = next(tool for tool in tools.tools if tool.name == "android_tap")
+    connect_tool = next(tool for tool in tools.tools if tool.name == "android_connect")
+    status_tool = next(tool for tool in tools.tools if tool.name == "android_status")
     list_apps_tool = next(tool for tool in tools.tools if tool.name == "android_list_apps")
     wait_tool = next(tool for tool in tools.tools if tool.name == "android_wait")
     for tool in (snapshot_tool, screenshot_tool):
@@ -54,6 +56,15 @@ async def test_stdio_server_initialize_list_and_call() -> None:
     assert "reset offset" in str(ui_elements_tool.description).lower()
     assert "content_description" in str(tap_tool.inputSchema)
     assert "not Target fields" in str(tap_tool.inputSchema)
+    connect_properties = connect_tool.inputSchema["properties"]
+    assert {
+        "policy",
+        "allowed_packages",
+        "allowed_system_packages",
+        "allowed_system_surfaces",
+    } <= set(connect_properties)
+    assert "pattern" in str(connect_properties["allowed_packages"])
+    assert "package_policy" in str(status_tool.outputSchema)
     assert "display names" in str(list_apps_tool.description)
     assert list_apps_tool.outputSchema is not None
     app_properties = list_apps_tool.outputSchema["properties"]
@@ -89,6 +100,30 @@ async def test_stdio_server_returns_actionable_adb_failure() -> None:
     assert result.structuredContent is not None
     assert result.structuredContent["success"] is False
     assert result.structuredContent["error_code"] == "ADB_UNAVAILABLE"
+
+
+async def test_stdio_connect_rejects_invalid_package_policy_schema() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mobile_use_mcp"],
+        cwd=project_root,
+    )
+
+    async with (
+        stdio_client(parameters) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as client,
+    ):
+        await client.initialize()
+        result = await client.call_tool(
+            "android_connect",
+            arguments={"policy": {"allowed_packages": ["com..example"]}},
+            read_timeout_seconds=timedelta(seconds=5),
+        )
+
+    assert result.isError is True
+    assert result.structuredContent is None
+    assert "allowed_packages" in str(result.content)
 
 
 async def test_stdio_app_inventory_failure_is_typed() -> None:

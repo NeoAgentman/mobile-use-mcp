@@ -18,11 +18,15 @@ from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.devices import DeviceRegistry
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
+    AndroidSystemSurface,
     BoundsProvenance,
     DeviceDisconnectResult,
     DeviceInfo,
     DeviceStatusResult,
+    ForegroundApp,
     LifecycleError,
+    PackagePolicy,
+    PackagePolicySummary,
     ResolvedTarget,
     ScreenSnapshot,
     SessionConnection,
@@ -120,9 +124,15 @@ class DeviceSession:
         *,
         config: RuntimeConfig | None = None,
         snapshot_store: SnapshotStore | None = None,
+        policy: PackagePolicy | dict[str, Any] | None = None,
+        package_policy: PackagePolicy | dict[str, Any] | None = None,
     ):
         self.config = config or RuntimeConfig.defaults()
         self.registry = registry or DeviceRegistry(config=self.config)
+        if policy is not None and package_policy is not None:
+            raise ValueError("policy and package_policy cannot both be provided")
+        configured_policy = package_policy if package_policy is not None else policy
+        self._policy = self._coerce_policy(configured_policy)
         # Keep injected factories source-compatible for deterministic core
         # tests.  The production default receives the same frozen config as
         # discovery and therefore cannot drift to another ADB endpoint.
@@ -268,6 +278,200 @@ class DeviceSession:
     def session_id(self) -> str | None:
         with self._state_lock:
             return self._session_id
+
+    @staticmethod
+    def _coerce_policy(
+        value: PackagePolicy | dict[str, Any] | None,
+    ) -> PackagePolicy | None:
+        if value is None:
+            return None
+        if isinstance(value, PackagePolicy):
+            return value.model_copy(deep=True)
+        return PackagePolicy.model_validate(value)
+
+    @property
+    def policy(self) -> PackagePolicy | None:
+        """Return a copy of the restrictive package policy, if configured."""
+
+        with self._state_lock:
+            return self._policy.model_copy(deep=True) if self._policy is not None else None
+
+    @property
+    def package_policy(self) -> PackagePolicy | None:
+        """Compatibility alias for the session package-scope policy."""
+
+        return self.policy
+
+    def policy_summary(self) -> PackagePolicySummary:
+        """Return a safe policy summary without reading installed apps."""
+
+        policy = self.policy
+        if policy is None:
+            return PackagePolicySummary(
+                enabled=False,
+                mode="unrestricted",
+            )
+        return policy.summary()
+
+    async def check_package_policy(
+        self,
+        *,
+        action: str,
+        controller: Any | None = None,
+        target_package: str | None = None,
+        target_package_required: bool = False,
+        target_surface: str | None = None,
+        operation: OperationContext | None = None,
+    ) -> ForegroundApp | None:
+        """Authorize one write against the current and target package.
+
+        This is the single policy seam used by all state-changing MCP tools.
+        It runs before any adapter command, treats a missing/failed foreground
+        read as a deny, and never accepts an exception based on host-agent
+        reasoning. An unrestricted session returns without probing foreground
+        state to preserve the historical optional-policy behavior.
+        """
+
+        active_operation = _effective_operation(operation)
+        _checkpoint(active_operation, "package_policy")
+        policy = self.policy
+        if policy is None:
+            return None
+        if controller is None:
+            controller = self.require_controller(operation=active_operation)
+
+        def foreground_error(reason: str, cause_code: str | None = None) -> MobileUseError:
+            details: dict[str, Any] = {
+                "stage": "package_policy",
+                "action": action,
+                "reason": reason,
+                "foreground_state": "unavailable",
+                "policy": policy.summary().model_dump(mode="json"),
+            }
+            if cause_code is not None:
+                details["cause_code"] = cause_code
+            return MobileUseError(
+                ErrorCode.PACKAGE_POLICY_FOREGROUND_UNAVAILABLE,
+                "Android foreground package could not be verified for the session policy.",
+                "Retry after confirming the device is connected and responsive.",
+                data=details,
+                retryable_override=True,
+            )
+
+        reader = getattr(controller, "get_foreground_app", None)
+        if not callable(reader):
+            raise foreground_error("foreground_reader_unavailable")
+        try:
+            value = reader()
+            if inspect.isawaitable(value):
+                value = await value
+            foreground = (
+                value
+                if isinstance(value, ForegroundApp)
+                else ForegroundApp.model_validate(value)
+            )
+        except MobileUseError as error:
+            raise foreground_error("foreground_read_failed", error.code.value) from error
+        except Exception as error:
+            del error  # Do not expose adapter exception text to the host.
+            raise foreground_error("foreground_read_failed") from None
+
+        assert foreground is not None
+        if not foreground.package:
+            raise MobileUseError(
+                ErrorCode.PACKAGE_POLICY_DENIED,
+                "The Android package policy denied the action because no foreground package was "
+                "available.",
+                "Wait for an Android surface to become foreground, then retry the action.",
+                data={
+                    "stage": "package_policy",
+                    "action": action,
+                    "reason": "missing_foreground",
+                    "foreground_state": "empty",
+                    "current_package": None,
+                    "target_package": target_package,
+                    "target_surface": target_surface,
+                    "policy": policy.summary().model_dump(mode="json"),
+                },
+                retryable_override=False,
+            )
+        if not policy.allows_package(foreground.package, foreground.activity):
+            raise MobileUseError(
+                ErrorCode.PACKAGE_POLICY_DENIED,
+                "The Android package policy denied the action for the current foreground package.",
+                "Use an explicitly allowed package or system surface, then retry the action.",
+                data={
+                    "stage": "package_policy",
+                    "action": action,
+                    "reason": "current_package_denied",
+                    "foreground_state": "occupied",
+                    "current_package": foreground.package,
+                    "current_activity": foreground.activity,
+                    "target_package": target_package,
+                    "target_surface": target_surface,
+                    "policy": policy.summary().model_dump(mode="json"),
+                },
+                retryable_override=False,
+            )
+        if target_package_required and not target_package:
+            raise MobileUseError(
+                ErrorCode.PACKAGE_POLICY_DENIED,
+                "The Android package policy denied the action because its target package could not "
+                "be verified.",
+                "Refresh the Android UI hierarchy and retry with a target whose package is known.",
+                data={
+                    "stage": "package_policy",
+                    "action": action,
+                    "reason": "target_package_unavailable",
+                    "foreground_state": "occupied",
+                    "current_package": foreground.package,
+                    "target_package": target_package,
+                    "target_surface": target_surface,
+                    "policy": policy.summary().model_dump(mode="json"),
+                },
+                retryable_override=False,
+            )
+        if target_package is not None and not policy.allows_package(target_package):
+            raise MobileUseError(
+                ErrorCode.PACKAGE_POLICY_DENIED,
+                "The Android package policy denied the action for its target package.",
+                "Use an explicitly allowed target package, then retry the action.",
+                data={
+                    "stage": "package_policy",
+                    "action": action,
+                    "reason": "target_package_denied",
+                    "foreground_state": "occupied",
+                    "current_package": foreground.package,
+                    "target_package": target_package,
+                    "target_surface": target_surface,
+                    "policy": policy.summary().model_dump(mode="json"),
+                },
+                retryable_override=False,
+            )
+        if target_surface is not None and not policy.allows_surface(target_surface):
+            raise MobileUseError(
+                ErrorCode.PACKAGE_POLICY_DENIED,
+                "The Android package policy denied the requested Android system surface.",
+                "Declare the system surface explicitly in the connection policy, then retry.",
+                data={
+                    "stage": "package_policy",
+                    "action": action,
+                    "reason": "system_surface_denied",
+                    "foreground_state": "occupied",
+                    "current_package": foreground.package,
+                    "target_package": target_package,
+                    "target_surface": target_surface,
+                    "policy": policy.summary().model_dump(mode="json"),
+                },
+                retryable_override=False,
+            )
+        _checkpoint(active_operation, "package_policy")
+        return foreground
+
+    # Descriptive aliases used by embedders and tests that name the seam as an
+    # authorization boundary rather than a policy check.
+    authorize_action = check_package_policy
+    enforce_package_policy = check_package_policy
 
     @property
     def generation(self) -> int | None:
@@ -429,12 +633,97 @@ class DeviceSession:
         with self._state_lock:
             self._last_error = error
 
+    def _resolve_connect_policy(
+        self,
+        policy: PackagePolicy | dict[str, Any] | None,
+        package_policy: PackagePolicy | dict[str, Any] | None,
+        allowed_packages: list[str] | None,
+        allowed_app_packages: list[str] | None,
+        allowed_system_packages: list[str] | None,
+        system_packages: list[str] | None,
+        allowed_system_surfaces: list[str] | None,
+        system_surfaces: list[str] | None,
+        allow_unrestricted: bool,
+    ) -> PackagePolicy | None:
+        """Normalize one connection's strict policy declaration.
+
+        A restrictive policy is retained across reconnects unless the caller
+        explicitly opts into ``allow_unrestricted``. This prevents reconnect
+        from becoming an authorization bypass while preserving an unrestricted
+        default for the first connection.
+        """
+
+        policy_values = [value for value in (policy, package_policy) if value is not None]
+        if len(policy_values) > 1:
+            raise ValueError("policy and package_policy cannot both be provided")
+        direct_values = {
+            "allowed_packages": allowed_packages,
+            "allowed_app_packages": allowed_app_packages,
+            "allowed_system_packages": allowed_system_packages,
+            "system_packages": system_packages,
+            "allowed_system_surfaces": allowed_system_surfaces,
+            "system_surfaces": system_surfaces,
+        }
+        supplied_direct = {key: value for key, value in direct_values.items() if value is not None}
+        if len({
+            key
+            for key in ("allowed_packages", "allowed_app_packages")
+            if direct_values[key] is not None
+        }) > 1:
+            raise ValueError("allowed_packages and allowed_app_packages cannot both be provided")
+        if len({
+            key
+            for key in ("allowed_system_packages", "system_packages")
+            if direct_values[key] is not None
+        }) > 1:
+            raise ValueError(
+                "allowed_system_packages and system_packages cannot both be provided"
+            )
+        if len({
+            key
+            for key in ("allowed_system_surfaces", "system_surfaces")
+            if direct_values[key] is not None
+        }) > 1:
+            raise ValueError(
+                "allowed_system_surfaces and system_surfaces cannot both be provided"
+            )
+        if policy_values and supplied_direct:
+            raise ValueError("policy cannot be combined with direct package allowlists")
+        if allow_unrestricted and (policy_values or supplied_direct):
+            raise ValueError("allow_unrestricted cannot be combined with a package policy")
+        if policy_values:
+            return self._coerce_policy(policy_values[0])
+        if supplied_direct:
+            return PackagePolicy(
+                allowed_packages=(allowed_packages or allowed_app_packages or []),
+                allowed_system_packages=(allowed_system_packages or system_packages or []),
+                allowed_system_surfaces=cast(
+                    list[AndroidSystemSurface],
+                    (allowed_system_surfaces or system_surfaces or []),
+                ),
+            )
+        if allow_unrestricted:
+            return None
+        # Reconnects inherit a previous restrictive policy by default. A
+        # fresh DeviceSession still starts unrestricted because ``_policy`` is
+        # ``None`` until a caller opts in.
+        return self.policy
+
     def connect(
         self,
         serial: str | None = None,
         *,
         operation_id: str | None = None,
         operation: OperationContext | None = None,
+        policy: PackagePolicy | dict[str, Any] | None = None,
+        package_policy: PackagePolicy | dict[str, Any] | None = None,
+        allowed_packages: list[str] | None = None,
+        allowed_app_packages: list[str] | None = None,
+        allowed_system_packages: list[str] | None = None,
+        system_packages: list[str] | None = None,
+        allowed_system_surfaces: list[str] | None = None,
+        system_surfaces: list[str] | None = None,
+        allow_unrestricted: bool = False,
     ) -> SessionConnection:
         """Connect one selected device and return a new session generation.
 
@@ -443,6 +732,17 @@ class DeviceSession:
         session references are cleared, leaving no connected controller behind.
         """
 
+        requested_policy = self._resolve_connect_policy(
+            policy,
+            package_policy,
+            allowed_packages,
+            allowed_app_packages,
+            allowed_system_packages,
+            system_packages,
+            allowed_system_surfaces,
+            system_surfaces,
+            allow_unrestricted,
+        )
         active_operation = _effective_operation(operation)
         effective_operation_id = operation_id or (
             active_operation.operation_id if active_operation is not None else _new_operation_id()
@@ -497,7 +797,11 @@ class DeviceSession:
                     try:
                         result = _commit(
                             active_operation,
-                            lambda: self._commit_connection_locked(selected, controller),
+                            lambda: self._commit_connection_locked(
+                                selected,
+                                controller,
+                                policy=requested_policy,
+                            ),
                             "session_commit",
                         )
                     except MobileUseError:
@@ -532,12 +836,15 @@ class DeviceSession:
         self,
         selected: DeviceInfo,
         controller: AndroidController,
+        *,
+        policy: PackagePolicy | None,
     ) -> SessionConnection:
         self._generation_counter += 1
         self._generation = self._generation_counter
         self._session_id = _new_session_id()
         self._device = selected
         self._controller = controller
+        self._policy = policy.model_copy(deep=True) if policy is not None else None
         self._screen_revision = 0
         self._state = SessionLifecycle.READY
         self._last_error = None
@@ -547,6 +854,7 @@ class DeviceSession:
             generation=self._generation,
             state=self._state,
             device=selected,
+            policy=self.policy_summary(),
         )
 
     def _detach_controller_locked(self) -> AndroidController | None:
@@ -1601,6 +1909,8 @@ class DeviceSession:
                 retryable=last_error.retryable if last_error else None,
                 suggestion=last_error.suggestion if last_error else None,
                 details=last_error.details if last_error else {},
+                policy=self.policy_summary(),
+                package_policy=self.policy_summary(),
             )
 
     def get_status(self, operation_id: str | None = None) -> DeviceStatusResult:

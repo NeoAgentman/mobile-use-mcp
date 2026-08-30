@@ -9,6 +9,7 @@ from mobile_use_mcp.models import (
     DeviceInfo,
     DeviceState,
     ForegroundApp,
+    PackagePolicy,
     ScreenSnapshot,
     SessionLifecycle,
 )
@@ -126,6 +127,95 @@ def test_connection_returns_opaque_context_and_advances_generation() -> None:
     assert second.state == SessionLifecycle.READY
     assert manager.status().state == SessionLifecycle.READY
     first_controller.disconnect.assert_called_once()
+
+
+def test_connection_carries_policy_and_reconnect_cannot_drop_it_implicitly() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    first_controller = Mock()
+    second_controller = Mock()
+    controllers = iter([first_controller, second_controller])
+    manager = SessionManager(
+        registry=registry,
+        controller_factory=lambda _: next(controllers),
+    )
+
+    first = manager.connect("ABC", policy=PackagePolicy(allowed_packages=["com.example"]))
+    second = manager.connect("ABC")
+
+    assert first.policy is not None
+    assert first.policy.allowed_packages == ["com.example"]
+    assert manager.policy_summary().enabled is True
+    assert second.policy is not None
+    assert second.policy.allowed_packages == ["com.example"]
+    assert manager.status().policy.allowed_packages == ["com.example"]
+
+
+def test_allow_unrestricted_is_explicit_when_reconnecting() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    controllers = iter([Mock(), Mock()])
+    manager = SessionManager(registry=registry, controller_factory=lambda _: next(controllers))
+
+    manager.connect("ABC", allowed_packages=["com.example"])
+    connection = manager.connect("ABC", allow_unrestricted=True)
+
+    assert connection.policy is not None
+    assert connection.policy.enabled is False
+    assert manager.status().policy.enabled is False
+
+
+@pytest.mark.asyncio
+async def test_package_policy_rejects_current_and_target_before_dispatch() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    controller = Mock()
+    controller.get_foreground_app = Mock(
+        return_value=ForegroundApp(package="com.example", activity=".Main")
+    )
+    manager = SessionManager(registry=registry, controller_factory=lambda _: controller)
+    manager.connect("ABC", allowed_packages=["com.example"])
+
+    await manager.check_package_policy(
+        action="tap",
+        controller=controller,
+        target_package="com.example",
+    )
+    with pytest.raises(MobileUseError) as denied:
+        await manager.check_package_policy(
+            action="tap",
+            controller=controller,
+            target_package="com.other",
+        )
+
+    assert denied.value.code == ErrorCode.PACKAGE_POLICY_DENIED
+    assert denied.value.data["reason"] == "target_package_denied"
+
+    with pytest.raises(MobileUseError) as unknown_target:
+        await manager.check_package_policy(
+            action="tap",
+            controller=controller,
+            target_package_required=True,
+        )
+
+    assert unknown_target.value.code == ErrorCode.PACKAGE_POLICY_DENIED
+    assert unknown_target.value.data["reason"] == "target_package_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_package_policy_foreground_read_failure_fails_closed() -> None:
+    registry = Mock()
+    registry.select.return_value = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    controller = Mock()
+    controller.get_foreground_app = Mock(side_effect=RuntimeError("adapter detail"))
+    manager = SessionManager(registry=registry, controller_factory=lambda _: controller)
+    manager.connect("ABC", allowed_packages=["com.example"])
+
+    with pytest.raises(MobileUseError) as failed:
+        await manager.check_package_policy(action="press_key", controller=controller)
+
+    assert failed.value.code == ErrorCode.PACKAGE_POLICY_FOREGROUND_UNAVAILABLE
+    assert "adapter detail" not in str(failed.value)
 
 
 def test_partial_connection_failure_rolls_back_new_controller_and_marks_failed() -> None:

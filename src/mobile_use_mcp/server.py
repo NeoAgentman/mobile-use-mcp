@@ -29,6 +29,8 @@ from mobile_use_mcp.doctor import run_doctor_bounded
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
 from mobile_use_mcp.models import (
+    AndroidPackageName,
+    AndroidSystemSurface,
     AppLaunchResult,
     AppListResult,
     AppTerminationResult,
@@ -43,6 +45,7 @@ from mobile_use_mcp.models import (
     LifecycleError,
     LifecycleResult,
     OperationResult,
+    PackagePolicy,
     ScreenshotCapture,
     ScreenshotResult,
     ScreenSnapshot,
@@ -68,7 +71,9 @@ pixels but do not download an app's original remote media file unless another to
 Call android_doctor to diagnose the local ADB, device, uiautomator2, and capability state before
 starting a workflow. Use android_wait_for_text, android_wait_for_element, or
 android_wait_for_ui_change for bounded condition synchronization; android_wait is only a fixed
-delay and does not inspect UI state."""
+delay and does not inspect UI state. When a package scope is requested, declare exact
+allowed_packages and any required allowed_system_packages or allowed_system_surfaces on
+android_connect; never infer a system-surface exception from the screen."""
 
 runtime_config = RuntimeConfig.defaults()
 session = DeviceSession(config=runtime_config)
@@ -459,6 +464,71 @@ async def android_connect(
             ),
         ),
     ] = None,
+    policy: Annotated[
+        PackagePolicy | None,
+        Field(
+            description=(
+                "Optional strict package allowlist. An instantiated empty policy denies all "
+                "packages until an explicit package or system surface is listed."
+            )
+        ),
+    ] = None,
+    package_policy: Annotated[
+        PackagePolicy | None,
+        Field(
+            description=(
+                "Compatibility alias for policy; do not provide both policy and package_policy."
+            )
+        ),
+    ] = None,
+    allowed_packages: Annotated[
+        list[AndroidPackageName] | None,
+        Field(
+            max_length=100,
+            description="Exact Android app package names allowed by this connection.",
+        ),
+    ] = None,
+    allowed_app_packages: Annotated[
+        list[AndroidPackageName] | None,
+        Field(
+            max_length=100,
+            description="Compatibility alias for allowed_packages.",
+        ),
+    ] = None,
+    allowed_system_packages: Annotated[
+        list[AndroidPackageName] | None,
+        Field(
+            max_length=100,
+            description="Exact Android system package names explicitly allowed by this connection.",
+        ),
+    ] = None,
+    system_packages: Annotated[
+        list[AndroidPackageName] | None,
+        Field(max_length=100, description="Compatibility alias for allowed_system_packages."),
+    ] = None,
+    allowed_system_surfaces: Annotated[
+        list[AndroidSystemSurface] | None,
+        Field(
+            max_length=20,
+            description=(
+                "Named Android system/action surfaces explicitly allowed: permission_dialog, "
+                "chooser, system_ui, launcher, or browser."
+            ),
+        ),
+    ] = None,
+    system_surfaces: Annotated[
+        list[AndroidSystemSurface] | None,
+        Field(max_length=20, description="Compatibility alias for allowed_system_surfaces."),
+    ] = None,
+    allow_unrestricted: Annotated[
+        bool,
+        Field(
+            description=(
+                "Explicitly clear a restrictive policy while reconnecting; this cannot be "
+                "combined with any package policy declaration."
+            )
+        ),
+    ] = False,
 ) -> DeviceConnectResult:
     """Connect this single-device MCP session to one authorized Android device.
 
@@ -468,6 +538,25 @@ async def android_connect(
 
     operation_id = session.new_operation_id()
     try:
+        connect_options: dict[str, Any] = {}
+        if policy is not None:
+            connect_options["policy"] = policy
+        if package_policy is not None:
+            connect_options["package_policy"] = package_policy
+        if allowed_packages is not None:
+            connect_options["allowed_packages"] = allowed_packages
+        if allowed_app_packages is not None:
+            connect_options["allowed_app_packages"] = allowed_app_packages
+        if allowed_system_packages is not None:
+            connect_options["allowed_system_packages"] = allowed_system_packages
+        if system_packages is not None:
+            connect_options["system_packages"] = system_packages
+        if allowed_system_surfaces is not None:
+            connect_options["allowed_system_surfaces"] = allowed_system_surfaces
+        if system_surfaces is not None:
+            connect_options["system_surfaces"] = system_surfaces
+        if allow_unrestricted:
+            connect_options["allow_unrestricted"] = True
         connection = cast(
             SessionConnection | DeviceInfo,
             await session.run_operation(
@@ -476,6 +565,7 @@ async def android_connect(
                     session.connect,
                     serial,
                     timeout_seconds=session.config.subprocess_timeout_seconds,
+                    **connect_options,
                 ),
                 operation_id=operation_id,
                 mutating=True,
@@ -534,10 +624,17 @@ async def android_connect(
         generation=connection_generation,
         device=device,
         connected=True,
+        policy=(
+            connection.policy
+            if isinstance(connection, SessionConnection) and connection.policy is not None
+            else session.policy_summary()
+        ),
         data={
             "device": device.model_dump(mode="json"),
             "session_id": connection_session_id,
             "generation": connection_generation,
+            "policy": session.policy_summary().model_dump(mode="json"),
+            "package_policy": session.policy_summary().model_dump(mode="json"),
         },
     )
 
@@ -1805,6 +1902,67 @@ def _target_requires_validation(target: Target) -> bool:
     )
 
 
+async def _authorize_action(
+    context: Any,
+    controller: Any,
+    *,
+    action: str,
+    target_package: str | None = None,
+    target_package_required: bool = False,
+    target_surface: str | None = None,
+) -> Any:
+    """Run the session-owned package policy gate before an Android command."""
+
+    checker = getattr(session, "check_package_policy", None)
+    if not callable(checker):
+        # A real DeviceSession always exposes this method. A session that
+        # advertises a policy but omits the checker is unsafe and therefore
+        # fails closed instead of letting a compatibility adapter bypass it.
+        configured_policy = getattr(session, "policy", None)
+        if configured_policy is not None:
+            raise MobileUseError(
+                ErrorCode.PACKAGE_POLICY_FOREGROUND_UNAVAILABLE,
+                "The Android package policy boundary is unavailable.",
+                "Reconnect through the built-in DeviceSession before retrying the action.",
+                data={
+                    "stage": "package_policy",
+                    "action": action,
+                    "reason": "policy_checker_unavailable",
+                },
+                retryable_override=False,
+            )
+        return None
+    result = checker(
+        action=action,
+        controller=controller,
+        target_package=target_package,
+        target_package_required=target_package_required,
+        target_surface=target_surface,
+        operation=context,
+    )
+    if isawaitable(result):
+        return await result
+    return result
+
+
+def _resolved_target_package(snapshot: ScreenSnapshot, resolved: Any) -> str | None:
+    """Recover the package owning a resolved target for policy enforcement."""
+
+    element = getattr(resolved, "element", None)
+    package = getattr(element, "package", None)
+    if isinstance(package, str) and package:
+        return package
+    bounds = getattr(resolved, "bounds", None)
+    if bounds is None:
+        return None
+    packages = {
+        element.package
+        for element in snapshot.elements
+        if element.bounds == bounds and element.package
+    }
+    return next(iter(packages)) if len(packages) == 1 else None
+
+
 def _safe_input_data(value: Any, *, secret: str | None = None) -> dict[str, object]:
     """Normalize an input outcome without allowing payload values to escape."""
 
@@ -1888,21 +2046,32 @@ async def _resolve_and_focus_target(
             data={"stage": "focus", "focus_status": "unverified"},
         )
 
-    _snapshot, resolved = await session.resolve_target(
+    snapshot, resolved = await session.resolve_target(
         target,
         operation=context,
         controller=controller,
     )
+    target_package = _resolved_target_package(snapshot, resolved)
+    expected_element = resolved.element or UIElement(bounds=resolved.bounds)
+    if expected_element.package is None and target_package is not None:
+        expected_element = expected_element.model_copy(update={"package": target_package})
     # Invalidate the copied target capability before dispatch. The focus
     # re-check reads a fresh hierarchy directly and therefore does not reuse
     # the stale target through the session resolver.
     session.advance_screen_revision(operation=context)
     context.checkpoint("focus_dispatch")
+    await _authorize_action(
+        context,
+        controller,
+        action="focus",
+        target_package=target_package,
+        target_package_required=True,
+    )
+    context.checkpoint("focus_dispatch")
     dispatch_result = resolver(resolved)
     if isawaitable(dispatch_result):
         await dispatch_result
     context.checkpoint("focus_verify")
-    expected_element = resolved.element or UIElement(bounds=resolved.bounds)
     verification = verifier(expected_element)
     if isawaitable(verification):
         verification = await verification
@@ -1949,6 +2118,7 @@ async def _resolve_and_dispatch_target(
     )
     snapshot_reader = _configured_method(controller, "snapshot")
     resolved = None
+    target_package: str | None = None
     should_validate = (
         tap_resolved is not None
         or snapshot_reader is not None
@@ -1956,14 +2126,23 @@ async def _resolve_and_dispatch_target(
         or _target_requires_validation(target)
     )
     if should_validate:
-        _snapshot, resolved = await session.resolve_target(
+        snapshot, resolved = await session.resolve_target(
             target,
             operation=context,
             controller=controller,
         )
+        target_package = _resolved_target_package(snapshot, resolved)
     # Invalidate copied bounds/ref capabilities only after all validation has
     # completed; a stale/conflicting target therefore sends no device command.
     session.advance_screen_revision(operation=context)
+    context.checkpoint("dispatch")
+    await _authorize_action(
+        context,
+        controller,
+        action="long_press" if long_press else "tap",
+        target_package=target_package,
+        target_package_required=True,
+    )
     context.checkpoint("dispatch")
     if tap_resolved is not None and resolved is not None:
         result = tap_resolved(resolved, duration_ms) if long_press else tap_resolved(resolved)
@@ -2300,11 +2479,12 @@ async def android_swipe(
 
         async def act(context: Any) -> dict[str, object]:
             controller = session.require_controller()
-            session.advance_screen_revision(operation=context)
-            context.checkpoint("dispatch")
             if normalized is not None:
                 percentage_method = _configured_method(controller, "swipe_percentage")
                 if percentage_method is not None:
+                    await _authorize_action(context, controller, action="swipe")
+                    session.advance_screen_revision(operation=context)
+                    context.checkpoint("dispatch")
                     result = percentage_method(normalized, duration_ms)
                     if isawaitable(result):
                         result = await result
@@ -2324,10 +2504,16 @@ async def android_swipe(
                     normalized_coordinate_to_pixel(normalized.end_x, current.width),
                     normalized_coordinate_to_pixel(normalized.end_y, current.height),
                 )
+                await _authorize_action(context, controller, action="swipe")
+                session.advance_screen_revision(operation=context)
+                context.checkpoint("dispatch")
                 result = controller.swipe(*actual, duration_ms)
             else:
                 assert all(value is not None for value in pixel_values)
                 actual = cast(tuple[int, int, int, int], pixel_values)
+                await _authorize_action(context, controller, action="swipe")
+                session.advance_screen_revision(operation=context)
+                context.checkpoint("dispatch")
                 result = controller.swipe(*actual, duration_ms)
             if isawaitable(result):
                 result = await result
@@ -2410,6 +2596,16 @@ async def android_type_text(
             ):
                 target_details, expected_element = await _resolve_and_focus_target(_context, target)
                 session.advance_screen_revision(operation=_context)
+                target_package = (
+                    expected_element.package if expected_element is not None else None
+                )
+                await _authorize_action(
+                    _context,
+                    controller,
+                    action="type_text",
+                    target_package=target_package,
+                    target_package_required=True,
+                )
                 detailed = _configured_method(controller, "type_text_detailed")
                 if detailed is not None:
                     result = detailed(
@@ -2420,6 +2616,12 @@ async def android_type_text(
                 else:
                     result = controller.type_text(text, None)
             else:
+                await _authorize_action(
+                    _context,
+                    controller,
+                    action="type_text",
+                    target_package_required=target is not None,
+                )
                 session.clear_snapshot()
                 result = controller.type_text(text, target)
             if isawaitable(result):
@@ -2498,6 +2700,16 @@ async def android_clear_text(
             ):
                 target_details, expected_element = await _resolve_and_focus_target(_context, target)
                 session.advance_screen_revision(operation=_context)
+                target_package = (
+                    expected_element.package if expected_element is not None else None
+                )
+                await _authorize_action(
+                    _context,
+                    controller,
+                    action="clear_text",
+                    target_package=target_package,
+                    target_package_required=True,
+                )
                 detailed = _configured_method(controller, "clear_text_detailed")
                 if detailed is not None:
                     result = detailed(
@@ -2508,6 +2720,12 @@ async def android_clear_text(
                 else:
                     result = controller.clear_text(bounded_max_characters, None)
             else:
+                await _authorize_action(
+                    _context,
+                    controller,
+                    action="clear_text",
+                    target_package_required=target is not None,
+                )
                 session.clear_snapshot()
                 result = controller.clear_text(bounded_max_characters, target)
             if isawaitable(result):
@@ -2567,8 +2785,15 @@ async def android_press_key(
     try:
 
         async def act(_context: Any) -> None:
+            controller = session.require_controller()
+            await _authorize_action(
+                _context,
+                controller,
+                action="press_key",
+                target_surface="launcher" if key.casefold() == "home" else None,
+            )
             session.clear_snapshot()
-            await session.require_controller().press_key(key)
+            await controller.press_key(key)
 
         await session.run_operation(
             "press_key",
@@ -2631,8 +2856,14 @@ async def android_launch_app(
     try:
 
         async def act(_context: Any) -> Any:
-            session.clear_snapshot()
             controller = session.require_controller()
+            await _authorize_action(
+                _context,
+                controller,
+                action="launch_app",
+                target_package=package,
+            )
+            session.clear_snapshot()
             if (
                 activity is None
                 and retries == 3
@@ -2703,8 +2934,15 @@ async def android_terminate_app(
     try:
 
         async def act(_context: Any) -> Any:
+            controller = session.require_controller()
+            await _authorize_action(
+                _context,
+                controller,
+                action="terminate_app",
+                target_package=package,
+            )
             session.clear_snapshot()
-            return await session.require_controller().terminate_app(package)
+            return await controller.terminate_app(package)
 
         termination = await session.run_operation(
             "terminate_app",
@@ -2763,8 +3001,15 @@ async def android_open_url(
     try:
 
         async def act(_context: Any) -> None:
+            controller = session.require_controller()
+            await _authorize_action(
+                _context,
+                controller,
+                action="open_url",
+                target_surface="browser",
+            )
             session.clear_snapshot()
-            await session.require_controller().open_url(url)
+            await controller.open_url(url)
 
         await session.run_operation(
             "open_url",
