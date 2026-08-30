@@ -1,6 +1,7 @@
 """Deterministic Android operations used by MCP tool handlers."""
 
 import asyncio
+import re
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -13,8 +14,11 @@ from mobile_use_mcp.android_client import AndroidClient, InputCommandError
 from mobile_use_mcp.config import RuntimeConfig
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
+    AppInfo,
+    AppInventory,
     AppLaunchAttempt,
     AppLaunchResult,
+    AppTerminationResult,
     ForegroundApp,
     ResolvedTarget,
     ScreenshotCapture,
@@ -181,6 +185,124 @@ class _CommandState:
     status: str
     fallback_used: bool = False
     attempts: int = 1
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedAppMetadata:
+    """Metadata extracted from one bounded Android package response."""
+
+    launcher_label: str | None = None
+    launchable_activity: str | None = None
+    is_system: bool | None = None
+    enabled: bool | None = None
+
+
+def _parse_package_names(output: str) -> list[str]:
+    """Parse package names from ``pm list packages`` output."""
+
+    packages: set[str] = set()
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("package:"):
+            continue
+        package = line.removeprefix("package:").strip()
+        # Package names are intentionally kept conservative.  This rejects a
+        # malformed shell response without ever treating it as a selector or
+        # executable argument.
+        if package and re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.]*", package):
+            packages.add(package)
+    return sorted(packages, key=lambda value: (value.casefold(), value))
+
+
+def _parse_label(output: str) -> str | None:
+    """Read a localized/non-localized label when dumpsys exposes one."""
+
+    for pattern in (
+        r"\bnonLocalizedLabel=(?:\"([^\"]*)\"|(.+?))(?=\s+[A-Za-z][A-Za-z0-9_]*=|\s*$)",
+        r"\blabel=(?:\"([^\"]*)\"|(.+?))(?=\s+[A-Za-z][A-Za-z0-9_]*=|\s*$)",
+    ):
+        match = re.search(pattern, output)
+        if match:
+            value = next((group.strip() for group in match.groups() if group is not None), "")
+            if value and value.casefold() not in {"null", "none"} and not value.startswith("0x"):
+                return value
+    return None
+
+
+def _parse_enabled(output: str) -> bool | None:
+    """Parse the package/user enabled state across Android dump formats."""
+
+    match = re.search(r"\benabled\s*=\s*(true|false|0|1)\b", output, re.IGNORECASE)
+    if match:
+        value = match.group(1).casefold()
+        return value in {"true", "1"}
+    return None
+
+
+def _parse_system_flag(output: str) -> bool | None:
+    """Infer system classification only from explicit Android package flags."""
+
+    flag_pattern = r"(?:pkgFlags|flags)\s*=\s*(?:\[([^\]]*)\]|(0x[0-9a-f]+))"
+    for flag_match in re.finditer(flag_pattern, output, re.I):
+        names = (flag_match.group(1) or "").casefold()
+        hex_value = flag_match.group(2)
+        if "system" in names or "flag_system" in names:
+            return True
+        if hex_value is not None:
+            try:
+                if int(hex_value, 16) & 0x1:
+                    return True
+            except ValueError:
+                continue
+    explicit = re.search(r"\bisSystem(?:App)?\s*=\s*(true|false)\b", output, re.I)
+    if explicit is not None:
+        return explicit.group(1).casefold() == "true"
+    if re.search(flag_pattern, output, re.I):
+        # An explicit flags value without SYSTEM does not prove that the app
+        # is third-party; OEMs add unrelated flags and omit some names.
+        return False if any(
+            match.group(2) is not None and int(match.group(2), 16) == 0
+            for match in re.finditer(flag_pattern, output, re.I)
+        ) else None
+    return None
+
+
+def _parse_activity(output: str, package: str) -> str | None:
+    """Parse a launcher component from resolve/query-activities output."""
+
+    component_pattern = re.compile(
+        rf"(?<![A-Za-z0-9_.]){re.escape(package)}/([^\s,}}]+)"
+    )
+    match = component_pattern.search(output)
+    if match:
+        activity = match.group(1).strip()
+        if activity and activity.casefold() not in {"null", "none"}:
+            return activity
+    info_match = re.search(
+        rf"packageName={re.escape(package)}\b.*?\bname=([^\s}}]+)", output, re.S
+    )
+    if info_match:
+        return info_match.group(1)
+    return None
+
+
+def _parse_app_metadata(output: str, package: str) -> _ParsedAppMetadata:
+    return _ParsedAppMetadata(
+        launcher_label=_parse_label(output),
+        is_system=_parse_system_flag(output),
+        enabled=_parse_enabled(output),
+        launchable_activity=_parse_activity(output, package),
+    )
+
+
+def _is_shell_error_output(output: str) -> bool:
+    """Recognize common ADB/Android shell failures when exit codes are hidden."""
+
+    return re.search(
+        r"(?im)^\s*(?:error(?::|\s)|adb:\s|cmd:\s*failure\b|"
+        r"exception\b|unknown command\b|unknown option\b|permission denied\b)",
+        output,
+    ) is not None
 
 
 def normalized_coordinate_to_pixel(value: float, size: int) -> int:
@@ -1100,72 +1222,276 @@ class AndroidController:
         self,
         package: str,
         *,
+        activity: str | None = None,
         retries: int = 3,
         timeout_seconds: float = 15,
+        stabilization_polls: int = 2,
     ) -> AppLaunchResult:
+        """Launch one package and verify a stable foreground transition.
+
+        ``app_start`` only proves that a command was accepted by ADB.  This
+        method keeps polling the foreground app until the requested package is
+        observed for a short consecutive window.  A different foreground
+        package is recorded as a blocker, while a failed foreground read is a
+        separate outcome and is never represented as an empty/loading state.
+        """
+
+        if not package.strip():
+            raise MobileUseError(
+                ErrorCode.APP_LAUNCH_FAILED,
+                "An Android package name is required to launch an app.",
+                "Call android_list_apps and pass an exact package name.",
+                retryable_override=False,
+            )
+        bounded_retries = max(1, min(retries, 10))
+        bounded_timeout = max(0.01, min(timeout_seconds, 300.0))
+        bounded_stabilization = max(1, min(stabilization_polls, 5))
         attempts: list[AppLaunchAttempt] = []
         last_foreground = ForegroundApp()
-        for attempt_index in range(1, retries + 1):
-            try:
-                await self._call_blocking(self.adb_device.app_start, package)
-            except Exception as error:
-                raise MobileUseError(
-                    ErrorCode.OPERATION_FAILED,
-                    f"Android could not start package {package!r}.",
-                    "Check that the exact package is installed with android_list_apps.",
-                    data={"stage": "start_command", "attempt": attempt_index},
-                ) from error
-            deadline = asyncio.get_running_loop().time() + timeout_seconds
+        blockers: list[ForegroundApp] = []
+        foreground_error: MobileUseError | None = None
+        for attempt_index in range(1, bounded_retries + 1):
+            transitions: list[ForegroundApp] = []
+            blocker: ForegroundApp | None = None
+            candidate_polls = 0
             polls = 0
-            while asyncio.get_running_loop().time() < deadline:
-                polls += 1
-                last_foreground = await self.get_foreground_app()
-                if last_foreground.package == package:
-                    attempts.append(
-                        AppLaunchAttempt(
-                            attempt=attempt_index,
-                            outcome="ready",
-                            polls=polls,
-                            foreground_app=last_foreground,
-                        )
-                    )
-                    return AppLaunchResult(foreground_app=last_foreground, attempts=attempts)
-                if last_foreground.package is not None:
-                    attempts.append(
-                        AppLaunchAttempt(
-                            attempt=attempt_index,
-                            outcome="blocked_by_other_app",
-                            polls=polls,
-                            foreground_app=last_foreground,
-                        )
-                    )
-                    break
-                await asyncio.sleep(0.5)
-            else:
+            try:
+                if activity is None:
+                    await self._call_blocking(self.adb_device.app_start, package)
+                else:
+                    await self._call_blocking(self.adb_device.app_start, package, activity)
+            except Exception as error:
                 attempts.append(
                     AppLaunchAttempt(
                         attempt=attempt_index,
-                        outcome="loading_timeout",
-                        polls=polls,
+                        outcome="start_failed",
+                        polls=0,
                         foreground_app=last_foreground,
+                        command_status="failed",
+                        effect_status="unverified",
+                        error_code=ErrorCode.APP_LAUNCH_FAILED.value,
                     )
                 )
-            if attempt_index < retries:
-                await asyncio.sleep(0.5)
+                raise MobileUseError(
+                    ErrorCode.APP_LAUNCH_FAILED,
+                    f"Android could not start package {package!r}.",
+                    "Check that the exact package is installed with android_list_apps.",
+                    data={
+                        "stage": "start_command",
+                        "attempt": attempt_index,
+                        "requested_package": package,
+                        "command_status": "failed",
+                        "effect_status": "unverified",
+                        "attempts": [item.model_dump(mode="json") for item in attempts],
+                    },
+                    retryable_override=False,
+                ) from error
+            deadline = asyncio.get_running_loop().time() + bounded_timeout
+            while asyncio.get_running_loop().time() < deadline:
+                polls += 1
+                try:
+                    last_foreground = await self._read_foreground_app()
+                except MobileUseError as error:
+                    foreground_error = error
+                    attempts.append(
+                        AppLaunchAttempt(
+                            attempt=attempt_index,
+                            outcome="foreground_unavailable",
+                            polls=polls,
+                            foreground_app=last_foreground,
+                            command_status="sent",
+                            effect_status="unverified",
+                            error_code=error.code.value,
+                            transitions=transitions,
+                        )
+                    )
+                    # Repeating app_start after a foreground read failure is
+                    # not useful and could hide an accepted launch command.
+                    break
+                if len(transitions) < 50:
+                    transitions.append(last_foreground)
+                else:
+                    # Keep the first transition history and the latest safe
+                    # state without allowing long stabilization windows to
+                    # exceed the typed response budget.
+                    transitions[-1] = last_foreground
+                if last_foreground.package == package:
+                    candidate_polls += 1
+                    if candidate_polls >= bounded_stabilization:
+                        attempts.append(
+                            AppLaunchAttempt(
+                                attempt=attempt_index,
+                                outcome="ready",
+                                polls=polls,
+                                foreground_app=last_foreground,
+                                command_status="sent",
+                                effect_status="verified",
+                                blocker=blocker,
+                                transitions=transitions,
+                            )
+                        )
+                        return AppLaunchResult(
+                            requested_package=package,
+                            launchable_activity=activity,
+                            command_status="sent",
+                            effect_status="verified",
+                            verification_available=True,
+                            stabilized=True,
+                            blockers=blockers,
+                            foreground_app=last_foreground,
+                            attempts=attempts,
+                        )
+                else:
+                    candidate_polls = 0
+                    if last_foreground.package is not None:
+                        blocker = last_foreground
+                        if len(blockers) < 50 and all(
+                            existing.package != last_foreground.package
+                            or existing.activity != last_foreground.activity
+                            for existing in blockers
+                        ):
+                            blockers.append(last_foreground)
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining > 0 and last_foreground.package != package:
+                    await asyncio.sleep(min(0.1, remaining))
+
+            if attempts and attempts[-1].attempt == attempt_index:
+                # A foreground read failure already produced the complete
+                # attempt record above.
+                pass
+            elif blocker is not None:
+                attempts.append(
+                    AppLaunchAttempt(
+                        attempt=attempt_index,
+                        outcome="blocked_by_other_app",
+                        polls=polls,
+                        foreground_app=last_foreground,
+                        command_status="sent",
+                        effect_status="blocked",
+                        blocker=blocker,
+                        transitions=transitions,
+                    )
+                )
+            else:
+                outcome = "foreground_empty" if not last_foreground.package else "loading_timeout"
+                attempts.append(
+                    AppLaunchAttempt(
+                        attempt=attempt_index,
+                        outcome=outcome,
+                        polls=polls,
+                        foreground_app=last_foreground,
+                        command_status="sent",
+                        effect_status="unverified",
+                        transitions=transitions,
+                    )
+                )
+            if foreground_error is not None:
+                # A foreground read failure makes the launch postcondition
+                # unknowable.  Do not send another potentially duplicate
+                # start command while the device state is unobservable.
+                break
+            if attempt_index < bounded_retries and foreground_error is None:
+                await asyncio.sleep(0.1)
+        if foreground_error is not None:
+            data = {
+                "requested_package": package,
+                "command_status": "sent",
+                "effect_status": "unverified",
+                "verification_available": False,
+                "foreground_state": "unavailable",
+                "last_foreground_app": last_foreground.model_dump(mode="json"),
+                "attempts": [item.model_dump(mode="json") for item in attempts],
+                "blockers": [item.model_dump(mode="json") for item in blockers],
+            }
+            raise MobileUseError(
+                ErrorCode.FOREGROUND_UNAVAILABLE,
+                f"Android could not verify the foreground while launching {package!r}.",
+                "Resolve the foreground read failure and inspect the screen before retrying.",
+                data=data,
+            ) from foreground_error
         raise MobileUseError(
             ErrorCode.TIMEOUT,
-            f"App {package!r} did not reach the foreground after {retries} attempts; "
+            f"App {package!r} did not reach the foreground after {bounded_retries} attempts; "
             f"last foreground package was {last_foreground.package!r}.",
             "Inspect the current screen for a permission dialog or another app, then retry.",
             data={
                 "requested_package": package,
+                "command_status": "sent",
+                "effect_status": "blocked" if blockers else "unverified",
+                "verification_available": True,
+                "foreground_state": "occupied" if blockers else "empty",
                 "last_foreground_app": last_foreground.model_dump(mode="json"),
                 "attempts": [item.model_dump(mode="json") for item in attempts],
+                "blockers": [item.model_dump(mode="json") for item in blockers],
             },
         )
 
-    async def terminate_app(self, package: str) -> None:
-        await self._call_blocking(self.adb_device.app_stop, package)
+    async def terminate_app(self, package: str) -> AppTerminationResult:
+        """Force-stop one exact package and report the observable effect."""
+
+        if not package.strip():
+            raise MobileUseError(
+                ErrorCode.APP_TERMINATION_FAILED,
+                "An Android package name is required to terminate an app.",
+                "Call android_list_apps and pass an exact package name.",
+                retryable_override=False,
+            )
+        foreground_before: ForegroundApp | None = None
+        with suppress(MobileUseError):
+            foreground_before = await self._read_foreground_app()
+            # A pre-command read is useful evidence but must not prevent the
+            # requested force-stop.  The postcondition remains explicitly
+            # unverified when the subsequent read also fails.
+        try:
+            await self._call_blocking(self.adb_device.app_stop, package)
+        except Exception as error:
+            raise MobileUseError(
+                ErrorCode.APP_TERMINATION_FAILED,
+                f"Android could not terminate package {package!r}.",
+                "Check that the exact package is installed and the device is responsive.",
+                data={
+                    "requested_package": package,
+                    "targeted_package": package,
+                    "command_status": "failed",
+                    "effect_status": "unverified",
+                },
+                retryable_override=False,
+            ) from error
+        foreground_after: ForegroundApp | None = None
+        verification_reason: str | None = None
+        verification_available = True
+        try:
+            foreground_after = await self._read_foreground_app()
+        except MobileUseError as error:
+            verification_available = False
+            verification_reason = error.code.value
+        effect_verified = bool(
+            verification_available
+            and foreground_before is not None
+            and foreground_before.package == package
+            and foreground_after is not None
+            and foreground_after.package != package
+        )
+        if not effect_verified and verification_reason is None:
+            verification_reason = (
+                "target_package_remains_foreground"
+                if foreground_after is not None and foreground_after.package == package
+                else "target_package_was_not_foreground"
+                if foreground_before is None or foreground_before.package != package
+                else "foreground_changed_without_process_proof"
+            )
+        return AppTerminationResult(
+            requested_package=package,
+            targeted_package=package,
+            command_status="sent",
+            effect_status="verified" if effect_verified else "unverified",
+            effect_verified=effect_verified,
+            verification_available=verification_available,
+            requires_observation=not effect_verified,
+            foreground_before=foreground_before,
+            foreground_after=foreground_after,
+            verification_reason=verification_reason,
+        )
 
     async def open_url(self, url: str) -> None:
         parsed = urlparse(url)
@@ -1177,45 +1503,288 @@ class AndroidController:
         await self._call_blocking(self.adb_device.open_browser, url)
 
     async def get_foreground_app(self) -> ForegroundApp:
-        try:
-            return await self._read_foreground_app()
-        except Exception:
-            # A standalone foreground query preserves its historical safe
-            # empty result.  Combined snapshots call the raising helper so
-            # they can expose a component warning instead.
-            return ForegroundApp()
+        """Return the current foreground app or a typed read failure.
+
+        An empty ``ForegroundApp`` is a real Android state (for example, a
+        transient launcher/transition surface).  It must not be used as a
+        fallback for an adapter failure because launch verification relies on
+        distinguishing those two cases.
+        """
+
+        return await self._read_foreground_app()
 
     async def _read_foreground_app(self) -> ForegroundApp:
         """Read foreground state and preserve adapter failures for callers."""
 
-        current = await self._call_blocking(self.adb_device.app_current)
+        try:
+            current = await self._call_blocking(self.adb_device.app_current)
+        except Exception as error:
+            raise MobileUseError(
+                ErrorCode.FOREGROUND_UNAVAILABLE,
+                "Android foreground app state could not be read.",
+                "Verify that the device is connected and responsive, then retry.",
+                data={"stage": "foreground_read", "foreground_state": "unavailable"},
+            ) from error
         if current is None:
-            raise RuntimeError("foreground app state was unavailable")
+            raise MobileUseError(
+                ErrorCode.FOREGROUND_UNAVAILABLE,
+                "Android foreground app state could not be read.",
+                "Verify that the device is connected and responsive, then retry.",
+                data={"stage": "foreground_read", "foreground_state": "unavailable"},
+            )
         package = getattr(current, "package", None)
         activity = getattr(current, "activity", None)
         if package is not None and not isinstance(package, str):
-            raise RuntimeError("invalid foreground package")
+            raise MobileUseError(
+                ErrorCode.FOREGROUND_UNAVAILABLE,
+                "Android returned invalid foreground app metadata.",
+                "Retry the foreground read after checking the device state.",
+                data={"stage": "foreground_read", "foreground_state": "unavailable"},
+            )
         if activity is not None and not isinstance(activity, str):
-            raise RuntimeError("invalid foreground activity")
+            raise MobileUseError(
+                ErrorCode.FOREGROUND_UNAVAILABLE,
+                "Android returned invalid foreground activity metadata.",
+                "Retry the foreground read after checking the device state.",
+                data={"stage": "foreground_read", "foreground_state": "unavailable"},
+            )
         return ForegroundApp(package=package or None, activity=activity or None)
 
     async def list_apps(self, query: str | None = None, limit: int = 100) -> list[str]:
-        output = await self._call_blocking(
-            self.adb_device.shell,
-            ["pm", "list", "packages", "-3"],
-            timeout=self.config.subprocess_timeout_seconds,
-        )
-        if not isinstance(output, str):
-            raise MobileUseError(ErrorCode.OPERATION_FAILED, "ADB returned invalid package data.")
-        packages = sorted(
-            line.removeprefix("package:").strip()
-            for line in output.splitlines()
-            if line.startswith("package:")
-        )
+        """Return package strings for compatibility with the original core API."""
+
+        inventory = await self.list_app_inventory(query=query, include_system=False)
+        return [app.package for app in inventory.apps[:limit]]
+
+    async def _app_shell(self, arguments: list[str]) -> str:
+        """Run one bounded, parameterized ADB query for app metadata."""
+
+        try:
+            output = await self._call_blocking(
+                self.adb_device.shell,
+                arguments,
+                timeout=self.config.subprocess_timeout_seconds,
+            )
+        except MobileUseError:
+            raise
+        except ProcessTimeoutError as error:
+            raise MobileUseError(
+                ErrorCode.TIMEOUT,
+                "Timed out while querying Android app metadata.",
+                "Check the device connection and retry the bounded app query.",
+                data={"stage": "app_query", "arguments": arguments[:4]},
+            ) from error
+        except Exception as error:
+            raise MobileUseError(
+                ErrorCode.APP_QUERY_FAILED,
+                "ADB failed while querying Android app metadata.",
+                "Verify the device is online and retry android_list_apps.",
+                data={"stage": "app_query", "arguments": arguments[:4]},
+            ) from error
+        if isinstance(output, bytes):
+            text = output.decode("utf-8", errors="replace")
+        elif isinstance(output, str):
+            text = output
+        else:
+            raise MobileUseError(
+                ErrorCode.APP_QUERY_FAILED,
+                "ADB returned invalid Android app metadata.",
+                "Retry android_list_apps after checking the device connection.",
+                data={"stage": "app_query", "arguments": arguments[:4]},
+            )
+        if len(text.encode("utf-8")) > self.config.subprocess_max_output_bytes:
+            raise MobileUseError(
+                ErrorCode.APP_QUERY_FAILED,
+                "Android app metadata exceeded the bounded query output budget.",
+                "Retry with the device responsive; oversized metadata cannot be returned safely.",
+                data={
+                    "stage": "app_query",
+                    "arguments": arguments[:4],
+                    "output_limit_bytes": self.config.subprocess_max_output_bytes,
+                },
+            )
+        if _is_shell_error_output(text):
+            raise MobileUseError(
+                ErrorCode.APP_QUERY_FAILED,
+                "Android reported an error while querying app metadata.",
+                "Verify the selected device is responsive and retry android_list_apps.",
+                data={"stage": "app_query", "arguments": arguments[:4]},
+            )
+        return text
+
+    async def list_app_inventory(
+        self,
+        query: str | None = None,
+        *,
+        include_system: bool = True,
+    ) -> AppInventory:
+        """Return stable Android package records without model-based matching."""
+
+        package_output: str | None = None
+        first_error: MobileUseError | None = None
+        try:
+            package_output = await self._app_shell(["pm", "list", "packages"])
+        except MobileUseError as error:
+            first_error = error
+        packages = _parse_package_names(package_output or "")
+        used_third_party_fallback = False
+        if not packages:
+            try:
+                fallback_output = await self._app_shell(["pm", "list", "packages", "-3"])
+            except MobileUseError as error:
+                if first_error is not None:
+                    raise MobileUseError(
+                        ErrorCode.APP_QUERY_FAILED,
+                        "ADB failed while listing installed Android apps.",
+                        "Run `adb devices -l`, verify the selected device, and retry.",
+                        data={"stage": "package_list"},
+                    ) from error
+                raise
+            packages = _parse_package_names(fallback_output)
+            used_third_party_fallback = bool(packages)
+        elif first_error is not None:
+            # A successful fallback is authoritative even if a newer package
+            # manager command was unavailable on this Android build.
+            used_third_party_fallback = True
+
+        optional_errors: list[str] = []
+        system_packages: set[str] = set()
+        third_party_packages: set[str] = set(packages) if used_third_party_fallback else set()
+        for arguments, target in (
+            (["pm", "list", "packages", "-s"], system_packages),
+            (["pm", "list", "packages", "-3"], third_party_packages),
+        ):
+            if used_third_party_fallback and arguments[-1] == "-3":
+                continue
+            try:
+                target.update(_parse_package_names(await self._app_shell(arguments)))
+            except MobileUseError as error:
+                optional_errors.append(f"{arguments[-1]}:{error.code.value}")
+
+        records: list[AppInfo] = []
+        metadata_errors: list[str] = []
+        for package in packages:
+            package_errors: list[str] = []
+            package_dump = ""
+            try:
+                package_dump = await self._app_shell(["dumpsys", "package", package])
+            except MobileUseError as error:
+                package_errors.append(f"dumpsys:{error.code.value}")
+                metadata_errors.append(f"{package}:dumpsys:{error.code.value}")
+            metadata = _parse_app_metadata(package_dump, package)
+            launcher_label = metadata.launcher_label
+            activity = None
+            resolve_error: MobileUseError | None = None
+            try:
+                activity_output = await self._app_shell(
+                    ["cmd", "package", "resolve-activity", "--brief", "--user", "0", package]
+                )
+            except MobileUseError as error:
+                resolve_error = error
+                activity_output = ""
+            if launcher_label is None:
+                launcher_label = _parse_label(activity_output)
+            activity = _parse_activity(activity_output, package)
+            if activity is None:
+                # Older Android package managers use query-activities and
+                # return the same component shape.  Try it even when the
+                # preferred resolver command is unavailable.
+                try:
+                    activity_output = await self._app_shell(
+                        [
+                            "cmd",
+                            "package",
+                            "query-activities",
+                            "--brief",
+                            "--user",
+                            "0",
+                            "-a",
+                            "android.intent.action.MAIN",
+                            "-c",
+                            "android.intent.category.LAUNCHER",
+                            package,
+                        ]
+                    )
+                except MobileUseError as error:
+                    package_errors.append(f"activity:{error.code.value}")
+                    metadata_errors.append(f"{package}:activity:{error.code.value}")
+                    if resolve_error is not None and resolve_error.code != error.code:
+                        metadata_errors.append(f"{package}:resolve:{resolve_error.code.value}")
+                    activity_output = ""
+                if launcher_label is None:
+                    launcher_label = _parse_label(activity_output)
+                activity = _parse_activity(activity_output, package)
+
+            is_system = metadata.is_system
+            if package in system_packages:
+                is_system = True
+            elif package in third_party_packages:
+                is_system = False
+            is_third_party = None if is_system is None else not is_system
+            values_known = sum(
+                value is not None
+                for value in (
+                    launcher_label,
+                    activity or metadata.launchable_activity,
+                    is_system,
+                    metadata.enabled,
+                )
+            )
+            optional_values_known = sum(
+                value is not None
+                for value in (
+                    launcher_label,
+                    activity or metadata.launchable_activity,
+                    metadata.enabled,
+                )
+            )
+            if package_errors and optional_values_known == 0:
+                metadata_status = "unavailable"
+            elif values_known < 4 or package_errors:
+                metadata_status = "partial"
+            else:
+                metadata_status = "available"
+            records.append(
+                AppInfo(
+                    package=package,
+                    launcher_label=launcher_label,
+                    launchable_activity=activity or metadata.launchable_activity,
+                    is_system=is_system,
+                    is_third_party=is_third_party,
+                    enabled=metadata.enabled,
+                    metadata_status=metadata_status,
+                )
+            )
+
         if query:
             normalized = query.casefold()
-            packages = [package for package in packages if normalized in package.casefold()]
-        return packages[:limit]
+            records = [
+                app
+                for app in records
+                if normalized in app.package.casefold()
+                or (
+                    app.launcher_label is not None
+                    and normalized in app.launcher_label.casefold()
+                )
+            ]
+        if not include_system:
+            records = [app for app in records if app.is_third_party is True]
+
+        records.sort(key=lambda app: (app.package.casefold(), app.package))
+        record_statuses = {app.metadata_status for app in records}
+        if not packages:
+            status = "available"
+        elif record_statuses == {"unavailable"}:
+            status = "unavailable"
+        elif "partial" in record_statuses or optional_errors:
+            status = "partial"
+        else:
+            status = "available"
+        return AppInventory(
+            apps=records,
+            metadata_status=status,
+            metadata_errors=(optional_errors + metadata_errors)[:50],
+        )
 
     async def start_recording(
         self,

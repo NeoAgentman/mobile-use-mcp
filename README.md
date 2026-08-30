@@ -220,7 +220,7 @@ and report the device model. Observe the screen again after every action.
 | `android_screenshot` | Screenshot plus basic metadata |
 | `android_get_ui_elements` | Page and query elements from one cached snapshot |
 | `android_get_foreground_app` | Current package and activity |
-| `android_list_apps` | Filter third-party package names |
+| `android_list_apps` | Deterministically list installed Apps with package, launcher label, launchable activity, system/third-party classification, enabled state, stable query, and paging |
 
 ### Condition waits
 
@@ -299,8 +299,8 @@ capacity eviction returns `SNAPSHOT_STALE`, and both instruct the agent to obser
 | `android_type_text` | Optionally focus a target, then type text with command/effect/IME status |
 | `android_clear_text` | Optionally focus a target, then bounded-clear text and verify emptiness |
 | `android_press_key` | Press back/home/enter/delete/tab/menu/volume keys |
-| `android_launch_app` | Launch a package and poll until foreground |
-| `android_terminate_app` | Force-stop a package |
+| `android_launch_app` | Launch a package and verify a stabilized foreground transition |
+| `android_terminate_app` | Force-stop a package and report the observed effect |
 | `android_open_url` | Open an HTTP or HTTPS URL |
 | `android_start_recording` | Start a bounded screen recording with automatic segment rollover |
 | `android_stop_recording` | Stop, pull, and optionally merge recording segments |
@@ -309,9 +309,17 @@ capacity eviction returns `SNAPSHOT_STALE`, and both instruct the agent to obser
 | `android_wait_for_element` | Wait for a `Target` in the complete hierarchy |
 | `android_wait_for_ui_change` | Wait for change from an explicit snapshot or screen-revision baseline |
 
-`android_launch_app` reports every launch attempt, polling count, and the last foreground App. A
-permission controller, chooser, or other foreground blocker is reported separately from an App
-that remains in an indeterminate loading state.
+`android_list_apps` searches package names and localized launcher display names without an embedded
+model. Its records preserve explicit `null` values when Android does not expose a metadata field;
+stable pages use `offset` and `limit`. A query with no match returns `APP_NOT_FOUND`, while an ADB
+query failure and unavailable optional metadata have distinct typed outcomes.
+
+`android_launch_app` reports every launch attempt, polling count, bounded foreground transitions,
+stabilization status, and the last foreground App. A permission controller, chooser, or other
+foreground blocker is reported separately from an App that remains in an indeterminate loading
+state. A foreground read failure is never treated as an empty/loading state. `android_terminate_app`
+reports the exact targeted package and whether its foreground effect was verified; an accepted
+force-stop with an unavailable postcondition is explicitly marked unverified.
 
 Recordings are limited to 5–1800 seconds. Device-side temporary files use randomized names and are
 removed after transfer. Android's per-recording time limit is handled with 170-second segments. If
@@ -476,7 +484,8 @@ device verification results.
 - Clear-text attempts are bounded by `max_characters`. An empty-field result is marked verified
   only when Android accessibility exposes a non-password field whose text is demonstrably empty;
   masked or unavailable fields remain unverified.
-- App discovery currently returns package names rather than localized display names.
+- App discovery is deterministic and searches package names plus localized launcher display names;
+  optional metadata remains `null` when the Android build does not expose it.
 - Screenshot tools return visible pixels as MCP image content; they do not extract or download an
   App's original remote media file.
 - Physical-device and emulator compatibility still requires validation across Android versions,

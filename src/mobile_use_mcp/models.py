@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 
 class StrictModel(BaseModel):
@@ -244,16 +244,125 @@ class ForegroundApp(StrictModel):
     activity: str | None = None
 
 
+class AppInfo(StrictModel):
+    """Deterministic metadata for one installed Android application.
+
+    Android exposes different portions of package metadata on different API
+    levels and OEM builds.  ``None`` is therefore intentional: it means the
+    field is unknown on this device, rather than that the app has an empty
+    label or is disabled.  The record remains useful for package selection
+    even when optional metadata cannot be read.
+    """
+
+    package: str = Field(min_length=1, max_length=512)
+    launcher_label: str | None = Field(
+        default=None,
+        max_length=2_000,
+        validation_alias=AliasChoices("launcher_label", "label"),
+    )
+    launchable_activity: str | None = Field(
+        default=None,
+        max_length=1_000,
+        validation_alias=AliasChoices("launchable_activity", "activity"),
+    )
+    is_system: bool | None = None
+    is_third_party: bool | None = None
+    enabled: bool | None = None
+    metadata_status: Literal["available", "partial", "unavailable"] = "available"
+
+    @property
+    def label(self) -> str | None:
+        """Compatibility alias for callers that call the label simply ``label``."""
+
+        return self.launcher_label
+
+    @property
+    def package_name(self) -> str:
+        """Compatibility alias for ADB clients that use ``package_name``."""
+
+        return self.package
+
+    @property
+    def system(self) -> bool | None:
+        """Compatibility alias for the system-app classification."""
+
+        return self.is_system
+
+    @property
+    def third_party(self) -> bool | None:
+        """Compatibility alias for the third-party classification."""
+
+        return self.is_third_party
+
+    @property
+    def activity(self) -> str | None:
+        """Compatibility alias for callers that call the activity simply ``activity``."""
+
+        return self.launchable_activity
+
+
+# ``AndroidApp`` is a descriptive alias used by embedders; both names share
+# one schema and therefore serialize identically.
+AndroidApp = AppInfo
+AppRecord = AppInfo
+InstalledApp = AppInfo
+
+
+class AppInventory(StrictModel):
+    """Core result of one deterministic Android package inventory read."""
+
+    apps: list[AppInfo] = Field(default_factory=lambda: list[AppInfo]())
+    metadata_status: Literal["available", "partial", "unavailable"] = "available"
+    metadata_errors: list[str] = Field(default_factory=list, max_length=50)
+
+    @property
+    def metadata_unavailable(self) -> bool:
+        """Whether optional package metadata was unavailable for this read."""
+
+        return self.metadata_status == "unavailable"
+
+
 class AppLaunchAttempt(StrictModel):
     attempt: int = Field(ge=1)
     outcome: str
     polls: int = Field(ge=0)
     foreground_app: ForegroundApp
+    command_status: Literal["sent", "failed", "uncertain"] = "sent"
+    effect_status: Literal["verified", "blocked", "unverified"] = "unverified"
+    blocker: ForegroundApp | None = None
+    transitions: list[ForegroundApp] = Field(
+        default_factory=lambda: list[ForegroundApp](), max_length=50
+    )
+    error_code: str | None = Field(default=None, max_length=128)
 
 
 class AppLaunchResult(StrictModel):
+    requested_package: str | None = None
+    launchable_activity: str | None = None
+    command_status: Literal["sent", "failed", "uncertain"] = "sent"
+    effect_status: Literal["verified", "blocked", "unverified"] = "verified"
+    verification_available: bool = True
+    stabilized: bool = False
+    blockers: list[ForegroundApp] = Field(
+        default_factory=lambda: list[ForegroundApp](), max_length=50
+    )
     foreground_app: ForegroundApp
     attempts: list[AppLaunchAttempt]
+
+
+class AppTerminationResult(StrictModel):
+    """Postcondition-aware result of one exact Android force-stop request."""
+
+    requested_package: str
+    targeted_package: str
+    command_status: Literal["sent", "failed", "uncertain"]
+    effect_status: Literal["verified", "unverified"]
+    effect_verified: bool
+    verification_available: bool
+    requires_observation: bool
+    foreground_before: ForegroundApp | None = None
+    foreground_after: ForegroundApp | None = None
+    verification_reason: str | None = None
 
 
 class ScreenSnapshot(StrictModel):
@@ -465,6 +574,23 @@ class LifecycleResult(ResultMappingMixin, StrictModel):
     # Kept as a compatibility envelope for callers of the pre-lifecycle
     # dictionaries. New lifecycle fields remain available at the top level.
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+class AppListResult(LifecycleResult):
+    """Typed, pageable result for deterministic Android App discovery."""
+
+    query: str | None = None
+    total: int = Field(default=0, ge=0)
+    count: int = Field(default=0, ge=0)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=100, ge=1, le=500)
+    has_more: bool = False
+    next_offset: int | None = Field(default=None, ge=0)
+    metadata_status: Literal["available", "partial", "unavailable"] = "available"
+    apps: list[AppInfo] = Field(default_factory=lambda: list[AppInfo]())
+    # Kept as an inexpensive compatibility projection for clients that only
+    # consumed package strings from the original android_list_apps tool.
+    packages: list[str] = Field(default_factory=list)
 
 
 class SessionConnection(StrictModel):

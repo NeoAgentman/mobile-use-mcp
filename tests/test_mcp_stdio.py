@@ -55,6 +55,11 @@ async def test_stdio_server_initialize_list_and_call() -> None:
     assert "content_description" in str(tap_tool.inputSchema)
     assert "not Target fields" in str(tap_tool.inputSchema)
     assert "display names" in str(list_apps_tool.description)
+    assert list_apps_tool.outputSchema is not None
+    app_properties = list_apps_tool.outputSchema["properties"]
+    assert {"operation_id", "apps", "total", "offset", "limit", "metadata_status"} <= set(
+        app_properties
+    )
     assert "not a condition wait" in str(wait_tool.description).lower()
     assert status.isError is False
     assert status.structuredContent is not None
@@ -84,6 +89,32 @@ async def test_stdio_server_returns_actionable_adb_failure() -> None:
     assert result.structuredContent is not None
     assert result.structuredContent["success"] is False
     assert result.structuredContent["error_code"] == "ADB_UNAVAILABLE"
+
+
+async def test_stdio_app_inventory_failure_is_typed() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mobile_use_mcp"],
+        cwd=project_root,
+    )
+
+    async with (
+        stdio_client(parameters) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as client,
+    ):
+        await client.initialize()
+        result = await client.call_tool(
+            "android_list_apps",
+            arguments={"query": "missing"},
+            read_timeout_seconds=timedelta(seconds=5),
+        )
+
+    assert result.isError is True
+    assert result.structuredContent is not None
+    assert result.structuredContent["success"] is False
+    assert result.structuredContent["error_code"] == "NOT_CONNECTED"
+    assert result.structuredContent["operation_id"]
 
 
 async def test_stdio_android_doctor_returns_independent_capability_matrix() -> None:

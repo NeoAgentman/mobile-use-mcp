@@ -29,6 +29,9 @@ from mobile_use_mcp.doctor import run_doctor_bounded
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
 from mobile_use_mcp.models import (
+    AppLaunchResult,
+    AppListResult,
+    AppTerminationResult,
     DeviceConnectResult,
     DeviceDisconnectResult,
     DeviceInfo,
@@ -36,6 +39,7 @@ from mobile_use_mcp.models import (
     DeviceStatusResult,
     DoctorResult,
     DoctorStatus,
+    ForegroundApp,
     LifecycleError,
     LifecycleResult,
     OperationResult,
@@ -1028,6 +1032,8 @@ async def android_get_foreground_app() -> dict[str, Any]:
         return _observation_failure("read the foreground Android app")
     return {
         "success": True,
+        "operation_id": operation_id,
+        "foreground_state": "empty" if foreground.package is None else "occupied",
         "foreground_app": foreground.model_dump(mode="json"),
     }
 
@@ -1044,37 +1050,155 @@ async def android_list_apps(
         Field(
             max_length=512,
             description=(
-                "Case-insensitive substring of the package name, not the localized app label."
+                "Case-insensitive substring of the package name or localized launcher display "
+                "name/label."
             ),
         ),
     ] = None,
     limit: Annotated[
         int,
-        Field(ge=1, le=500, description="Maximum matching third-party packages to return."),
+        Field(ge=1, le=500, description="Maximum matching Android App records to return."),
     ] = 100,
-) -> dict[str, Any]:
-    """List third-party package names, optionally filtering the package string.
+    offset: Annotated[
+        int,
+        Field(ge=0, description="Zero-based page offset applied after deterministic sorting."),
+    ] = 0,
+    include_system: Annotated[
+        bool,
+        Field(description="Include Android system Apps whose package metadata is available."),
+    ] = True,
+) -> AppListResult:
+    """List deterministic Android App records with stable sorting and paging.
 
-    Query does not search localized launcher display names. android_launch_app requires an exact
-    package such as com.taobao.idlefish, not an app label such as 闲鱼.
+    Query searches package names and localized launcher display names/labels without a model or
+    fuzzy resolver.
+    ``None`` fields in an App record explicitly mean that Android did not expose that metadata on
+    the selected device. android_launch_app still requires an exact package such as
+    ``com.taobao.idlefish``.
     """
 
     if not 1 <= limit <= 500:
         raise ValueError("limit must be between 1 and 500")
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
     operation_id = session.new_operation_id()
     try:
-        apps = await session.run_operation(
+        inventory = await session.run_operation(
             "list_apps",
-            lambda _context: session.require_controller().list_apps(query=query, limit=limit),
+            lambda _context: session.require_controller().list_app_inventory(
+                query=query,
+                include_system=include_system,
+            ),
             operation_id=operation_id,
             retry_safe=True,
             mutating=False,
         )
+        apps = sorted(
+            inventory.apps,
+            key=lambda app: (app.package.casefold(), app.package),
+        )
+        if query:
+            normalized_query = query.casefold()
+            apps = [
+                app
+                for app in apps
+                if normalized_query in app.package.casefold()
+                or (
+                    app.launcher_label is not None
+                    and normalized_query in app.launcher_label.casefold()
+                )
+            ]
+        if not include_system:
+            apps = [app for app in apps if app.is_third_party is True]
+        if not apps and query:
+            raise MobileUseError(
+                ErrorCode.APP_NOT_FOUND,
+                f"No installed Android App matched {query!r}.",
+                "Use android_list_apps without a query to inspect exact package names and labels.",
+                data={"query": query, "include_system": include_system},
+                retryable_override=False,
+            )
+        if inventory.metadata_status == "unavailable" and apps:
+            raise MobileUseError(
+                ErrorCode.APP_METADATA_UNAVAILABLE,
+                "Android returned packages but App metadata could not be read.",
+                "Retry after checking the device connection; unknown fields are not launch proof.",
+                data={
+                    "metadata_status": inventory.metadata_status,
+                    "metadata_errors": inventory.metadata_errors,
+                    "apps": [app.model_dump(mode="json") for app in apps[:50]],
+                },
+                retryable_override=True,
+            )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            AppListResult,
+            _lifecycle_failure(
+                AppListResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+                connected=session.connected,
+                data={
+                    "query": query,
+                    "offset": offset,
+                    "limit": limit,
+                    "include_system": include_system,
+                },
+            ),
+        )
     except Exception:
-        return _observation_failure("list installed Android apps")
-    return {"success": True, "count": len(apps), "apps": apps}
+        error = MobileUseError(
+            ErrorCode.APP_QUERY_FAILED,
+            "Failed to list installed Android Apps.",
+            "Verify the device is connected and retry android_list_apps.",
+            retryable_override=True,
+        )
+        return cast(
+            AppListResult,
+            _lifecycle_failure(
+                AppListResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+                connected=session.connected,
+                data={
+                    "query": query,
+                    "offset": offset,
+                    "limit": limit,
+                    "include_system": include_system,
+                },
+            ),
+        )
+    page = apps[offset : offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < len(apps) else None
+    return AppListResult(
+        success=True,
+        operation_id=operation_id,
+        message=f"Found {len(apps)} installed Android App(s).",
+        state=session.state,
+        session_id=session.session_id,
+        generation=session.generation,
+        device=session.device,
+        connected=session.connected,
+        query=query,
+        total=len(apps),
+        count=len(page),
+        offset=offset,
+        limit=limit,
+        has_more=next_offset is not None,
+        next_offset=next_offset,
+        metadata_status=inventory.metadata_status,
+        apps=page,
+        packages=[app.package for app in page],
+        warnings=inventory.metadata_errors,
+    )
 
 
 DEFAULT_WAIT_TIMEOUT_SECONDS = 10.0
@@ -2476,6 +2600,25 @@ async def android_launch_app(
             description="Exact installed Android package name, not a launcher display label.",
         ),
     ],
+    activity: Annotated[
+        str | None,
+        Field(
+            max_length=1_000,
+            description="Optional exact launchable activity from android_list_apps.",
+        ),
+    ] = None,
+    retries: Annotated[
+        int,
+        Field(ge=1, le=10, description="Maximum bounded launch command attempts."),
+    ] = 3,
+    timeout_seconds: Annotated[
+        float,
+        Field(gt=0, le=300, description="Foreground verification window per attempt."),
+    ] = 15,
+    stabilization_polls: Annotated[
+        int,
+        Field(ge=1, le=5, description="Consecutive foreground reads required for readiness."),
+    ] = 2,
 ) -> dict[str, Any]:
     """Open an installed Android mobile App and wait until it reaches the foreground.
 
@@ -2489,7 +2632,21 @@ async def android_launch_app(
 
         async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            return await session.require_controller().launch_app(package)
+            controller = session.require_controller()
+            if (
+                activity is None
+                and retries == 3
+                and timeout_seconds == 15
+                and stabilization_polls == 2
+            ):
+                return await controller.launch_app(package)
+            return await controller.launch_app(
+                package,
+                activity=activity,
+                retries=retries,
+                timeout_seconds=timeout_seconds,
+                stabilization_polls=stabilization_polls,
+            )
 
         launch = await session.run_operation(
             "launch_app",
@@ -2501,10 +2658,26 @@ async def android_launch_app(
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("app launch")
+    if isinstance(launch, AppLaunchResult):
+        data = launch.model_dump(mode="json")
+    elif isinstance(launch, ForegroundApp):
+        data = {
+            "foreground_app": launch.model_dump(mode="json"),
+            "requested_package": package,
+            "command_status": "sent",
+            "effect_status": "unverified",
+            "verification_available": False,
+            "stabilized": False,
+            "requires_observation": True,
+        }
+    elif isinstance(launch, dict):
+        data = cast(dict[str, Any], launch)
+    else:
+        data = {"requested_package": package, "effect_status": "unverified"}
     return OperationResult(
         success=True,
         message=f"Launched Android app {package!r}.",
-        data=launch.model_dump(mode="json"),
+        data=data,
     ).model_dump(mode="json")
 
 
@@ -2524,16 +2697,16 @@ async def android_terminate_app(
         ),
     ],
 ) -> dict[str, Any]:
-    """Force-stop one exact installed Android package and invalidate cached UI state."""
+    """Force-stop one exact package and report whether its effect was observable."""
 
     operation_id = session.new_operation_id()
     try:
 
-        async def act(_context: Any) -> None:
+        async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            await session.require_controller().terminate_app(package)
+            return await session.require_controller().terminate_app(package)
 
-        await session.run_operation(
+        termination = await session.run_operation(
             "terminate_app",
             act,
             operation_id=operation_id,
@@ -2543,9 +2716,25 @@ async def android_terminate_app(
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("app termination")
-    return OperationResult(success=True, message=f"Terminated Android app {package!r}.").model_dump(
-        mode="json"
-    )
+    if isinstance(termination, AppTerminationResult):
+        data = termination.model_dump(mode="json")
+    elif isinstance(termination, dict):
+        data = cast(dict[str, Any], termination)
+    else:
+        data = {
+            "requested_package": package,
+            "targeted_package": package,
+            "command_status": "sent",
+            "effect_status": "unverified",
+            "effect_verified": False,
+            "verification_available": False,
+            "requires_observation": True,
+        }
+    return OperationResult(
+        success=True,
+        message=f"Terminated Android app {package!r}.",
+        data=data,
+    ).model_dump(mode="json")
 
 
 @mcp.tool(

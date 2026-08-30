@@ -187,6 +187,279 @@ async def test_list_apps_filters_and_limits(
     assert await service.list_apps(query="demo") == ["org.demo"]
 
 
+class InventoryADBDevice(FakeADBDevice):
+    """Small stateful ADB substitute for the deterministic app inventory seam."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.current = FakeRunningApp(package="com.android.launcher")
+
+    def shell(
+        self,
+        cmdargs: list[str],
+        stream: bool = False,
+        timeout: float | None = 600,
+        encoding: str | None = "utf-8",
+        rstrip: bool = True,
+    ) -> str:
+        del stream, timeout, encoding, rstrip
+        if cmdargs == ["pm", "list", "packages"]:
+            return "package:com.example.demo\npackage:com.android.settings\n"
+        if cmdargs == ["pm", "list", "packages", "-s"]:
+            return "package:com.android.settings\n"
+        if cmdargs == ["pm", "list", "packages", "-3"]:
+            return "package:com.example.demo\n"
+        if cmdargs == ["dumpsys", "package", "com.example.demo"]:
+            return (
+                "applicationInfo=ApplicationInfo{com.example.demo "
+                "enabled=true nonLocalizedLabel=示例应用 flags=0x0}\n"
+            )
+        if cmdargs == ["dumpsys", "package", "com.android.settings"]:
+            return "applicationInfo=ApplicationInfo{com.android.settings enabled=true flags=0x1}\n"
+        if cmdargs[:3] == ["cmd", "package", "resolve-activity"]:
+            package = cmdargs[-1]
+            if package == "com.example.demo":
+                return "com.example.demo/.MainActivity\n"
+            return "No activity found\n"
+        return ""
+
+
+async def test_app_inventory_is_stable_pageable_and_searches_localized_labels() -> None:
+    u2_device = FakeU2Device()
+    adb_device = InventoryADBDevice()
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    inventory = await service.list_app_inventory()
+
+    assert [app.package for app in inventory.apps] == [
+        "com.android.settings",
+        "com.example.demo",
+    ]
+    assert inventory.apps[0].launcher_label is None
+    assert inventory.apps[0].launchable_activity is None
+    assert inventory.apps[0].is_system is True
+    assert inventory.apps[0].is_third_party is False
+    assert inventory.apps[1].launcher_label == "示例应用"
+    assert inventory.apps[1].launchable_activity == ".MainActivity"
+    assert inventory.apps[1].is_system is False
+    assert inventory.apps[1].is_third_party is True
+    assert inventory.apps[1].enabled is True
+
+    localized = await service.list_app_inventory(query="示例应用")
+    assert [app.package for app in localized.apps] == ["com.example.demo"]
+
+
+async def test_foreground_read_failure_is_not_an_empty_foreground() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+
+    def broken_current() -> FakeRunningApp:
+        raise RuntimeError("dumpsys unavailable")
+
+    adb_device.app_current = broken_current  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    with pytest.raises(MobileUseError) as caught:
+        await service.get_foreground_app()
+
+    assert caught.value.code == ErrorCode.FOREGROUND_UNAVAILABLE
+
+
+async def test_termination_reports_verified_effect() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+    adb_device.current = FakeRunningApp(package="org.demo")
+
+    def stop(package: str) -> None:
+        adb_device.stopped.append(package)
+        adb_device.current = FakeRunningApp(package="com.android.launcher")
+
+    adb_device.app_stop = stop  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    result = await service.terminate_app("org.demo")
+
+    assert result.targeted_package == "org.demo"
+    assert result.command_status == "sent"
+    assert result.effect_status == "verified"
+
+
+async def test_launch_records_transition_and_does_not_confuse_foreground_read_failure() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+    states = iter(
+        [
+            FakeRunningApp(package="com.android.permissioncontroller"),
+            FakeRunningApp(package="org.demo"),
+            FakeRunningApp(package="org.demo"),
+        ]
+    )
+
+    def current() -> FakeRunningApp:
+        return next(states)
+
+    adb_device.app_current = current  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    result = await service.launch_app("org.demo", retries=1, timeout_seconds=0.2)
+
+    assert result.effect_status == "verified"
+    assert result.stabilized is True
+    assert result.blockers[0].package == "com.android.permissioncontroller"
+    assert result.attempts[0].transitions[0].package == "com.android.permissioncontroller"
+
+
+async def test_launch_foreground_read_failure_has_distinct_outcome() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+
+    def broken_current() -> FakeRunningApp:
+        raise RuntimeError("foreground unavailable")
+
+    adb_device.app_current = broken_current  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    with pytest.raises(MobileUseError) as caught:
+        await service.launch_app("org.demo", retries=1, timeout_seconds=0.2)
+
+    assert caught.value.code == ErrorCode.FOREGROUND_UNAVAILABLE
+    assert caught.value.data["attempts"][0]["outcome"] == "foreground_unavailable"  # type: ignore[index]
+    assert adb_device.started == ["org.demo"]
+    assert all(
+        attempt["outcome"] != "loading_timeout"  # type: ignore[index]
+        for attempt in caught.value.data["attempts"]  # type: ignore[union-attr]
+    )
+
+
+async def test_termination_is_unverified_when_target_was_not_foreground() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+    adb_device.current = FakeRunningApp(package="com.other")
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    result = await service.terminate_app("org.demo")
+
+    assert result.command_status == "sent"
+    assert result.effect_status == "unverified"
+    assert result.effect_verified is False
+    assert result.verification_reason == "target_package_was_not_foreground"
+
+
+async def test_app_query_failure_is_distinct_from_an_empty_match() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+
+    def broken_shell(
+        cmdargs: list[str],
+        stream: bool = False,
+        timeout: float | None = 600,
+        encoding: str | None = "utf-8",
+        rstrip: bool = True,
+    ) -> str:
+        del cmdargs, stream, timeout, encoding, rstrip
+        raise RuntimeError("adb query failed")
+
+    adb_device.shell = broken_shell  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    with pytest.raises(MobileUseError) as caught:
+        await service.list_app_inventory()
+
+    assert caught.value.code == ErrorCode.APP_QUERY_FAILED
+
+
+async def test_app_query_error_text_is_not_mistaken_for_an_empty_inventory() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+
+    def shell(
+        cmdargs: list[str],
+        stream: bool = False,
+        timeout: float | None = 600,
+        encoding: str | None = "utf-8",
+        rstrip: bool = True,
+    ) -> str:
+        del cmdargs, stream, timeout, encoding, rstrip
+        return "Error: device offline\n"
+
+    adb_device.shell = shell  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    with pytest.raises(MobileUseError) as caught:
+        await service.list_app_inventory()
+
+    assert caught.value.code == ErrorCode.APP_QUERY_FAILED
+
+
+async def test_app_inventory_preserves_unknown_metadata_when_metadata_is_unavailable() -> None:
+    u2_device = FakeU2Device()
+    adb_device = FakeADBDevice(u2_device)
+
+    def shell(
+        cmdargs: list[str],
+        stream: bool = False,
+        timeout: float | None = 600,
+        encoding: str | None = "utf-8",
+        rstrip: bool = True,
+    ) -> str:
+        del stream, timeout, encoding, rstrip
+        if cmdargs == ["pm", "list", "packages"]:
+            return "package:com.example.demo\n"
+        if cmdargs == ["pm", "list", "packages", "-s"]:
+            return ""
+        if cmdargs == ["pm", "list", "packages", "-3"]:
+            return "package:com.example.demo\n"
+        raise RuntimeError(f"unsupported metadata command: {cmdargs}")
+
+    adb_device.shell = shell  # type: ignore[method-assign]
+    service = AndroidController(
+        "serial",
+        android_client=AndroidClient("serial", connector=lambda _: u2_device),
+        adb_connector=lambda _: adb_device,
+    )
+
+    inventory = await service.list_app_inventory()
+
+    assert inventory.metadata_status == "unavailable"
+    assert inventory.apps[0].launcher_label is None
+    assert inventory.apps[0].launchable_activity is None
+    assert inventory.apps[0].is_system is False
+    assert inventory.apps[0].is_third_party is True
+    assert inventory.apps[0].enabled is None
+
+
 async def test_type_text_can_focus_and_verify_target(
     controller: tuple[AndroidController, FakeADBDevice],
 ) -> None:

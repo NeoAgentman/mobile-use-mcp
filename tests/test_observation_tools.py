@@ -6,6 +6,8 @@ from mcp.types import ImageContent
 from PIL import Image
 
 from mobile_use_mcp.models import (
+    AppInfo,
+    AppInventory,
     DeviceInfo,
     DeviceState,
     ForegroundApp,
@@ -15,6 +17,7 @@ from mobile_use_mcp.models import (
 from mobile_use_mcp.server import (
     android_connect,
     android_get_ui_elements,
+    android_list_apps,
     android_list_devices,
     android_screenshot,
     android_snapshot,
@@ -268,3 +271,55 @@ async def test_ui_elements_rejects_expired_snapshot_id() -> None:
 
     assert result["success"] is False
     assert result["error_code"] == "SNAPSHOT_NOT_FOUND"
+
+
+async def test_list_apps_returns_localized_inventory_with_paging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = Mock()
+    controller.list_app_inventory = AsyncMock(
+        return_value=AppInventory(
+            apps=[
+                AppInfo(
+                    package="com.example.demo",
+                    launcher_label="示例应用",
+                    launchable_activity=".MainActivity",
+                    is_system=False,
+                    is_third_party=True,
+                    enabled=True,
+                ),
+                AppInfo(
+                    package="com.example.reader",
+                    launcher_label="阅读器",
+                    launchable_activity=".ReaderActivity",
+                    is_system=False,
+                    is_third_party=True,
+                    enabled=True,
+                ),
+            ],
+            metadata_status="available",
+        )
+    )
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    result = await android_list_apps(query="示例", offset=0, limit=1)
+
+    assert result["success"] is True
+    assert result["total"] == 1
+    assert result["count"] == 1
+    assert result["has_more"] is False
+    assert result["apps"][0]["launcher_label"] == "示例应用"  # type: ignore[index]
+    controller.list_app_inventory.assert_awaited_once_with(query="示例", include_system=True)
+
+
+async def test_list_apps_no_match_is_typed_business_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller = Mock()
+    controller.list_app_inventory = AsyncMock(return_value=AppInventory(apps=[]))
+    monkeypatch.setattr(session, "require_controller", lambda: controller)
+
+    result = await android_list_apps(query="missing-app")
+
+    assert result["success"] is False
+    assert result["error_code"] == "APP_NOT_FOUND"

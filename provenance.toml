@@ -20,7 +20,7 @@ modification_statement = "Significantly rewritten for the local MCP session boun
 path = "src/mobile_use_mcp/controller.py"
 upstream_path = "minitap/mobile_use/controllers/android_controller.py; minitap/mobile_use/tools/utils.py"
 kind = "adapted"
-sha256 = "5b510b72e9760d62971a955cf41a8bdba28c3538bed051bd7bb77cf10e91c4c8"
+sha256 = "062cb5dc005d8dd6d700b9be71fbd40fa0ddd4136a23f692c4ded919568ba898"
 modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, MCP-safe results, independent observation components, and screenshot-only capture."
 
 [[files]]
