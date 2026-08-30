@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="fixture_primary">#1565C0</color>
+    <color name="fixture_primary_dark">#0D47A1</color>
+    <color name="fixture_background">#F7F9FC</color>
+    <color name="fixture_panel">#FFFFFF</color>
+    <color name="fixture_text">#1B2430</color>
+    <color name="fixture_muted">#566273</color>
+    <color name="fixture_accent">#E3F2FD</color>
+</resources>

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Android MCP Fixture</string>
+    <string name="fixture_title">Android MCP Fixture</string>
+    <string name="fixture_subtitle">Stable controls for public stdio acceptance</string>
+    <string name="change_button">Trigger UI change</string>
+    <string name="change_value_baseline">UI state: baseline</string>
+    <string name="change_value_changed">UI state: changed</string>
+    <string name="delayed_trigger">Reveal delayed element</string>
+    <string name="delayed_pending">Delayed element pending</string>
+    <string name="delayed_ready">Delayed element ready</string>
+    <string name="input_hint">Unicode input field</string>
+    <string name="reset_button">Reset fixture state</string>
+    <string name="scroll_top">Scroll position: top</string>
+    <string name="scroll_moved">Scroll position: moved</string>
+    <string name="status_ready">Fixture ready</string>
+    <string name="status_changed">Fixture state changed</string>
+    <string name="status_pending">Waiting for delayed content</string>
+    <string name="status_delayed">Delayed content is ready</string>
+    <string name="status_reset">Fixture reset</string>
+</resources>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="fixture_root" type="id" />
+    <item name="fixture_title" type="id" />
+    <item name="fixture_status" type="id" />
+    <item name="fixture_revision" type="id" />
+    <item name="fixture_change_button" type="id" />
+    <item name="fixture_change_value" type="id" />
+    <item name="fixture_delayed_trigger" type="id" />
+    <item name="fixture_delayed_element" type="id" />
+    <item name="fixture_text_input" type="id" />
+    <item name="fixture_reset_button" type="id" />
+    <item name="fixture_scroll_container" type="id" />
+    <item name="fixture_scroll_state" type="id" />
+</resources>

@@ -502,6 +502,31 @@ MOBILE_USE_ANDROID_SERIAL=ABC123 uv run pytest -m android
 Device tests are excluded from the default test run and require an explicit serial so the test
 suite never selects and operates a connected phone accidentally.
 
+### Public Android fixture acceptance
+
+The repository includes an OEM-independent, platform-view-only fixture under
+[`fixtures/android-fixture`](fixtures/android-fixture). It has stable resource IDs for a title,
+scrollable region, Unicode input field, delayed element, deterministic state-change trigger, and
+reset control. Build and install it on the explicitly selected device before running the real
+stdio flow:
+
+```bash
+cd fixtures/android-fixture
+gradle --no-daemon --console plain assembleDebug
+adb -s "$MOBILE_USE_ANDROID_SERIAL" install -r app/build/outputs/apk/debug/app-debug.apk
+cd ../..
+uv run python scripts/android_fixture_acceptance.py --serial "$MOBILE_USE_ANDROID_SERIAL"
+```
+
+The acceptance flow requires `--serial`; it never discovers and silently chooses a device. It
+starts a separate installed `mobile-use-mcp` process through the official MCP `ClientSession` and
+uses only public `android_*` tools after startup. The flow covers native PNG image content,
+snapshot paging, stale element rejection, a percentage swipe, UI-change and delayed-element
+condition waits, scoped app inventory, Unicode type/clear with non-echo assertions, session and
+screen-revision provenance, and unconditional fixture reset/Home/disconnect cleanup. To run the
+same flow against a wheel-installed command, pass its absolute entry point with
+`--server-command`.
+
 See [`COMPATIBILITY.md`](COMPATIBILITY.md) for current Codex, Claude Code, MCP client, and real
 device verification results.
 

@@ -9,10 +9,12 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+fixtures/android-fixture/.gradle/
+fixtures/android-fixture/local.properties
+fixtures/android-fixture/**/*.apk
 coverage.xml
 .coverage
 htmlcov/
 screenshots/
 traces/
 *.log
-

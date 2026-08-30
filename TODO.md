@@ -328,6 +328,19 @@ mobile-use-mcp/
 - [ ] HTTP MCP transport
 - [ ] 发布 PyPI 包
 
+## Production acceptance fixture
+
+- [x] Add an OEM-independent platform-view Android fixture with stable resource IDs, a scrollable
+  region, Unicode input, delayed content, deterministic UI changes, visible fixture revisions, and
+  a reset control.
+- [x] Add a real stdio `ClientSession` acceptance flow that requires an explicit serial and uses
+  only public `android_*` tools for connect, observation, actions, waits, cleanup, and disconnect.
+- [x] Assert native image content, immutable snapshot paging, stale-target rejection, percentage
+  coordinates, scoped app inventory, session/generation/screen-revision provenance, effect
+  verification, and sensitive-input non-echo.
+- [x] Use bounded stage/total deadlines and unconditional reset, Home, recording-stop, and
+  disconnect cleanup paths without arbitrary sleeps.
+
 ## 预计时间
 
 | 交付级别 | 预计时间 |
