@@ -127,6 +127,10 @@ mobile-use-mcp/
   - [x] 支持 `interactive_only`
   - [x] 支持 `max_elements`
 - [x] `android_screenshot`
+- [x] Snapshots carry session/generation/screen-revision provenance and capture timestamps
+- [x] Snapshot retention is bounded by entry count, bytes, and TTL with stale/expired diagnostics
+- [x] Identified snapshots remain immutable and pageable after later screen mutations
+- [x] Screenshot-only capture avoids hierarchy and foreground-App collection
 - [x] `android_get_ui_elements`
 - [x] `android_get_foreground_app`
 - [x] `android_list_apps`

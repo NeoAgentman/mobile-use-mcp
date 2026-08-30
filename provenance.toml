@@ -13,15 +13,15 @@ review_note = "This is a source ancestry and notice record, not a legal conclusi
 path = "src/mobile_use_mcp/android_client.py"
 upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
 kind = "adapted"
-sha256 = "3629623baeb81377e99416d5092eab639ad27e26affb9350c423d92018a5620b"
-modification_statement = "Significantly rewritten for the local MCP session boundary, configured ADB endpoint, bounded reconnect, and secret-safe text handling."
+sha256 = "1d1f1df45a5cce9a5b64c7a9bb9e8b4a7ef5f18ac84c120e6aee67654e99568f"
+modification_statement = "Significantly rewritten for the local MCP session boundary, configured ADB endpoint, bounded reconnect, secret-safe text handling, and hierarchy-free screenshot capture."
 
 [[files]]
 path = "src/mobile_use_mcp/controller.py"
 upstream_path = "minitap/mobile_use/controllers/android_controller.py; minitap/mobile_use/tools/utils.py"
 kind = "adapted"
-sha256 = "d5210436f7b3bd9a3a7cb925b0597db923ef343c7daa25d3cf4c4c5d0d11c808"
-modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, and MCP-safe results."
+sha256 = "28a9d5a68cda97634c04e1ec3bd0680764752d1aae2d100281a749efd0f27aaa"
+modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, MCP-safe results, independent observation components, and screenshot-only capture."
 
 [[files]]
 path = "src/mobile_use_mcp/selectors.py"
@@ -34,8 +34,8 @@ modification_statement = "Significantly rewritten into a small Android selector 
 path = "src/mobile_use_mcp/snapshot.py"
 upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
 kind = "adapted"
-sha256 = "7cf052f972ffcecc9fff7f017ad0b67fae249831436391e3ac9745642bef5359"
-modification_statement = "Significantly rewritten to normalize and bound Android hierarchy output for the MCP schema."
+sha256 = "ade14d24568f050ca2b9eae4e697048dc36ecebe29baaa0063ab0a52d5f2e0f9"
+modification_statement = "Significantly rewritten to normalize and bound Android hierarchy output and retain immutable revision-aware observations for the MCP schema."
 
 [[files]]
 path = "src/mobile_use_mcp/recording.py"

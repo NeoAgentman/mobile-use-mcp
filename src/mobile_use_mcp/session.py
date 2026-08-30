@@ -25,9 +25,11 @@ from mobile_use_mcp.models import (
     ScreenSnapshot,
     SessionConnection,
     SessionLifecycle,
+    SnapshotContext,
 )
 from mobile_use_mcp.operations import OperationContext, OperationGateway, current_operation
 from mobile_use_mcp.processes import run_blocking
+from mobile_use_mcp.snapshot import SnapshotStore
 
 ControllerFactory = Callable[[str], AndroidController]
 
@@ -112,6 +114,7 @@ class DeviceSession:
         controller_factory: ControllerFactory = AndroidController,
         *,
         config: RuntimeConfig | None = None,
+        snapshot_store: SnapshotStore | None = None,
     ):
         self.config = config or RuntimeConfig.defaults()
         self.registry = registry or DeviceRegistry(config=self.config)
@@ -126,8 +129,19 @@ class DeviceSession:
         self.controller_factory = controller_impl
         self._device: DeviceInfo | None = None
         self._controller: AndroidController | None = None
+        self._snapshot_store = snapshot_store or SnapshotStore(
+            max_entries=self.config.snapshot_max_entries,
+            max_bytes=self.config.snapshot_max_bytes,
+            ttl_seconds=self.config.snapshot_ttl_seconds,
+        )
+        # ``_snapshot_id`` and ``_snapshot`` remain compatibility pointers to
+        # the latest committed observation.  The store itself retains older
+        # immutable observations until TTL or capacity eviction.
         self._snapshot_id: str | None = None
         self._snapshot: ScreenSnapshot | None = None
+        self._legacy_snapshot_input: ScreenSnapshot | None = None
+        self._current_snapshot_revision_managed = False
+        self._screen_revision = 0
 
         self._state = SessionLifecycle.DISCONNECTED
         self._session_id: str | None = None
@@ -254,6 +268,44 @@ class DeviceSession:
     def last_generation(self) -> int | None:
         with self._state_lock:
             return self._generation_counter or None
+
+    @property
+    def screen_revision(self) -> int:
+        """Current monotonic screen revision for the active session."""
+
+        with self._state_lock:
+            return self._screen_revision
+
+    @property
+    def revision(self) -> int:
+        """Compatibility alias for :attr:`screen_revision`."""
+
+        return self.screen_revision
+
+    @property
+    def current_snapshot_id(self) -> str | None:
+        with self._state_lock:
+            return self._snapshot_id
+
+    @property
+    def snapshot_store(self) -> SnapshotStore:
+        """Expose the bounded store for diagnostics and embedders."""
+
+        return self._snapshot_store
+
+    def observation_context(self) -> SnapshotContext:
+        """Capture the session context before starting a possibly slow read."""
+
+        with self._state_lock:
+            return SnapshotContext(
+                session_id=self._session_id,
+                generation=self._generation,
+                screen_revision=self._screen_revision,
+            )
+
+    # ``snapshot_context`` is intentionally a named alias: callers that use
+    # either observation terminology can share the same race-safe seam.
+    snapshot_context = observation_context
 
     @property
     def active_operation_id(self) -> str | None:
@@ -456,6 +508,7 @@ class DeviceSession:
             self._last_error = _lifecycle_error(error)
             self._device = None
             self._controller = None
+            self._screen_revision = 0
             self._clear_snapshot_unchecked()
 
     def _commit_connection_locked(
@@ -468,6 +521,7 @@ class DeviceSession:
         self._session_id = _new_session_id()
         self._device = selected
         self._controller = controller
+        self._screen_revision = 0
         self._state = SessionLifecycle.READY
         self._last_error = None
         self._clear_snapshot_unchecked()
@@ -486,6 +540,7 @@ class DeviceSession:
         self._device = None
         self._session_id = None
         self._generation = None
+        self._screen_revision = 0
         self._clear_snapshot_unchecked()
         return controller
 
@@ -499,16 +554,119 @@ class DeviceSession:
         snapshot: ScreenSnapshot,
         *,
         operation: OperationContext | None = None,
+        expected_context: SnapshotContext | None = None,
+        expected_session_id: str | None = None,
+        expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        expected_screen_revision: int | None = None,
     ) -> str:
-        """Replace the one-entry snapshot cache and return its opaque identifier."""
+        """Commit one observation if its capture context is still current.
+
+        The expected context is optional for compatibility with direct core
+        callers.  Public snapshot capture supplies it immediately before the
+        adapter read; a later screen mutation then rejects that late result
+        instead of allowing it to become the current observation.
+        """
 
         active_operation = _effective_operation(operation)
+        alias_revision = (
+            expected_screen_revision
+            if expected_screen_revision is not None
+            else expected_revision
+        )
 
         def store() -> str:
             with self._state_lock:
-                self._snapshot_id = f"s-{uuid4().hex}"
-                self._snapshot = snapshot
-                return self._snapshot_id
+                current = SnapshotContext(
+                    session_id=self._session_id,
+                    generation=self._generation,
+                    screen_revision=self._screen_revision,
+                )
+                context_mismatch = expected_context is not None and current != expected_context
+                alias_mismatch = (
+                    expected_context is None
+                    and (
+                        (expected_session_id is not None
+                         and current.session_id != expected_session_id)
+                        or (expected_generation is not None
+                            and current.generation != expected_generation)
+                        or (alias_revision is not None
+                            and current.screen_revision != alias_revision)
+                    )
+                )
+                if context_mismatch or alias_mismatch:
+                    expected_sid = (
+                        expected_context.session_id
+                        if expected_context is not None
+                        else expected_session_id
+                    )
+                    expected_gen = (
+                        expected_context.generation
+                        if expected_context is not None
+                        else expected_generation
+                    )
+                    expected_rev = (
+                        expected_context.screen_revision
+                        if expected_context is not None
+                        else alias_revision
+                    )
+                    raise MobileUseError(
+                        ErrorCode.SNAPSHOT_STALE,
+                        "The Android observation finished after the screen changed.",
+                        "Discard this observation and call android_snapshot again.",
+                        data={
+                            "expected_session_id": expected_sid,
+                            "current_session_id": current.session_id,
+                            "expected_generation": expected_gen,
+                            "current_generation": current.generation,
+                            "expected_screen_revision": expected_rev,
+                            "current_screen_revision": current.screen_revision,
+                        },
+                    )
+
+                stamped = snapshot.model_copy(deep=True)
+                stamped.session_id = current.session_id
+                stamped.generation = current.generation
+                stamped.screen_revision = current.screen_revision
+                # The store owns the opaque identifier.  A caller-provided ID
+                # must never allow an observation to overwrite another entry.
+                stamped.snapshot_id = None
+
+                # Preserve the identity behavior of the old unbound core API
+                # only for the exact same object stored twice.  MCP captures
+                # are always session-bound and take the immutable path.
+                repeated_legacy = (
+                    current.session_id is None
+                    and expected_context is None
+                    and expected_session_id is None
+                    and expected_generation is None
+                    and alias_revision is None
+                    and self._legacy_snapshot_input is snapshot
+                    and self._snapshot_id is not None
+                )
+                if repeated_legacy:
+                    previous_id = self._snapshot_id
+                    assert previous_id is not None
+                    self._snapshot_store.forget(previous_id)
+                    stamped = snapshot
+                    stamped.session_id = None
+                    stamped.generation = None
+                    stamped.screen_revision = 0
+                    stored = self._snapshot_store.put(stamped, clone=False)
+                else:
+                    stored = self._snapshot_store.put(stamped)
+                    # Publish the provenance on the caller's result object as
+                    # well.  The store retained a deep copy, so this
+                    # convenience mutation cannot make its entry mutable.
+                    snapshot.session_id = current.session_id
+                    snapshot.generation = current.generation
+                    snapshot.screen_revision = current.screen_revision
+                    snapshot.snapshot_id = stored.snapshot_id
+                self._legacy_snapshot_input = snapshot
+                self._snapshot_id = stored.snapshot_id
+                self._snapshot = stored
+                self._current_snapshot_revision_managed = expected_context is not None
+                return cast(str, stored.snapshot_id)
 
         return cast(str, _commit(active_operation, store, "snapshot_commit"))
 
@@ -518,32 +676,100 @@ class DeviceSession:
         *,
         operation: OperationContext | None = None,
     ) -> ScreenSnapshot:
-        """Return the cached snapshot or reject an expired/unknown identifier."""
+        """Return one immutable identified observation.
+
+        Older revisions remain readable.  A snapshot from another connected
+        session is reported as stale even when it has not reached store
+        capacity, preventing cross-device reuse of an opaque ID.
+        """
 
         active_operation = _effective_operation(operation)
         _checkpoint(active_operation, "snapshot_read")
         with self._state_lock:
-            if self._snapshot_id != snapshot_id or self._snapshot is None:
+            snapshot = self._snapshot_store.get(
+                snapshot_id,
+                clone=not (
+                    self._legacy_snapshot_input is not None
+                    and self._snapshot_id == snapshot_id
+                    and self._session_id is None
+                ),
+            )
+            if snapshot.session_id is not None and snapshot.session_id != self._session_id:
                 raise MobileUseError(
-                    ErrorCode.SNAPSHOT_NOT_FOUND,
-                    f"Android snapshot {snapshot_id!r} is no longer available.",
+                    ErrorCode.SNAPSHOT_STALE,
+                    f"Android snapshot {snapshot_id!r} belongs to an earlier Android session.",
                     "Call android_snapshot to capture the current screen and use its new "
                     "snapshot_id.",
+                    data={
+                        "snapshot_id": snapshot_id,
+                        "snapshot_session_id": snapshot.session_id,
+                        "current_session_id": self._session_id,
+                    },
                 )
-            snapshot = self._snapshot
         _checkpoint(active_operation, "snapshot_read")
         return snapshot
 
     def clear_snapshot(self, *, operation: OperationContext | None = None) -> None:
-        """Invalidate cached observation state for the current operation."""
+        """Advance the screen revision and clear only the current pointer.
+
+        Calls from the operation gateway represent a known screen-changing
+        operation.  Direct legacy callers retain the old explicit-clear
+        behavior and remove only the current entry.
+        """
 
         active_operation = _effective_operation(operation)
-        _commit(active_operation, self._clear_snapshot_unchecked, "snapshot_invalidate")
+        if active_operation is None:
+            with self._state_lock:
+                current_id = self._snapshot_id
+                self._clear_snapshot_unchecked()
+                if current_id is not None:
+                    self._snapshot_store.forget(current_id)
+                self._screen_revision += 1
+            return
+        # Legacy direct callers can still store an unbound snapshot while no
+        # device session exists.  Such entries never had revision provenance,
+        # so retain the old invalidation behavior for them; session-bound
+        # public observations remain pageable after a mutation.
+        with self._state_lock:
+            current_id = self._snapshot_id
+            current_snapshot = self._snapshot
+            if (
+                current_id is not None
+                and current_snapshot is not None
+                and current_snapshot.session_id is None
+                and not self._current_snapshot_revision_managed
+            ):
+                self._snapshot_store.forget(current_id)
+        self.advance_screen_revision(operation=active_operation)
 
     def _clear_snapshot_unchecked(self) -> None:
         with self._state_lock:
             self._snapshot_id = None
             self._snapshot = None
+            self._current_snapshot_revision_managed = False
+
+    def advance_screen_revision(
+        self,
+        reason: str | None = None,
+        *,
+        operation: OperationContext | None = None,
+    ) -> int:
+        """Advance revision before dispatching a known screen mutation."""
+
+        del reason  # Reserved for future local diagnostics; never log content.
+        active_operation = _effective_operation(operation)
+
+        def advance() -> int:
+            with self._state_lock:
+                self._screen_revision += 1
+                self._clear_snapshot_unchecked()
+                return self._screen_revision
+
+        return cast(int, _commit(active_operation, advance, "screen_revision"))
+
+    # Descriptive aliases used by embedders and tests.
+    advance_revision = advance_screen_revision
+    mark_screen_changed = advance_screen_revision
 
     def require_controller(
         self,
@@ -662,6 +888,9 @@ class DeviceSession:
                 device=device,
                 connected=connected,
                 active_operation_id=self._active_operation_id,
+                screen_revision=self._screen_revision,
+                current_snapshot_id=self._snapshot_id,
+                snapshot_store=self._snapshot_store.stats(),
                 last_error=last_error,
                 error_code=last_error.code if last_error else None,
                 category=last_error.category if last_error else None,

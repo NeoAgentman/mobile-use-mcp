@@ -1,8 +1,9 @@
 """Validated data models shared by the Android core and MCP tools."""
 
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -156,12 +157,106 @@ class AppLaunchResult(StrictModel):
 
 
 class ScreenSnapshot(StrictModel):
-    serial: str
+    """One immutable-in-storage Android observation.
+
+    The capture context is deliberately part of the observation rather than
+    being kept only in the session cache.  This lets callers safely page an
+    identified observation while a later operation moves the screen on.
+    ``None`` values keep the core model source-compatible with callers that
+    construct a snapshot before a :class:`DeviceSession` has stamped it.
+    """
+
+    serial: str = Field(min_length=1, max_length=256)
     width: int = Field(gt=0)
     height: int = Field(gt=0)
     screenshot_png: bytes
     elements: list[UIElement]
     foreground_app: ForegroundApp
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    screen_revision: int = Field(
+        default=0,
+        ge=0,
+        description="Monotonic screen revision within the connected session.",
+    )
+    captured_at: datetime = Field(
+        default_factory=lambda: datetime.now(UTC),
+        description="UTC timestamp at which this observation was captured.",
+    )
+    snapshot_id: str | None = Field(default=None, max_length=128)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+
+    @property
+    def revision(self) -> int:
+        """Convenience alias for integrations that call it a revision."""
+
+        return self.screen_revision
+
+    @property
+    def capture_time(self) -> datetime:
+        """Compatibility alias for the public capture timestamp."""
+
+        return self.captured_at
+
+
+class SnapshotContext(StrictModel):
+    """Capture provenance used to reject a late observation commit."""
+
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    screen_revision: int = Field(default=0, ge=0)
+
+    @property
+    def revision(self) -> int:
+        return self.screen_revision
+
+
+class ScreenshotCapture(StrictModel):
+    """The hierarchy-free result of one native Android screenshot read."""
+
+    serial: str = Field(min_length=1, max_length=256)
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    screenshot_png: bytes
+
+
+class ScreenshotResult(StrictModel):
+    """Typed metadata accompanying a hierarchy-free MCP image."""
+
+    success: bool
+    operation_id: str = Field(min_length=1, max_length=128)
+    serial: str = Field(min_length=1, max_length=256)
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    screen_revision: int = Field(default=0, ge=0)
+    captured_at: datetime
+    width: int = Field(gt=0)
+    height: int = Field(gt=0)
+    image_format: Literal["png", "jpeg"]
+    image_quality: int | None = Field(default=None, ge=1, le=100)
+    image_lossless: bool
+    image_width: int = Field(gt=0)
+    image_height: int = Field(gt=0)
+    quality_notice: str
+    lossless_fallback: dict[str, Any] | None = None
+    hierarchy_collected: bool = False
+    foreground_app_collected: bool = False
+
+
+class SnapshotResult(ScreenshotResult):
+    """Typed metadata for an immutable, pageable Android snapshot."""
+
+    snapshot_id: str = Field(min_length=1, max_length=128)
+    detail_level: Literal["compact", "full"]
+    foreground_app: ForegroundApp
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+    total_elements: int = Field(ge=0)
+    returned_elements: int = Field(ge=0)
+    element_count: int = Field(ge=0)
+    truncated: bool
+    next_offset: int | None = Field(default=None, ge=0)
+    full_fallback: dict[str, Any] | None = None
+    elements: list[UIElement] = Field(default_factory=lambda: [])
 
 
 class SelectorAttempt(StrictModel):
@@ -272,6 +367,9 @@ class DeviceStatusResult(LifecycleResult):
     """Typed, privacy-safe view of the current Android session state."""
 
     active_operation_id: str | None = Field(default=None, max_length=128)
+    screen_revision: int = Field(default=0, ge=0)
+    current_snapshot_id: str | None = Field(default=None, max_length=128)
+    snapshot_store: dict[str, int | float] = Field(default_factory=dict)
     last_error: LifecycleError | None = None
 
 

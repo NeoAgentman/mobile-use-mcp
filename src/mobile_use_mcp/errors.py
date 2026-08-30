@@ -23,6 +23,9 @@ class ErrorCode(StrEnum):
     BUSY = "BUSY"
     UNSUPPORTED = "UNSUPPORTED"
     SNAPSHOT_NOT_FOUND = "SNAPSHOT_NOT_FOUND"
+    SNAPSHOT_EXPIRED = "SNAPSHOT_EXPIRED"
+    SNAPSHOT_STALE = "SNAPSHOT_STALE"
+    SNAPSHOT_TOO_LARGE = "SNAPSHOT_TOO_LARGE"
 
 
 class ErrorCategory(StrEnum):
@@ -44,6 +47,9 @@ _ERROR_CATEGORIES: dict[ErrorCode, ErrorCategory] = {
     ErrorCode.MULTIPLE_DEVICES: ErrorCategory.CONNECTION,
     ErrorCode.NOT_CONNECTED: ErrorCategory.SESSION,
     ErrorCode.SNAPSHOT_NOT_FOUND: ErrorCategory.SESSION,
+    ErrorCode.SNAPSHOT_EXPIRED: ErrorCategory.SESSION,
+    ErrorCode.SNAPSHOT_STALE: ErrorCategory.SESSION,
+    ErrorCode.SNAPSHOT_TOO_LARGE: ErrorCategory.SESSION,
     ErrorCode.OPERATION_FAILED: ErrorCategory.OPERATION,
     ErrorCode.TIMEOUT: ErrorCategory.OPERATION,
     ErrorCode.CANCELLED: ErrorCategory.OPERATION,

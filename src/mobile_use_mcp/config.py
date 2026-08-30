@@ -24,6 +24,9 @@ DEFAULT_OPERATION_TIMEOUT_SECONDS = 30.0
 DEFAULT_QUEUE_TIMEOUT_SECONDS = 5.0
 DEFAULT_SNAPSHOT_MAX_ELEMENTS = 200
 DEFAULT_SNAPSHOT_MAX_TEXT_LENGTH = 500
+DEFAULT_SNAPSHOT_MAX_ENTRIES = 8
+DEFAULT_SNAPSHOT_MAX_BYTES = 64 * 1024 * 1024
+DEFAULT_SNAPSHOT_TTL_SECONDS = 5 * 60
 DEFAULT_PAYLOAD_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 10.0
 DEFAULT_SUBPROCESS_MAX_OUTPUT_BYTES = 1 * 1024 * 1024
@@ -83,6 +86,38 @@ class RuntimeConfig(BaseModel):
     snapshot_max_elements: int = Field(default=DEFAULT_SNAPSHOT_MAX_ELEMENTS, ge=1, le=10_000)
     snapshot_max_text_length: int = Field(
         default=DEFAULT_SNAPSHOT_MAX_TEXT_LENGTH, ge=1, le=100_000
+    )
+    snapshot_max_entries: int = Field(
+        default=DEFAULT_SNAPSHOT_MAX_ENTRIES,
+        ge=1,
+        le=10_000,
+        validation_alias=AliasChoices(
+            "snapshot_max_entries",
+            "snapshot_max_count",
+            "snapshot_cache_max_entries",
+            "snapshot_store_max_entries",
+        ),
+    )
+    snapshot_max_bytes: int = Field(
+        default=DEFAULT_SNAPSHOT_MAX_BYTES,
+        ge=1,
+        le=10 * 1024 * 1024 * 1024,
+        validation_alias=AliasChoices(
+            "snapshot_max_bytes",
+            "snapshot_cache_max_bytes",
+            "snapshot_store_max_bytes",
+        ),
+    )
+    snapshot_ttl_seconds: float = Field(
+        default=DEFAULT_SNAPSHOT_TTL_SECONDS,
+        ge=0,
+        le=31_536_000,
+        validation_alias=AliasChoices(
+            "snapshot_ttl_seconds",
+            "snapshot_retention_seconds",
+            "snapshot_cache_ttl_seconds",
+            "snapshot_store_ttl_seconds",
+        ),
     )
     payload_max_bytes: int = Field(
         default=DEFAULT_PAYLOAD_MAX_BYTES, ge=1, le=100 * 1024 * 1024
@@ -149,6 +184,28 @@ class RuntimeConfig(BaseModel):
         "snapshot_max_text_length": (
             "MOBILE_USE_SNAPSHOT_MAX_TEXT_LENGTH",
             "MOBILE_USE_MCP_SNAPSHOT_MAX_TEXT_LENGTH",
+        ),
+        "snapshot_max_entries": (
+            "MOBILE_USE_SNAPSHOT_MAX_ENTRIES",
+            "MOBILE_USE_SNAPSHOT_MAX_COUNT",
+            "MOBILE_USE_SNAPSHOT_CACHE_MAX_ENTRIES",
+            "MOBILE_USE_SNAPSHOT_STORE_MAX_ENTRIES",
+            "MOBILE_USE_MCP_SNAPSHOT_MAX_ENTRIES",
+            "MOBILE_USE_MCP_SNAPSHOT_MAX_COUNT",
+        ),
+        "snapshot_max_bytes": (
+            "MOBILE_USE_SNAPSHOT_MAX_BYTES",
+            "MOBILE_USE_SNAPSHOT_CACHE_MAX_BYTES",
+            "MOBILE_USE_SNAPSHOT_STORE_MAX_BYTES",
+            "MOBILE_USE_MCP_SNAPSHOT_MAX_BYTES",
+        ),
+        "snapshot_ttl_seconds": (
+            "MOBILE_USE_SNAPSHOT_TTL_SECONDS",
+            "MOBILE_USE_SNAPSHOT_RETENTION_SECONDS",
+            "MOBILE_USE_SNAPSHOT_CACHE_TTL_SECONDS",
+            "MOBILE_USE_SNAPSHOT_STORE_TTL_SECONDS",
+            "MOBILE_USE_MCP_SNAPSHOT_TTL_SECONDS",
+            "MOBILE_USE_MCP_SNAPSHOT_RETENTION_SECONDS",
         ),
         "payload_max_bytes": (
             "MOBILE_USE_PAYLOAD_MAX_BYTES",
@@ -280,6 +337,18 @@ class RuntimeConfig(BaseModel):
     @property
     def queue_timeout(self) -> float:
         return self.queue_timeout_seconds
+
+    @property
+    def snapshot_max_count(self) -> int:
+        """Compatibility alias for entry-count terminology."""
+
+        return self.snapshot_max_entries
+
+    @property
+    def snapshot_retention_seconds(self) -> float:
+        """Compatibility alias for TTL terminology."""
+
+        return self.snapshot_ttl_seconds
 
 
 def load_runtime_config(environ: Mapping[str, str] | None = None) -> RuntimeConfig:

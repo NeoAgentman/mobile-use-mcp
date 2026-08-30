@@ -15,6 +15,7 @@ from mobile_use_mcp.models import (
     AppLaunchAttempt,
     AppLaunchResult,
     ForegroundApp,
+    ScreenshotCapture,
     ScreenSnapshot,
     Target,
 )
@@ -70,6 +71,22 @@ def _default_adb_connector(
             socket_timeout=runtime.subprocess_timeout_seconds,
         ).device(serial=serial),
     )
+
+
+def _optional_method(instance: Any, name: str) -> Callable[..., Any] | None:
+    """Read an optional adapter method without accepting mock auto-attrs."""
+
+    candidate = getattr(instance, name, None)
+    if not callable(candidate):
+        return None
+    owner_type = cast(type[Any], type(instance))
+    if (
+        getattr(owner_type, name, None) is not None
+        or name in getattr(instance, "__dict__", {})
+        or hasattr(candidate, "assert_awaited")
+    ):
+        return candidate
+    return None
 
 
 class AndroidController:
@@ -141,24 +158,90 @@ class AndroidController:
         max_elements: int | None = 200,
         max_text_length: int = 500,
     ) -> ScreenSnapshot:
-        screenshot, hierarchy, width, height = await self._call_blocking(
-            self.android_client.get_screen
-        )
-        elements = parse_hierarchy(
-            hierarchy,
-            interactive_only=interactive_only,
-            max_elements=max_elements,
-            max_text_length=max_text_length,
-        )
-        foreground = await self.get_foreground_app()
+        """Capture a coherent best-effort observation.
+
+        Pixels are the required component.  Accessibility hierarchy and
+        foreground-app reads are optional so a transient failure in either
+        does not discard an otherwise useful screenshot.  The warning strings
+        are stable and deliberately omit raw adapter exception details.
+        """
+
+        capture = await self.screenshot()
+        warnings: list[str] = []
+        elements = []
+        try:
+            hierarchy_reader = _optional_method(self.android_client, "get_hierarchy")
+            if hierarchy_reader is None:
+                # Keep compatibility with injected clients predating the
+                # hierarchy-free screenshot method.
+                legacy = await self._call_blocking(self.android_client.get_screen)
+                hierarchy = legacy[1]
+            else:
+                hierarchy = await self._call_blocking(hierarchy_reader)
+            elements = parse_hierarchy(
+                hierarchy,
+                interactive_only=interactive_only,
+                max_elements=max_elements,
+                max_text_length=max_text_length,
+            )
+        except Exception:
+            warnings.append(
+                "HIERARCHY_UNAVAILABLE: Android UI hierarchy could not be collected."
+            )
+        try:
+            foreground = await self._read_foreground_app()
+        except Exception:
+            foreground = ForegroundApp()
+            warnings.append(
+                "FOREGROUND_APP_UNAVAILABLE: Android foreground app could not be collected."
+            )
         return ScreenSnapshot(
             serial=self.serial,
-            width=width,
-            height=height,
-            screenshot_png=screenshot,
+            width=capture.width,
+            height=capture.height,
+            screenshot_png=capture.screenshot_png,
             elements=elements,
             foreground_app=foreground,
+            warnings=warnings,
         )
+
+    async def screenshot(self) -> ScreenshotCapture:
+        """Capture only native pixels; never request hierarchy or foreground app."""
+
+        screenshot_reader = _optional_method(self.android_client, "get_screenshot")
+        if screenshot_reader is not None:
+            result = await self._call_blocking(screenshot_reader)
+            if isinstance(result, ScreenshotCapture):
+                return result
+            if isinstance(result, tuple):
+                result_tuple = cast(tuple[object, ...], result)
+                if len(result_tuple) != 3:
+                    result_tuple = ()
+            else:
+                result_tuple = ()
+            if len(result_tuple) == 3:
+                screenshot, width, height = cast(tuple[bytes, int, int], result_tuple)
+                return ScreenshotCapture(
+                    serial=self.serial,
+                    screenshot_png=screenshot,
+                    width=width,
+                    height=height,
+                )
+        # Compatibility path for an injected pre-T06 AndroidClient.  The
+        # production client always takes the hierarchy-free branch above.
+        legacy = await self._call_blocking(self.android_client.get_screen)
+        screenshot, _hierarchy, width, height = legacy
+        return ScreenshotCapture(
+            serial=self.serial,
+            screenshot_png=screenshot,
+            width=width,
+            height=height,
+        )
+
+    async def capture_screenshot(self) -> ScreenshotCapture:
+        """Explicit alias for callers that prefer a capture verb."""
+
+        return await self.screenshot()
 
     async def tap(self, target: Target) -> dict[str, object]:
         snapshot = await self.snapshot()
@@ -378,10 +461,26 @@ class AndroidController:
 
     async def get_foreground_app(self) -> ForegroundApp:
         try:
-            current = await self._call_blocking(self.adb_device.app_current)
+            return await self._read_foreground_app()
         except Exception:
+            # A standalone foreground query preserves its historical safe
+            # empty result.  Combined snapshots call the raising helper so
+            # they can expose a component warning instead.
             return ForegroundApp()
-        return ForegroundApp(package=current.package or None, activity=current.activity or None)
+
+    async def _read_foreground_app(self) -> ForegroundApp:
+        """Read foreground state and preserve adapter failures for callers."""
+
+        current = await self._call_blocking(self.adb_device.app_current)
+        if current is None:
+            raise RuntimeError("foreground app state was unavailable")
+        package = getattr(current, "package", None)
+        activity = getattr(current, "activity", None)
+        if package is not None and not isinstance(package, str):
+            raise RuntimeError("invalid foreground package")
+        if activity is not None and not isinstance(activity, str):
+            raise RuntimeError("invalid foreground activity")
+        return ForegroundApp(package=package or None, activity=activity or None)
 
     async def list_apps(self, query: str | None = None, limit: int = 100) -> list[str]:
         output = await self._call_blocking(

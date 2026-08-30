@@ -139,14 +139,27 @@ class AndroidClient:
         return device
 
     def get_screen(self) -> tuple[bytes, str, int, int]:
+        """Capture the legacy screenshot-plus-hierarchy pair."""
+
+        screenshot, width, height = self.get_screenshot()
+        hierarchy = self.get_hierarchy()
+        return screenshot, hierarchy, width, height
+
+    def get_screenshot(self) -> tuple[bytes, int, int]:
+        """Capture native pixels without requesting accessibility hierarchy."""
+
         device = self.ensure_connected()
         screenshot = device.screenshot()
         if screenshot is None:
             raise RuntimeError("uiautomator2 failed to capture a screenshot")
-        hierarchy = device.dump_hierarchy(compressed=True)
         buffer = BytesIO()
         screenshot.save(buffer, format="PNG")
-        return buffer.getvalue(), hierarchy, screenshot.width, screenshot.height
+        return buffer.getvalue(), screenshot.width, screenshot.height
+
+    def get_hierarchy(self) -> str:
+        """Read the accessibility hierarchy as a separate optional component."""
+
+        return self.ensure_connected().dump_hierarchy(compressed=True)
 
     def get_screenshot_base64(self) -> str:
         screenshot, _, _, _ = self.get_screen()

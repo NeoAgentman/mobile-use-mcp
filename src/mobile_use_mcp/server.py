@@ -5,6 +5,8 @@ import signal
 import sys
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
+from inspect import isawaitable
 from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
@@ -32,8 +34,12 @@ from mobile_use_mcp.models import (
     LifecycleError,
     LifecycleResult,
     OperationResult,
+    ScreenshotCapture,
+    ScreenshotResult,
+    ScreenSnapshot,
     SessionConnection,
     SessionLifecycle,
+    SnapshotResult,
     Target,
     UIElement,
 )
@@ -221,6 +227,65 @@ def _image_delivery_metadata(
             "arguments": {"image_format": "png"},
         },
     }
+
+
+async def _capture_screenshot_only(controller: Any) -> ScreenshotCapture:
+    """Use the hierarchy-free controller seam with legacy fake fallback.
+
+    ``Mock`` instances dynamically manufacture attributes, so merely calling
+    ``getattr(controller, "screenshot")`` would make old tests accidentally
+    take a mock path.  Concrete controller methods and explicitly configured
+    async test methods are both accepted; an unconfigured legacy fake falls
+    back to its existing combined snapshot method.
+    """
+
+    def available(name: str) -> Any:
+        instance_method = getattr(controller, name, None)
+        controller_type = cast(type[Any], type(controller))
+        if (
+            getattr(controller_type, name, None) is not None
+            or name in getattr(controller, "__dict__", {})
+        ):
+            return instance_method
+        if hasattr(instance_method, "assert_awaited"):
+            return instance_method
+        return None
+
+    method = available("capture_screenshot") or available("screenshot")
+    if method is not None:
+        result = method()
+        if isawaitable(result):
+            result = await result
+        if isinstance(result, ScreenshotCapture):
+            return result
+        if isinstance(result, tuple):
+            result_tuple = cast(tuple[object, ...], result)
+            if len(result_tuple) != 3:
+                result_tuple = ()
+        else:
+            result_tuple = ()
+        if len(result_tuple) == 3:
+            screenshot, width, height = cast(tuple[bytes, int, int], result_tuple)
+            return ScreenshotCapture(
+                serial=str(getattr(controller, "serial", "android")),
+                screenshot_png=screenshot,
+                width=width,
+                height=height,
+            )
+
+    # Source-compatible fallback for an injected pre-revision controller.
+    legacy = controller.snapshot
+    result = legacy()
+    if isawaitable(result):
+        result = await result
+    if isinstance(result, ScreenSnapshot):
+        return ScreenshotCapture(
+            serial=result.serial,
+            screenshot_png=result.screenshot_png,
+            width=result.width,
+            height=result.height,
+        )
+    raise TypeError("Android controller did not return screenshot data")
 
 
 @mcp.tool(
@@ -581,6 +646,10 @@ async def android_snapshot(
     try:
         async def capture(context: Any) -> tuple[Any, str]:
             context.checkpoint("observation")
+            # Take provenance before the potentially slow Android read.  A
+            # mutation that advances the revision before this callback
+            # commits will reject the late observation.
+            observation_context = session.observation_context()
             controller = session.require_controller()
             snapshot = await controller.snapshot(
                 interactive_only=interactive_only,
@@ -588,8 +657,11 @@ async def android_snapshot(
                 max_text_length=effective_max_text_length,
             )
             context.checkpoint("snapshot_commit")
-            snapshot_id = session.store_snapshot(snapshot)
-            return snapshot, snapshot_id
+            snapshot_id = session.store_snapshot(
+                snapshot,
+                expected_context=observation_context,
+            )
+            return session.get_snapshot(snapshot_id), snapshot_id
 
         snapshot, snapshot_id = await session.run_operation(
             "snapshot",
@@ -630,30 +702,42 @@ async def android_snapshot(
         image_format=image_format,
         image_quality=image_quality,
     )
-    metadata = {
-        "success": True,
-        "snapshot_id": snapshot_id,
-        "detail_level": detail_level,
-        "serial": snapshot.serial,
-        "width": snapshot.width,
-        "height": snapshot.height,
-        "image_format": image_format,
-        "image_width": image_width,
-        "image_height": image_height,
+    metadata = SnapshotResult(
+        success=True,
+        snapshot_id=snapshot_id,
+        operation_id=operation_id,
+        session_id=snapshot.session_id,
+        generation=snapshot.generation,
+        screen_revision=snapshot.screen_revision,
+        captured_at=snapshot.captured_at,
+        detail_level=detail_level,
+        serial=snapshot.serial,
+        width=snapshot.width,
+        height=snapshot.height,
+        image_format=image_format,
+        image_width=image_width,
+        image_height=image_height,
         **_image_delivery_metadata("android_snapshot", image_format, image_quality),
-        "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
-        "total_elements": total_elements,
-        "returned_elements": len(returned_elements),
-        "element_count": len(returned_elements),
-        "truncated": truncated,
-        "next_offset": len(returned_elements) if truncated else None,
-        "full_fallback": (
+        hierarchy_collected=not any(
+            warning.startswith("HIERARCHY_UNAVAILABLE") for warning in snapshot.warnings
+        ),
+        foreground_app_collected=not any(
+            warning.startswith("FOREGROUND_APP_UNAVAILABLE") for warning in snapshot.warnings
+        ),
+        foreground_app=snapshot.foreground_app,
+        warnings=snapshot.warnings,
+        total_elements=total_elements,
+        returned_elements=len(returned_elements),
+        element_count=len(returned_elements),
+        truncated=truncated,
+        next_offset=len(returned_elements) if truncated else None,
+        full_fallback=(
             {"tool": "android_snapshot", "arguments": {"detail_level": "full"}}
             if truncated
             else None
         ),
-        "elements": [element.model_dump(mode="json") for element in returned_elements],
-    }
+        elements=returned_elements,
+    ).model_dump(mode="json")
     return CallToolResult(
         content=[
             TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
@@ -686,12 +770,11 @@ async def android_screenshot(
 
     operation_id = session.new_operation_id()
     try:
-        async def capture(_context: Any) -> Any:
-            return await session.require_controller().snapshot(
-                interactive_only=True,
-                max_elements=1,
-                max_text_length=1,
-            )
+        async def capture(_context: Any) -> ScreenshotCapture:
+            # This path intentionally does not call ``controller.snapshot``:
+            # hierarchy and foreground reads are unrelated to a visual-only
+            # request and can make an otherwise valid screenshot fail.
+            return await _capture_screenshot_only(session.require_controller())
 
         snapshot = await session.run_operation(
             "screenshot",
@@ -719,17 +802,23 @@ async def android_screenshot(
         image_format=image_format,
         image_quality=image_quality,
     )
-    metadata = {
-        "success": True,
-        "serial": snapshot.serial,
-        "width": snapshot.width,
-        "height": snapshot.height,
-        "image_format": image_format,
-        "image_width": image_width,
-        "image_height": image_height,
+    metadata = ScreenshotResult(
+        success=True,
+        operation_id=operation_id,
+        serial=snapshot.serial,
+        session_id=session.session_id,
+        generation=session.generation,
+        screen_revision=session.screen_revision,
+        captured_at=datetime.now(UTC),
+        width=snapshot.width,
+        height=snapshot.height,
+        image_format=image_format,
+        image_width=image_width,
+        image_height=image_height,
+        hierarchy_collected=False,
+        foreground_app_collected=False,
         **_image_delivery_metadata("android_screenshot", image_format, image_quality),
-        "foreground_app": snapshot.foreground_app.model_dump(mode="json"),
-    }
+    ).model_dump(mode="json")
     return CallToolResult(
         content=[
             TextContent(type="text", text=json.dumps(metadata)),
@@ -785,12 +874,17 @@ async def android_get_ui_elements(
     try:
         async def read_snapshot(_context: Any) -> tuple[Any, str]:
             if snapshot_id is None:
+                observation_context = session.observation_context()
                 snapshot = await session.require_controller().snapshot(
                     interactive_only=False,
                     max_elements=None,
                     max_text_length=min(2_000, session.config.snapshot_max_text_length),
                 )
-                resolved_snapshot_id = session.store_snapshot(snapshot)
+                resolved_snapshot_id = session.store_snapshot(
+                    snapshot,
+                    expected_context=observation_context,
+                )
+                snapshot = session.get_snapshot(resolved_snapshot_id)
             else:
                 snapshot = session.get_snapshot(snapshot_id)
                 resolved_snapshot_id = snapshot_id
@@ -840,8 +934,13 @@ async def android_get_ui_elements(
         "success": True,
         "snapshot_id": resolved_snapshot_id,
         "serial": snapshot.serial,
+        "session_id": snapshot.session_id,
+        "generation": snapshot.generation,
+        "screen_revision": snapshot.screen_revision,
+        "captured_at": snapshot.captured_at.isoformat(),
         "width": snapshot.width,
         "height": snapshot.height,
+        "warnings": snapshot.warnings,
         "snapshot_total_elements": len(snapshot.elements),
         "total_matches": len(elements),
         "count": len(page),

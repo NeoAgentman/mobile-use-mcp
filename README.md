@@ -81,7 +81,7 @@ The supported `MOBILE_USE_*` variables are:
 | `MOBILE_USE_ADB_EXECUTABLE` (`MOBILE_USE_ADB_PATH`) | ADB executable path or command |
 | `MOBILE_USE_ADB_HOST`, `MOBILE_USE_ADB_PORT` | ADB server endpoint |
 | `MOBILE_USE_OPERATION_TIMEOUT_SECONDS`, `MOBILE_USE_QUEUE_TIMEOUT_SECONDS` | Operation and queue budgets |
-| `MOBILE_USE_SNAPSHOT_MAX_ELEMENTS`, `MOBILE_USE_SNAPSHOT_MAX_TEXT_LENGTH`, `MOBILE_USE_PAYLOAD_MAX_BYTES` | Snapshot and response budgets |
+| `MOBILE_USE_SNAPSHOT_MAX_ELEMENTS`, `MOBILE_USE_SNAPSHOT_MAX_TEXT_LENGTH`, `MOBILE_USE_SNAPSHOT_MAX_ENTRIES`, `MOBILE_USE_SNAPSHOT_MAX_BYTES`, `MOBILE_USE_SNAPSHOT_TTL_SECONDS`, `MOBILE_USE_PAYLOAD_MAX_BYTES` | Snapshot store and response budgets |
 | `MOBILE_USE_SUBPROCESS_TIMEOUT_SECONDS`, `MOBILE_USE_SUBPROCESS_MAX_OUTPUT_BYTES`, `MOBILE_USE_SUBPROCESS_TERMINATE_TIMEOUT_SECONDS` | External process limits |
 | `MOBILE_USE_ARTIFACT_ROOT`, `MOBILE_USE_ARTIFACT_RETENTION_SECONDS`, `MOBILE_USE_ARTIFACT_MAX_COUNT`, `MOBILE_USE_ARTIFACT_MAX_BYTES` | Recording artifact ownership and retention |
 | `MOBILE_USE_LOG_LEVEL` | `DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL` |
@@ -219,9 +219,13 @@ and report the device model. Observe the screen again after every action.
 | `android_list_apps` | Filter third-party package names |
 
 `android_snapshot` defaults to `detail_level="compact"`, returns at most 200 elements, and reports
-`snapshot_id`, `total_elements`, `returned_elements`, `truncated`, and `next_offset`; no truncation
-is silent. The default `max_text_length=500` is applied separately to each node's text and content
-description, including in full mode. Increase it up to 2000 when reading long-form content.
+`snapshot_id`, `session_id`, `generation`, `screen_revision`, `captured_at`, `total_elements`,
+`returned_elements`, `truncated`, and `next_offset`; no truncation is silent. Snapshots are bounded
+by entry count, total stored bytes, and TTL. Capacity eviction is deterministic and returns a
+`SNAPSHOT_STALE` diagnostic; TTL expiry returns `SNAPSHOT_EXPIRED`. An identified snapshot remains
+immutable and pageable after later screen mutations while it is retained. The default
+`max_text_length=500` is applied separately to each node's text and content description, including
+in full mode. Increase it up to 2000 when reading long-form content.
 
 When `truncated=true`, first query or page the same snapshot with `android_get_ui_elements`; use
 `detail_level="full"` only as an explicit large-output fallback. `interactive_only=true` keeps only
@@ -234,7 +238,9 @@ Screenshots always keep the original device resolution. The default is JPEG qual
 lossless image. Every JPEG response includes a `quality_notice` and machine-readable
 `lossless_fallback` with the exact PNG retry arguments. Screenshot base64 is not duplicated in
 structured JSON. Use `android_snapshot` when UI text or targets are needed; use
-`android_screenshot` for visual-only inspection without a pageable hierarchy.
+`android_screenshot` for visual-only inspection. The latter reads native pixels only: it does not
+collect hierarchy or foreground-App state and does not create a pageable snapshot. Combined
+snapshots continue with a safe warning when optional hierarchy or foreground-App collection fails.
 
 Use `android_get_ui_elements` with the returned `snapshot_id` to page the exact same hierarchy.
 Its default page size is 100. It supports `offset`, `limit`, a case-insensitive `query` across
@@ -251,8 +257,11 @@ filters. Filters are applied before pagination; reset `offset` to zero when chan
 }
 ```
 
-Only the latest snapshot is cached. Actions, waiting, reconnecting, and disconnecting invalidate
-it; an expired ID returns `SNAPSHOT_NOT_FOUND` and instructs the agent to observe again.
+Snapshots are retained independently of the current-observation pointer. Actions and waiting
+advance the screen revision, but an identified snapshot remains stable for paging until its
+configured TTL or capacity eviction. Reconnecting or disconnecting makes observations from the
+previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while capacity eviction returns
+`SNAPSHOT_STALE`, and both instruct the agent to observe again.
 
 ### Actions
 
