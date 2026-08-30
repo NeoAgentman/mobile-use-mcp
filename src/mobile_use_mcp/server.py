@@ -1,12 +1,16 @@
 """stdio MCP server entry point and Android observation tools."""
 
+import asyncio
+import hashlib
 import json
 import signal
 import sys
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import isawaitable
+from time import monotonic
 from typing import Annotated, Any, Literal, cast
 
 from mcp.server.fastmcp import FastMCP
@@ -44,6 +48,7 @@ from mobile_use_mcp.models import (
     SwipePercentage,
     Target,
     UIElement,
+    WaitResult,
 )
 from mobile_use_mcp.processes import run_blocking
 from mobile_use_mcp.session import DeviceSession
@@ -57,7 +62,9 @@ possible, and compose snapshot/tap/swipe/input tools for multi-step mobile workf
 Observe again after actions. The tools operate Android only, not iOS. Screenshots capture visible
 pixels but do not download an app's original remote media file unless another tool provides it.
 Call android_doctor to diagnose the local ADB, device, uiautomator2, and capability state before
-starting a workflow."""
+starting a workflow. Use android_wait_for_text, android_wait_for_element, or
+android_wait_for_ui_change for bounded condition synchronization; android_wait is only a fixed
+delay and does not inspect UI state."""
 
 runtime_config = RuntimeConfig.defaults()
 session = DeviceSession(config=runtime_config)
@@ -1068,6 +1075,561 @@ async def android_list_apps(
     except Exception:
         return _observation_failure("list installed Android apps")
     return {"success": True, "count": len(apps), "apps": apps}
+
+
+DEFAULT_WAIT_TIMEOUT_SECONDS = 10.0
+DEFAULT_WAIT_POLL_INTERVAL_SECONDS = 0.25
+MAX_WAIT_POLL_INTERVAL_SECONDS = 5.0
+MAX_WAIT_POLLS = 10_000
+WaitMatcher = Callable[[ScreenSnapshot], tuple[int, UIElement] | None]
+
+
+@dataclass(slots=True)
+class _WaitState:
+    """Bounded, privacy-safe evidence accumulated by one condition wait."""
+
+    submitted_at: float
+    operation_id: str
+    poll_count: int = 0
+    last_snapshot: ScreenSnapshot | None = None
+    last_observation: dict[str, Any] | None = None
+    last_error_stage: str | None = None
+    last_error_code: str | None = None
+
+    @property
+    def elapsed_ms(self) -> float:
+        return round(max(0.0, (monotonic() - self.submitted_at) * 1_000), 2)
+
+    def observe(self, snapshot: ScreenSnapshot) -> None:
+        self.last_snapshot = snapshot
+        self.last_observation = {
+            "available": True,
+            "snapshot_id": snapshot.snapshot_id,
+            "session_id": snapshot.session_id,
+            "generation": snapshot.generation,
+            "screen_revision": snapshot.screen_revision,
+            "captured_at": snapshot.captured_at.isoformat(),
+            "serial": snapshot.serial,
+            "width": snapshot.width,
+            "height": snapshot.height,
+            "element_count": len(snapshot.elements),
+            "warnings": list(snapshot.warnings),
+        }
+
+    def record_error(self, stage: str, code: str | None = None) -> None:
+        self.last_error_stage = stage
+        self.last_error_code = code
+
+
+class _WaitCallToolResult(CallToolResult):
+    """MCP error result that remains mapping-compatible for direct callers."""
+
+    def __getitem__(self, key: str) -> Any:
+        if self.structuredContent is None:
+            raise KeyError(key)
+        return self.structuredContent[key]
+
+
+def _snapshot_fingerprint(snapshot: ScreenSnapshot) -> tuple[object, ...]:
+    """Return content identity while ignoring volatile observation provenance."""
+
+    elements = tuple(
+        json.dumps(
+            element.model_dump(
+                mode="json",
+                exclude={"element_ref", "bounds_provenance"},
+            ),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for element in snapshot.elements
+    )
+    return (
+        hashlib.sha256(snapshot.screenshot_png).digest(),
+        snapshot.width,
+        snapshot.height,
+        elements,
+        snapshot.foreground_app.model_dump_json(),
+    )
+
+
+def _wait_text_match(
+    snapshot: ScreenSnapshot,
+    text: str,
+    text_index: int,
+) -> tuple[int, UIElement] | None:
+    """Find one case-insensitive text/content-description occurrence."""
+
+    query = text.casefold()
+    matches = [
+        (index, element)
+        for index, element in enumerate(snapshot.elements)
+        if query in (element.text or "").casefold()
+        or query in (element.content_description or "").casefold()
+    ]
+    return matches[text_index] if text_index < len(matches) else None
+
+
+def _wait_element_match(snapshot: ScreenSnapshot, target: Target) -> tuple[int, UIElement] | None:
+    """Resolve a presence target against a complete hierarchy.
+
+    Unlike action targeting, a wait observes presence rather than dispatching
+    a command. Disabled or bounds-less nodes therefore still satisfy the
+    condition when their selectors identify them.
+    """
+
+    candidates = list(enumerate(snapshot.elements))
+
+    def intersect(matches: list[tuple[int, UIElement]]) -> None:
+        nonlocal candidates
+        allowed = {index for index, _element in matches}
+        candidates = [item for item in candidates if item[0] in allowed]
+
+    if target.element_ref is not None:
+        intersect([item for item in candidates if item[1].element_ref == target.element_ref])
+    if target.bounds is not None:
+        intersect([item for item in candidates if item[1].bounds == target.bounds])
+    if target.resource_id:
+        resource_matches = [
+            item for item in candidates if item[1].resource_id == target.resource_id
+        ]
+        selected = (
+            resource_matches[target.resource_id_index]
+            if target.resource_id_index < len(resource_matches)
+            else None
+        )
+        candidates = [selected] if selected is not None else []
+    if target.text:
+        query = target.text.casefold()
+        text_matches = [
+            item
+            for item in candidates
+            if query
+            in {
+                (item[1].text or "").casefold(),
+                (item[1].content_description or "").casefold(),
+            }
+        ]
+        selected = (
+            text_matches[target.text_index]
+            if target.text_index < len(text_matches)
+            else None
+        )
+        candidates = [selected] if selected is not None else []
+    return candidates[0] if candidates else None
+
+
+_WAIT_DISCONNECT_CODES = {
+    ErrorCode.DEVICE_DISCONNECTED,
+    ErrorCode.DEVICE_NOT_FOUND,
+    ErrorCode.DEVICE_OFFLINE,
+    ErrorCode.DEVICE_UNAUTHORIZED,
+    ErrorCode.NOT_CONNECTED,
+}
+
+
+def _wait_timeout_error(
+    *,
+    condition: Literal["text", "element", "ui_change"],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    state: _WaitState,
+) -> MobileUseError:
+    """Build one timeout carrying only bounded wait evidence."""
+
+    details: dict[str, Any] = {
+        "operation_id": state.operation_id,
+        "condition": condition,
+        "poll_count": state.poll_count,
+        "elapsed_ms": state.elapsed_ms,
+        "timeout_seconds": timeout_seconds,
+        "poll_interval_seconds": poll_interval_seconds,
+        "last_observation": state.last_observation,
+        "last_safe_observation": state.last_observation,
+        "last_error_stage": state.last_error_stage,
+        "last_error_code": state.last_error_code,
+    }
+    return MobileUseError(
+        ErrorCode.TIMEOUT,
+        f"Android wait for {condition} condition timed out.",
+        "Call android_snapshot to inspect the current screen, then retry with a bounded wait.",
+        data=details,
+        retryable_override=True,
+    )
+
+
+def _wait_error_with_evidence(
+    error: MobileUseError,
+    *,
+    condition: Literal["text", "element", "ui_change"],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    state: _WaitState,
+) -> MobileUseError:
+    """Attach wait diagnostics to an early device/session failure."""
+
+    details = dict(error.data)
+    details.update(
+        {
+            "operation_id": state.operation_id,
+            "condition": condition,
+            "poll_count": state.poll_count,
+            "elapsed_ms": state.elapsed_ms,
+            "timeout_seconds": timeout_seconds,
+            "poll_interval_seconds": poll_interval_seconds,
+            "last_observation": state.last_observation,
+            "last_safe_observation": state.last_observation,
+            "last_error_stage": state.last_error_stage,
+            "last_error_code": state.last_error_code,
+        }
+    )
+    return MobileUseError(
+        error.code,
+        error.message,
+        error.suggestion,
+        data=details,
+        retryable_override=error.retryable,
+    )
+
+
+def _wait_failure(
+    error: MobileUseError,
+    *,
+    operation_id: str,
+    condition: Literal["text", "element", "ui_change"],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    baseline_snapshot_id: str | None = None,
+    baseline_screen_revision: int | None = None,
+) -> _WaitCallToolResult:
+    """Serialize a wait failure and mark it as an MCP business error."""
+
+    details = dict(error.data)
+    last_observation = details.get("last_observation")
+    last_observation_data = (
+        cast(dict[str, Any], last_observation) if isinstance(last_observation, dict) else None
+    )
+    payload = WaitResult(
+        success=False,
+        operation_id=operation_id,
+        condition=condition,
+        message=error.message,
+        poll_count=int(details.get("poll_count", 0)),
+        polls=int(details.get("poll_count", 0)),
+        elapsed_ms=float(details.get("elapsed_ms", 0.0)),
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        snapshot_id=(
+            str(last_observation_data["snapshot_id"])
+            if last_observation_data and last_observation_data.get("snapshot_id") is not None
+            else None
+        ),
+        session_id=(
+            str(last_observation_data["session_id"])
+            if last_observation_data and last_observation_data.get("session_id") is not None
+            else None
+        ),
+        generation=(
+            int(last_observation_data["generation"])
+            if last_observation_data and last_observation_data.get("generation") is not None
+            else None
+        ),
+        screen_revision=(
+            int(last_observation_data.get("screen_revision", 0))
+            if last_observation_data
+            else 0
+        ),
+        baseline_snapshot_id=baseline_snapshot_id,
+        baseline_screen_revision=baseline_screen_revision,
+        last_observation=last_observation_data,
+        last_safe_observation=last_observation_data,
+        last_error_stage=(
+            str(details["last_error_stage"])
+            if details.get("last_error_stage") is not None
+            else None
+        ),
+        last_error_code=(
+            str(details["last_error_code"])
+            if details.get("last_error_code") is not None
+            else None
+        ),
+        error_code=error.code.value,
+        suggestion=error.suggestion,
+        data=details,
+    ).model_dump(mode="json")
+    return _WaitCallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        structuredContent=payload,
+    )
+
+
+async def _call_condition_wait(
+    *,
+    condition: Literal["text", "element", "ui_change"],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    matcher: WaitMatcher | None,
+    baseline_snapshot_id: str | None = None,
+    baseline_screen_revision: int | None = None,
+) -> WaitResult:
+    """Invoke one condition wait and map business failures to MCP errors."""
+
+    operation_id = session.new_operation_id()
+    try:
+        return await _run_condition_wait(
+            condition=condition,
+            timeout_seconds=timeout_seconds,
+            poll_interval_seconds=poll_interval_seconds,
+            matcher=matcher,
+            operation_id=operation_id,
+            baseline_snapshot_id=baseline_snapshot_id,
+            baseline_screen_revision=baseline_screen_revision,
+        )
+    except MobileUseError as error:
+        return cast(
+            WaitResult,
+            _wait_failure(
+                error,
+                operation_id=str(error.data.get("operation_id", operation_id)),
+                condition=condition,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                baseline_snapshot_id=baseline_snapshot_id,
+                baseline_screen_revision=baseline_screen_revision,
+            ),
+        )
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            f"Failed while waiting for Android {condition}.",
+            "Verify the device is connected and responsive, then retry the bounded wait.",
+            data={"operation_id": operation_id},
+        )
+        return cast(
+            WaitResult,
+            _wait_failure(
+                error,
+                operation_id=operation_id,
+                condition=condition,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                baseline_snapshot_id=baseline_snapshot_id,
+                baseline_screen_revision=baseline_screen_revision,
+            ),
+        )
+
+
+async def _run_condition_wait(
+    *,
+    condition: Literal["text", "element", "ui_change"],
+    timeout_seconds: float,
+    poll_interval_seconds: float,
+    matcher: WaitMatcher | None,
+    operation_id: str | None = None,
+    baseline_snapshot_id: str | None = None,
+    baseline_screen_revision: int | None = None,
+) -> WaitResult:
+    """Poll complete Android observations through the DeviceSession gateway."""
+
+    resolved_operation_id = operation_id or session.new_operation_id()
+    state = _WaitState(submitted_at=monotonic(), operation_id=resolved_operation_id)
+
+    async def wait(context: Any) -> WaitResult:
+        baseline: ScreenSnapshot | None = None
+        if baseline_snapshot_id is not None:
+            context.checkpoint("baseline")
+            baseline = session.get_snapshot(baseline_snapshot_id, operation=context)
+            effective_baseline_revision = (
+                baseline_screen_revision
+                if baseline_screen_revision is not None
+                else baseline.screen_revision
+            )
+        else:
+            effective_baseline_revision = baseline_screen_revision
+
+        while True:
+            state.poll_count += 1
+            try:
+                context.checkpoint("poll")
+                if state.poll_count > MAX_WAIT_POLLS:
+                    raise _wait_timeout_error(
+                        condition=condition,
+                        timeout_seconds=timeout_seconds,
+                        poll_interval_seconds=poll_interval_seconds,
+                        state=state,
+                    )
+                if getattr(session, "disconnect_requested", False) is True:
+                    raise MobileUseError(
+                        ErrorCode.DEVICE_DISCONNECTED,
+                        "The Android session is closing while the condition wait is running.",
+                        "Wait for android_disconnect to finish, then reconnect before retrying.",
+                    )
+                controller = session.require_controller()
+                observation_context = session.observation_context()
+                context.checkpoint("observation")
+                snapshot = await session.capture_complete_snapshot(
+                    controller,
+                    min(2_000, session.config.snapshot_max_text_length),
+                )
+                context.checkpoint("observation")
+                if session.observation_context() != observation_context:
+                    raise MobileUseError(
+                        ErrorCode.SNAPSHOT_STALE,
+                        "The Android observation finished after the screen changed.",
+                        "Discard this observation and retry the condition wait.",
+                    )
+                state.observe(snapshot)
+
+                if condition == "ui_change":
+                    changed = (
+                        baseline is not None
+                        and _snapshot_fingerprint(snapshot) != _snapshot_fingerprint(baseline)
+                    ) or (
+                        effective_baseline_revision is not None
+                        and observation_context.screen_revision != effective_baseline_revision
+                    )
+                    match = True if changed else None
+                else:
+                    if matcher is None:
+                        raise RuntimeError("element wait matcher is not configured")
+                    match = matcher(snapshot)
+                if match:
+                    if getattr(session, "disconnect_requested", False) is True:
+                        raise MobileUseError(
+                            ErrorCode.DEVICE_DISCONNECTED,
+                            "The Android session is closing while the condition wait is running.",
+                            (
+                                "Wait for android_disconnect to finish, then reconnect before "
+                                "retrying."
+                            ),
+                        )
+                    context.checkpoint("snapshot_commit")
+                    snapshot_id = session.store_snapshot(
+                        snapshot,
+                        operation=context,
+                        expected_context=observation_context,
+                    )
+                    final = session.get_snapshot(snapshot_id, operation=context)
+                    state.observe(final)
+                    matched_element = None
+                    # A text wait's query may itself be sensitive.  Return
+                    # the immutable snapshot provenance but do not echo the
+                    # matching node (which could contain the queried value).
+                    if condition != "text" and isinstance(match, tuple):
+                        matched_index = match[0]
+                        if 0 <= matched_index < len(final.elements):
+                            matched_element = final.elements[matched_index]
+                    return WaitResult(
+                        success=True,
+                        operation_id=resolved_operation_id,
+                        condition=condition,
+                        message=f"Android {condition} condition satisfied.",
+                        poll_count=state.poll_count,
+                        polls=state.poll_count,
+                        elapsed_ms=context.elapsed_ms,
+                        timeout_seconds=timeout_seconds,
+                        poll_interval_seconds=poll_interval_seconds,
+                        snapshot_id=final.snapshot_id,
+                        session_id=final.session_id,
+                        generation=final.generation,
+                        screen_revision=final.screen_revision,
+                        captured_at=final.captured_at,
+                        matched_element=matched_element,
+                        baseline_snapshot_id=baseline_snapshot_id,
+                        baseline_screen_revision=effective_baseline_revision,
+                        last_observation=state.last_observation,
+                        last_safe_observation=state.last_observation,
+                        data={
+                            "condition_met": True,
+                            "snapshot_id": final.snapshot_id,
+                            "session_id": final.session_id,
+                            "generation": final.generation,
+                            "screen_revision": final.screen_revision,
+                            "captured_at": final.captured_at.isoformat(),
+                        },
+                    )
+                state.record_error("condition")
+            except asyncio.CancelledError:
+                raise
+            except MobileUseError as error:
+                if error.code in _WAIT_DISCONNECT_CODES:
+                    state.record_error("controller", error.code.value)
+                    raise _wait_error_with_evidence(
+                        error,
+                        condition=condition,
+                        timeout_seconds=timeout_seconds,
+                        poll_interval_seconds=poll_interval_seconds,
+                        state=state,
+                    ) from error
+                if error.code == ErrorCode.CANCELLED:
+                    raise
+                if (
+                    error.code == ErrorCode.TIMEOUT
+                    and error.data.get("condition") == condition
+                    and error.data.get("poll_count") == state.poll_count
+                ):
+                    raise
+                if error.code == ErrorCode.TIMEOUT and context.remaining_seconds() <= 0:
+                    raise _wait_timeout_error(
+                        condition=condition,
+                        timeout_seconds=timeout_seconds,
+                        poll_interval_seconds=poll_interval_seconds,
+                        state=state,
+                    ) from error
+                state.record_error("observation", error.code.value)
+            except Exception:
+                # Adapter errors are intentionally reduced to one stable
+                # stage/code and retried until the operation deadline.
+                state.record_error("observation", ErrorCode.OPERATION_FAILED.value)
+
+            if context.remaining_seconds() <= 0:
+                raise _wait_timeout_error(
+                    condition=condition,
+                    timeout_seconds=timeout_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
+                    state=state,
+                )
+            # Leave a small scheduling margin so the callback can publish the
+            # rich wait diagnostics before the gateway's outer deadline wins.
+            margin = min(0.01, timeout_seconds / 4)
+            remaining = context.remaining_seconds()
+            if remaining <= margin:
+                raise _wait_timeout_error(
+                    condition=condition,
+                    timeout_seconds=timeout_seconds,
+                    poll_interval_seconds=poll_interval_seconds,
+                    state=state,
+                )
+            await asyncio.sleep(min(poll_interval_seconds, remaining - margin))
+
+    try:
+        return await session.run_operation(
+            f"wait_for_{condition}",
+            wait,
+            operation_id=resolved_operation_id,
+            timeout_seconds=timeout_seconds,
+            retry_safe=True,
+            mutating=False,
+        )
+    except MobileUseError as error:
+        # A blocking adapter may still be cancelled by the gateway's outer
+        # deadline before the callback can assemble its own diagnostics.
+        # Preserve the same wait-level evidence in that race.
+        if error.code == ErrorCode.TIMEOUT and error.data.get("condition") != condition:
+            timeout_error = _wait_timeout_error(
+                condition=condition,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=poll_interval_seconds,
+                state=state,
+            )
+            gateway_stage = error.data.get("stage")
+            if isinstance(gateway_stage, str):
+                timeout_error.data["stage"] = gateway_stage
+                timeout_error.data["last_error_stage"] = gateway_stage
+            raise timeout_error from error
+        raise
 
 
 def _observation_failure(action: str) -> dict[str, Any]:
@@ -2122,6 +2684,192 @@ async def android_stop_recording() -> dict[str, Any]:
         message="Android screen recording stopped.",
         data=details,
     ).model_dump(mode="json")
+
+
+@mcp.tool(
+    name="android_wait_for_text",
+    title="Wait for Android text",
+    annotations=READ_ONLY,
+    structured_output=True,
+)
+async def android_wait_for_text(
+    text: Annotated[
+        str,
+        Field(
+            min_length=1,
+            max_length=2_000,
+            description=(
+                "Case-insensitive substring to find in a complete Android hierarchy's text "
+                "or content description. The value is never echoed in results."
+            ),
+        ),
+    ],
+    text_index: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=10_000,
+            description="Zero-based occurrence among matching text/content descriptions.",
+        ),
+    ] = 0,
+    timeout_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=3_600,
+            description="Total monotonic wait budget, including the operation queue (default 10s).",
+        ),
+    ] = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    poll_interval_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=MAX_WAIT_POLL_INTERVAL_SECONDS,
+            description="Bounded polling interval in seconds (default 0.25s).",
+        ),
+    ] = DEFAULT_WAIT_POLL_INTERVAL_SECONDS,
+) -> WaitResult:
+    """Wait until text or a content description appears on Android.
+
+    Each poll reads the complete hierarchy, not the compact response page.
+    On success the result points at the immutable final snapshot that matched.
+    A timeout is returned as an MCP error with bounded poll and last-observation
+    diagnostics. Use android_wait for a fixed delay when no condition is needed.
+    """
+
+    return await _call_condition_wait(
+        condition="text",
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        matcher=lambda snapshot: _wait_text_match(snapshot, text, text_index),
+    )
+
+
+@mcp.tool(
+    name="android_wait_for_element",
+    title="Wait for Android element",
+    annotations=READ_ONLY,
+    structured_output=True,
+)
+async def android_wait_for_element(
+    target: Annotated[
+        Target,
+        Field(
+            description=(
+                "Element presence selector. Prefer resource_id or text/content-description; "
+                "the selector is evaluated against the complete current hierarchy."
+            )
+        ),
+    ],
+    timeout_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=3_600,
+            description="Total monotonic wait budget, including the operation queue (default 10s).",
+        ),
+    ] = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    poll_interval_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=MAX_WAIT_POLL_INTERVAL_SECONDS,
+            description="Bounded polling interval in seconds (default 0.25s).",
+        ),
+    ] = DEFAULT_WAIT_POLL_INTERVAL_SECONDS,
+) -> WaitResult:
+    """Wait until a target element appears in the complete Android hierarchy.
+
+    This is a presence wait, so a matching disabled or bounds-less node still
+    satisfies the condition. It does not tap, focus, or otherwise mutate the
+    device.
+    """
+
+    return await _call_condition_wait(
+        condition="element",
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        matcher=lambda snapshot: _wait_element_match(snapshot, target),
+    )
+
+
+@mcp.tool(
+    name="android_wait_for_ui_change",
+    title="Wait for Android UI change",
+    annotations=READ_ONLY,
+    structured_output=True,
+)
+async def android_wait_for_ui_change(
+    baseline_snapshot_id: Annotated[
+        str | None,
+        Field(
+            min_length=1,
+            max_length=128,
+            description=(
+                "Explicit snapshot_id from android_snapshot to compare against; use this for "
+                "content-level change detection."
+            ),
+        ),
+    ] = None,
+    baseline_screen_revision: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description=(
+                "Explicit session screen revision baseline. The wait succeeds when a later "
+                "observation has a different revision."
+            ),
+        ),
+    ] = None,
+    baseline_revision: Annotated[
+        int | None,
+        Field(
+            ge=0,
+            description="Compatibility alias for baseline_screen_revision.",
+        ),
+    ] = None,
+    timeout_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=3_600,
+            description="Total monotonic wait budget, including the operation queue (default 10s).",
+        ),
+    ] = DEFAULT_WAIT_TIMEOUT_SECONDS,
+    poll_interval_seconds: Annotated[
+        float,
+        Field(
+            gt=0,
+            le=MAX_WAIT_POLL_INTERVAL_SECONDS,
+            description="Bounded polling interval in seconds (default 0.25s).",
+        ),
+    ] = DEFAULT_WAIT_POLL_INTERVAL_SECONDS,
+) -> WaitResult:
+    """Wait until Android UI content differs from an explicit baseline.
+
+    Supply a baseline snapshot ID or a screen revision (or both). A successful
+    result references the immutable final snapshot; a timeout is an MCP error
+    with bounded poll count, elapsed time, and last safe observation metadata.
+    """
+
+    if baseline_revision is not None:
+        if (
+            baseline_screen_revision is not None
+            and baseline_revision != baseline_screen_revision
+        ):
+            raise ValueError("baseline_revision and baseline_screen_revision must agree")
+        baseline_screen_revision = baseline_revision
+    if baseline_snapshot_id is None and baseline_screen_revision is None:
+        raise ValueError("baseline_snapshot_id or baseline_screen_revision is required")
+
+    return await _call_condition_wait(
+        condition="ui_change",
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=poll_interval_seconds,
+        matcher=None,
+        baseline_snapshot_id=baseline_snapshot_id,
+        baseline_screen_revision=baseline_screen_revision,
+    )
 
 
 @mcp.tool(

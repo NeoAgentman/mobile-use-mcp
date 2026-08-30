@@ -189,7 +189,9 @@ Use `--scope project` instead if the configuration should only apply to one proj
 7. If an action fails, use the returned selector attempts and refresh the snapshot.
 
 `android_wait` is only a fixed delay. It does not wait for a condition or inspect whether an
-element appeared, and it invalidates the cached snapshot. Always observe again afterward.
+element appeared. For synchronization, use one of the bounded condition waits below; every
+successful condition wait returns the immutable final `snapshot_id` and its session/generation/
+screen-revision context.
 
 Example instruction for the host agent:
 
@@ -219,6 +221,28 @@ and report the device model. Observe the screen again after every action.
 | `android_get_ui_elements` | Page and query elements from one cached snapshot |
 | `android_get_foreground_app` | Current package and activity |
 | `android_list_apps` | Filter third-party package names |
+
+### Condition waits
+
+| Tool | Purpose |
+|---|---|
+| `android_wait_for_text` | Poll complete hierarchy until text or content description appears |
+| `android_wait_for_element` | Poll complete hierarchy until a `Target` is present |
+| `android_wait_for_ui_change` | Poll until content differs from an explicit baseline snapshot or screen revision |
+
+Condition waits use a total monotonic timeout (default `10` seconds) and bounded polling (default
+`0.25` seconds, maximum `5` seconds). Queue time counts toward the timeout. Text matching is a
+case-insensitive substring search across text and content descriptions; element waits accept the
+same strict `Target` selectors as actions and do not tap or mutate the device. The element wait
+reads the complete hierarchy on every poll, so nodes beyond the compact snapshot page are still
+found.
+
+UI-change waits require `baseline_snapshot_id` or `baseline_screen_revision`. A snapshot baseline
+compares the original screenshot, dimensions, foreground app, and normalized hierarchy. A screen
+revision baseline succeeds when the session revision changes; supplying both uses either explicit
+change signal. A successful result includes the final immutable `snapshot_id`, `session_id`,
+`generation`, `screen_revision`, and `captured_at`. Timeout and disconnect results are MCP errors
+and include bounded `poll_count`, `elapsed_ms`, `last_safe_observation`, and error-stage details.
 
 `android_snapshot` defaults to `detail_level="compact"`, returns at most 200 elements, and reports
 `snapshot_id`, `session_id`, `generation`, `screen_revision`, `captured_at`, `total_elements`,
@@ -259,11 +283,11 @@ filters. Filters are applied before pagination; reset `offset` to zero when chan
 }
 ```
 
-Snapshots are retained independently of the current-observation pointer. Actions and waiting
-advance the screen revision, but an identified snapshot remains stable for paging until its
-configured TTL or capacity eviction. Reconnecting or disconnecting makes observations from the
-previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while capacity eviction returns
-`SNAPSHOT_STALE`, and both instruct the agent to observe again.
+Snapshots are retained independently of the current-observation pointer. Actions and the fixed
+`android_wait` delay advance the screen revision, but an identified snapshot remains stable for
+paging until its configured TTL or capacity eviction. Reconnecting or disconnecting makes
+observations from the previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while
+capacity eviction returns `SNAPSHOT_STALE`, and both instruct the agent to observe again.
 
 ### Actions
 
@@ -281,6 +305,9 @@ previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while capacity
 | `android_start_recording` | Start a bounded screen recording with automatic segment rollover |
 | `android_stop_recording` | Stop, pull, and optionally merge recording segments |
 | `android_wait` | Sleep for a bounded fixed delay and advance the screen revision |
+| `android_wait_for_text` | Wait for text/content description in the complete hierarchy |
+| `android_wait_for_element` | Wait for a `Target` in the complete hierarchy |
+| `android_wait_for_ui_change` | Wait for change from an explicit snapshot or screen-revision baseline |
 
 `android_launch_app` reports every launch attempt, polling count, and the last foreground App. A
 permission controller, chooser, or other foreground blocker is reported separately from an App

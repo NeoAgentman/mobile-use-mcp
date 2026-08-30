@@ -316,9 +316,9 @@ mobile-use-mcp/
 
 - [ ] snapshot 临时元素引用，如 `e12`
 - [ ] stale element 检测
-- [ ] `android_wait_for_text`
-- [ ] `android_wait_for_element`
-- [ ] `android_wait_for_ui_change`
+- [x] `android_wait_for_text`
+- [x] `android_wait_for_element`
+- [x] `android_wait_for_ui_change`
 - [ ] UI diff
 - [ ] 多设备并行 session
 - [ ] 录屏实时预览或流式传输（有界本地录制和分段合并已实现）

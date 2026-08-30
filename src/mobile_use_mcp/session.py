@@ -154,6 +154,11 @@ class DeviceSession:
         self._generation_counter = 0
         self._active_operation_id: str | None = None
         self._last_error: LifecycleError | None = None
+        # An explicit close request is observable by long-running read waits
+        # even while the close operation is queued behind the current FIFO
+        # item. This lets condition waits terminate promptly without allowing
+        # a late observation commit after the caller has requested disconnect.
+        self._disconnect_requested = False
         self._state_lock = RLock()
         self._lifecycle_lock = Lock()
 
@@ -330,6 +335,13 @@ class DeviceSession:
                 and self._device is not None
                 and self._controller is not None
             )
+
+    @property
+    def disconnect_requested(self) -> bool:
+        """Whether an explicit asynchronous close is waiting to run."""
+
+        with self._state_lock:
+            return self._disconnect_requested
 
     def new_operation_id(self) -> str:
         """Allocate an opaque ID for a public operation."""
@@ -580,6 +592,15 @@ class DeviceSession:
 
         def store() -> str:
             with self._state_lock:
+                if self._disconnect_requested:
+                    raise MobileUseError(
+                        ErrorCode.DEVICE_DISCONNECTED,
+                        "The Android session is closing; the observation cannot be committed.",
+                        (
+                            "Wait for android_disconnect to finish, then observe again after "
+                            "reconnecting."
+                        ),
+                    )
                 current = SnapshotContext(
                     session_id=self._session_id,
                     generation=self._generation,
@@ -1710,13 +1731,19 @@ class DeviceSession:
         """Awaitable shutdown hook backed by the explicit disconnect path."""
 
         operation_id = self.new_operation_id()
-        return await self.run_operation(
-            "disconnect",
-            self._disconnect_async,
-            operation_id=operation_id,
-            retry_safe=True,
-            mutating=True,
-        )
+        with self._state_lock:
+            self._disconnect_requested = True
+        try:
+            return await self.run_operation(
+                "disconnect",
+                self._disconnect_async,
+                operation_id=operation_id,
+                retry_safe=True,
+                mutating=True,
+            )
+        finally:
+            with self._state_lock:
+                self._disconnect_requested = False
 
     async def _disconnect_async(self, operation: OperationContext) -> DeviceDisconnectResult:
         """Disconnect through the gateway while awaiting child-process reap."""

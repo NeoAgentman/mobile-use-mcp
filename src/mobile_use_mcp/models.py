@@ -409,6 +409,41 @@ class ResultMappingMixin:
         return iter(self.model_dump(mode="json"))  # type: ignore[attr-defined]
 
 
+class WaitResult(ResultMappingMixin, StrictModel):
+    """Typed result for a bounded Android condition wait.
+
+    A successful wait identifies the exact immutable observation that proved
+    the condition.  Failure diagnostics intentionally retain only metadata
+    about the last safe observation; they never include the text queried by a
+    caller or a complete hierarchy.
+    """
+
+    success: bool
+    operation_id: str = Field(min_length=1, max_length=128)
+    condition: Literal["text", "element", "ui_change"]
+    message: str
+    poll_count: int = Field(ge=0)
+    polls: int | None = Field(default=None, ge=0, description="Compatibility alias for poll_count.")
+    elapsed_ms: float = Field(ge=0)
+    timeout_seconds: float = Field(gt=0)
+    poll_interval_seconds: float = Field(gt=0)
+    snapshot_id: str | None = Field(default=None, max_length=128)
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    screen_revision: int = Field(default=0, ge=0)
+    captured_at: datetime | None = None
+    matched_element: UIElement | None = None
+    baseline_snapshot_id: str | None = Field(default=None, max_length=128)
+    baseline_screen_revision: int | None = Field(default=None, ge=0)
+    last_observation: dict[str, Any] | None = None
+    last_safe_observation: dict[str, Any] | None = None
+    last_error_stage: str | None = Field(default=None, max_length=64)
+    last_error_code: str | None = Field(default=None, max_length=64)
+    error_code: str | None = Field(default=None, max_length=64)
+    suggestion: str | None = None
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
 class LifecycleResult(ResultMappingMixin, StrictModel):
     """Common typed envelope for Android session lifecycle tools."""
 
