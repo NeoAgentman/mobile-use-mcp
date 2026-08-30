@@ -46,7 +46,8 @@ ADB explicitly, although tool selection ultimately remains under the host agent'
 
 ## Requirements
 
-- macOS, Linux, or Windows with Python 3.12+
+- Ubuntu 24.04, macOS 14, or Windows 2022 with Python 3.12 (the CI support
+  matrix; other host and Python versions are unverified)
 - [`uv`](https://docs.astral.sh/uv/)
 - Android SDK platform-tools with `adb` on `PATH`
 - A physical Android device with USB debugging enabled, or an Android emulator
@@ -67,6 +68,39 @@ ABC123 device product:... model:... transport_id:1
 
 If the state is `unauthorized`, unlock the phone and accept the USB debugging prompt. If it is
 `offline`, reconnect the device or restart the ADB server.
+
+## CI and support matrix
+
+Pull requests run separate static-analysis, unit/component, stdio-contract, package, inspection,
+and Android-emulator checks. The supported host matrix is Ubuntu 24.04, macOS 14, and Windows 2022
+with Python 3.12. The project metadata permits newer Python versions, but they are not support
+claims until they are added to this matrix.
+
+The `Build wheel artifact` job builds the wheel once and records `dist/wheel.sha256`. Every
+installed-package smoke, MCP inspector, and Android acceptance job verifies that digest and
+installs that exact wheel; none imports the checkout as the server under test. The Android gate
+uses API 35, the `google_apis` x86_64 image, pinned SDK/build tooling, and a stable fixture App.
+
+Configure these exact check names as required branch-protection gates:
+
+- `Static analysis`
+- `Unit/component tests (ubuntu-24.04, Python 3.12)`
+- `Unit/component tests (macos-14, Python 3.12)`
+- `Unit/component tests (windows-2022, Python 3.12)`
+- `stdio contract tests`
+- `Build wheel artifact`
+- `Installed-package smoke (ubuntu-24.04, Python 3.12)`
+- `Installed-package smoke (macos-14, Python 3.12)`
+- `Installed-package smoke (windows-2022, Python 3.12)`
+- `MCP inspector schema`
+- `Android emulator acceptance`
+- `Required CI gates`
+
+The workflow pins GitHub Actions by commit, uses explicit Python/uv/SDK/Gradle/emulator versions,
+and invokes `@modelcontextprotocol/inspector@2.4.0` rather than an unversioned package. The
+Android wrapper applies bounded stage and total deadlines, always stops the public MCP session,
+reaps its process group, quarantines incomplete recording artifacts, and uploads only redacted
+diagnostics.
 
 ### Runtime configuration and diagnostics
 
@@ -488,9 +522,9 @@ uv run pytest
 Inspect the live stdio MCP schema:
 
 ```bash
-npx -y @modelcontextprotocol/inspector --cli \
+npx -y @modelcontextprotocol/inspector@2.4.0 --cli \
   uv --directory "$PWD" run mobile-use-mcp \
-  --method tools/list
+  -- --transport stdio --method tools/list --strict --format json
 ```
 
 Tests marked `android` require a connected device or emulator:

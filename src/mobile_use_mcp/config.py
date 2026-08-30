@@ -131,9 +131,7 @@ class RuntimeConfig(BaseModel):
             "snapshot_store_ttl_seconds",
         ),
     )
-    payload_max_bytes: int = Field(
-        default=DEFAULT_PAYLOAD_MAX_BYTES, ge=1, le=100 * 1024 * 1024
-    )
+    payload_max_bytes: int = Field(default=DEFAULT_PAYLOAD_MAX_BYTES, ge=1, le=100 * 1024 * 1024)
 
     subprocess_timeout_seconds: float = Field(
         default=DEFAULT_SUBPROCESS_TIMEOUT_SECONDS, gt=0, le=3_600
@@ -362,9 +360,7 @@ class RuntimeConfig(BaseModel):
             if self.content_trace_redaction != "strict":
                 raise ValueError("enabled content tracing requires strict redaction")
             if self.content_trace_retention_seconds <= 0:
-                raise ValueError(
-                    "enabled content tracing requires a positive retention limit"
-                )
+                raise ValueError("enabled content tracing requires a positive retention limit")
             if self.content_trace_max_bytes <= 0:
                 raise ValueError("enabled content tracing requires a positive size limit")
         return self
@@ -376,9 +372,7 @@ class RuntimeConfig(BaseModel):
         return cls()
 
     @classmethod
-    def from_environment(
-        cls, environ: Mapping[str, str] | None = None
-    ) -> RuntimeConfig:
+    def from_environment(cls, environ: Mapping[str, str] | None = None) -> RuntimeConfig:
         """Load and validate environment settings without leaking raw values."""
 
         source = os.environ if environ is None else environ

@@ -74,6 +74,6 @@ def test_package_policy_matches_only_explicit_packages_or_system_surfaces() -> N
     assert not policy.allows_package("com.other")
     assert not policy.allows_package("com.android.settings")
     assert not policy.allows_surface("launcher")
-    assert not PackagePolicy(
-        allowed_system_surfaces=["permission_dialog"]
-    ).allows_package("evil.permissioncontroller")
+    assert not PackagePolicy(allowed_system_surfaces=["permission_dialog"]).allows_package(
+        "evil.permissioncontroller"
+    )

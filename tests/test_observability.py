@@ -67,8 +67,9 @@ async def test_operation_success_logs_only_stable_metadata_to_stderr() -> None:
 
 
 @pytest.mark.asyncio
-async def test_operation_failure_logs_error_code_and_hashed_serial_without_sensitive_values(
-) -> None:
+async def test_operation_failure_logs_error_code_and_hashed_serial_without_sensitive_values() -> (
+    None
+):
     registry = Mock()
     registry.select.return_value = DeviceInfo(serial="SERIAL-PRIVATE", state=DeviceState.DEVICE)
     controller = Mock()

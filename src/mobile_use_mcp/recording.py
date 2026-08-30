@@ -770,9 +770,7 @@ class RecordingManager:
             raise
         try:
             output_is_usable = (
-                output_path is not None
-                and output_path.is_file()
-                and output_path.stat().st_size > 0
+                output_path is not None and output_path.is_file() and output_path.stat().st_size > 0
             )
         except OSError:
             output_is_usable = False
@@ -1110,9 +1108,7 @@ class RecordingManager:
             if artifact.expires_at <= now
             or (
                 monotonic_now is not None
-                and monotonic_now >= self._artifact_expiry_monotonic.get(
-                    artifact_id, float("inf")
-                )
+                and monotonic_now >= self._artifact_expiry_monotonic.get(artifact_id, float("inf"))
             )
         ]
         for artifact_id in sorted(expired):

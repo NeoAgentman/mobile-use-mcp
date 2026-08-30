@@ -396,9 +396,7 @@ class DeviceSession:
             if inspect.isawaitable(value):
                 value = await value
             foreground = (
-                value
-                if isinstance(value, ForegroundApp)
-                else ForegroundApp.model_validate(value)
+                value if isinstance(value, ForegroundApp) else ForegroundApp.model_validate(value)
             )
         except MobileUseError as error:
             raise foreground_error("foreground_read_failed", error.code.value) from error
@@ -695,28 +693,39 @@ class DeviceSession:
             "system_surfaces": system_surfaces,
         }
         supplied_direct = {key: value for key, value in direct_values.items() if value is not None}
-        if len({
-            key
-            for key in ("allowed_packages", "allowed_app_packages")
-            if direct_values[key] is not None
-        }) > 1:
+        if (
+            len(
+                {
+                    key
+                    for key in ("allowed_packages", "allowed_app_packages")
+                    if direct_values[key] is not None
+                }
+            )
+            > 1
+        ):
             raise ValueError("allowed_packages and allowed_app_packages cannot both be provided")
-        if len({
-            key
-            for key in ("allowed_system_packages", "system_packages")
-            if direct_values[key] is not None
-        }) > 1:
-            raise ValueError(
-                "allowed_system_packages and system_packages cannot both be provided"
+        if (
+            len(
+                {
+                    key
+                    for key in ("allowed_system_packages", "system_packages")
+                    if direct_values[key] is not None
+                }
             )
-        if len({
-            key
-            for key in ("allowed_system_surfaces", "system_surfaces")
-            if direct_values[key] is not None
-        }) > 1:
-            raise ValueError(
-                "allowed_system_surfaces and system_surfaces cannot both be provided"
+            > 1
+        ):
+            raise ValueError("allowed_system_packages and system_packages cannot both be provided")
+        if (
+            len(
+                {
+                    key
+                    for key in ("allowed_system_surfaces", "system_surfaces")
+                    if direct_values[key] is not None
+                }
             )
+            > 1
+        ):
+            raise ValueError("allowed_system_surfaces and system_surfaces cannot both be provided")
         if policy_values and supplied_direct:
             raise ValueError("policy cannot be combined with direct package allowlists")
         if allow_unrestricted and (policy_values or supplied_direct):

@@ -9,59 +9,360 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHON_VERSION: "3.12"
+  UV_VERSION: "0.11.29"
+  ANDROID_API_LEVEL: "35"
+  ANDROID_EMULATOR_BUILD: "16138043"
+  MCP_INSPECTOR_VERSION: "2.4.0"
+
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  static-analysis:
+    name: Static analysis
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Check out repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install uv
-        uses: astral-sh/setup-uv@v8.3.2
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
         with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
-      - name: Install Python and dependencies
+      - name: Install locked development environment
         run: uv sync --locked --dev
 
-      - name: Lint
+      - name: Ruff lint
         run: uv run ruff check .
 
-      - name: Check formatting
+      - name: Ruff format
         run: uv run ruff format --check .
 
-      - name: Type check
+      - name: Pyright type check
         run: uv run pyright
 
-      - name: Run non-device tests
-        run: uv run pytest
+  unit-component-tests:
+    name: Unit/component tests (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.12"
+          - os: macos-14
+            python-version: "3.12"
+          - os: windows-2022
+            python-version: "3.12"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Build distributions
-        run: uv build
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
 
-      - name: Audit release artifacts
+      - name: Install locked development environment
+        run: uv sync --locked --dev
+
+      - name: Run unit and component tests
+        run: >-
+          uv run pytest
+          --ignore=tests/test_mcp_stdio.py
+          --ignore=tests/test_typed_contract.py
+          --ignore=tests/integration
+
+  stdio-contract-tests:
+    name: stdio contract tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install locked development environment
+        run: uv sync --locked --dev
+
+      - name: Run stdio MCP contract tests
+        run: uv run pytest tests/test_mcp_stdio.py tests/test_typed_contract.py
+
+  build-wheel:
+    name: Build wheel artifact
+    needs: [static-analysis, unit-component-tests, stdio-contract-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install locked development environment
+        run: uv sync --locked --dev
+
+      - name: Build wheel and source archive once
+        run: uv build --wheel --sdist --out-dir dist
+
+      - name: Audit the built distributions
         run: |
-          wheel="$(find dist -maxdepth 1 -name '*.whl' -print -quit)"
-          sdist="$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          sdist="$(find dist -maxdepth 1 -type f -name '*.tar.gz' -print -quit)"
           test -n "$wheel"
           test -n "$sdist"
-          uv run python scripts/release_audit.py \
-            --wheel "$wheel" \
-            --sdist "$sdist" \
-            --provenance provenance.toml
+          uv run python scripts/release_audit.py --wheel "$wheel" --sdist "$sdist" --provenance provenance.toml
 
-      - name: Install wheel in a clean environment
-        run: |
-          smoke_env="$(mktemp -d)"
-          python -m venv "$smoke_env"
-          "$smoke_env/bin/python" -m pip install --disable-pip-version-check --no-input \
+      - name: Record the wheel SHA-256 digest
+        run: uv run python scripts/artifact_digest.py --write --directory dist --output dist/wheel.sha256
+
+      - name: Upload the exact build output
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mobile-use-mcp-distributions-${{ github.sha }}
+          path: |
             dist/*.whl
-          "$smoke_env/bin/python" scripts/stdio_smoke.py \
-            --command "$smoke_env/bin/mobile-use-mcp"
+            dist/*.tar.gz
+            dist/wheel.sha256
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Inspect MCP tool schema
+  installed-package-smoke:
+    name: Installed-package smoke (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    needs: build-wheel
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            python-version: "3.12"
+          - os: macos-14
+            python-version: "3.12"
+          - os: windows-2022
+            python-version: "3.12"
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Download the exact wheel artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: mobile-use-mcp-distributions-${{ github.sha }}
+          path: dist
+
+      - name: Verify the wheel digest before installation
         run: >-
-          npx -y @modelcontextprotocol/inspector --cli
-          uv --directory "$GITHUB_WORKSPACE" run mobile-use-mcp
-          --method tools/list
+          uv run --no-project --python ${{ matrix.python-version }} python
+          scripts/artifact_digest.py
+          --verify
+          --directory dist
+          --output dist/wheel.sha256
+
+      - name: Install and exercise the exact wheel
+        run: >-
+          uv run --no-project --python ${{ matrix.python-version }} python
+          scripts/wheel_smoke.py
+          --directory dist
+          --digest-file dist/wheel.sha256
+
+  mcp-inspection:
+    name: MCP inspector schema
+    needs: build-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Download the exact wheel artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: mobile-use-mcp-distributions-${{ github.sha }}
+          path: dist
+
+      - name: Verify the wheel digest before installation
+        run: >-
+          uv run --no-project --python ${{ env.PYTHON_VERSION }} python
+          scripts/artifact_digest.py
+          --verify
+          --directory dist
+          --output dist/wheel.sha256
+
+      - name: Install the exact wheel into an isolated server environment
+        run: |
+          uv run --no-project --python "$PYTHON_VERSION" python -m venv "$RUNNER_TEMP/mcp-server"
+          "$RUNNER_TEMP/mcp-server/bin/python" -m pip install --disable-pip-version-check --no-input dist/*.whl
+
+      - name: Install Node.js for the pinned MCP inspector
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.14.0"
+
+      - name: Inspect tools/list from the installed entry point
+        run: |
+          server="$RUNNER_TEMP/mcp-server/bin/mobile-use-mcp"
+          env -u PYTHONPATH npm exec --yes --package="@modelcontextprotocol/inspector@2.4.0" -- mcp-inspector --cli "$server" -- --transport stdio --method tools/list --strict --format json > "$RUNNER_TEMP/mcp-tools.json"
+          uv run --no-project --python "$PYTHON_VERSION" python -c 'import json, pathlib; payload=json.loads(pathlib.Path("'$RUNNER_TEMP'/mcp-tools.json").read_text()); tools=payload["result"]["tools"]; names={tool["name"] for tool in tools}; assert {"android_status", "android_snapshot", "android_tap"} <= names'
+
+  android-emulator-acceptance:
+    name: Android emulator acceptance
+    needs: build-wheel
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ANDROID_SERIAL: emulator-5554
+      FIXTURE_PACKAGE: com.neoagentman.mobileusefixture
+      ARTIFACT_ROOT: ${{ runner.temp }}/mobile-use-artifacts
+      DIAGNOSTICS_DIR: ${{ runner.temp }}/android-diagnostics
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install locked development environment
+        run: uv sync --locked --dev --no-install-project
+
+      - name: Download the exact wheel artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
+        with:
+          name: mobile-use-mcp-distributions-${{ github.sha }}
+          path: dist
+
+      - name: Verify the wheel digest before installation
+        run: .venv/bin/python scripts/artifact_digest.py --verify --directory dist --output dist/wheel.sha256
+
+      - name: Install Java 17 for the pinned Android build
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17.0.13+11"
+
+      - name: Install the pinned Android SDK components
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          cmdline-tools-version: "12266719"
+          packages: platform-tools emulator platforms;android-35 build-tools;35.0.0 system-images;android-35;google_apis;x86_64
+
+      - name: Install Gradle 8.10.2
+        uses: gradle/gradle-build-action@ac2d340dc04d9e1113182899e983b5400c17cda1 # v3.5.0
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build the deterministic fixture APK
+        working-directory: fixtures/android-fixture
+        run: gradle --no-daemon --console plain :app:assembleDebug
+
+      - name: Install the exact wheel into an isolated server environment
+        run: |
+          server_env="$RUNNER_TEMP/mobile-use-server"
+          uv run --no-project --python "$PYTHON_VERSION" python -m venv "$server_env"
+          "$server_env/bin/python" -m pip install --disable-pip-version-check --no-input dist/*.whl
+
+      - name: Start the pinned emulator and run public acceptance
+        uses: reactivecircus/android-emulator-runner@324029e2f414c084d8b15ba075288885e74aef9c # v2.34.0
+        with:
+          api-level: ${{ env.ANDROID_API_LEVEL }}
+          system-image-api-level: ${{ env.ANDROID_API_LEVEL }}
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          channel: "0"
+          emulator-build: ${{ env.ANDROID_EMULATOR_BUILD }}
+          emulator-port: "5554"
+          emulator-boot-timeout: "300"
+          force-avd-creation: true
+          disable-animations: true
+          emulator-options: "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim"
+          script: |
+            set -euo pipefail
+            timeout 90s adb -s "$ANDROID_SERIAL" wait-for-device
+            adb -s "$ANDROID_SERIAL" install -r fixtures/android-fixture/app/build/outputs/apk/debug/app-debug.apk
+            timeout 90s .venv/bin/python scripts/android_emulator_preflight.py --serial "$ANDROID_SERIAL" --package "$FIXTURE_PACKAGE"
+            .venv/bin/python scripts/android_ci_acceptance.py --serial "$ANDROID_SERIAL" --package "$FIXTURE_PACKAGE" --server-command "$RUNNER_TEMP/mobile-use-server/bin/mobile-use-mcp" --artifact-root "$ARTIFACT_ROOT" --diagnostics "$DIAGNOSTICS_DIR/acceptance.log" --stage-timeout-seconds 35 --total-timeout-seconds 180
+
+      - name: Create a redacted diagnostic marker when setup failed early
+        if: ${{ always() }}
+        run: |
+          mkdir -p "$DIAGNOSTICS_DIR"
+          if [ ! -f "$DIAGNOSTICS_DIR/acceptance.log" ]; then
+            printf '%s\n' 'android acceptance did not reach the harness' > "$DIAGNOSTICS_DIR/acceptance.log"
+          fi
+
+      - name: Upload redacted Android diagnostics only
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: android-emulator-diagnostics-${{ github.sha }}
+          path: ${{ runner.temp }}/android-diagnostics/acceptance.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  required-gates:
+    name: Required CI gates
+    if: ${{ always() }}
+    needs:
+      - static-analysis
+      - unit-component-tests
+      - stdio-contract-tests
+      - build-wheel
+      - installed-package-smoke
+      - mcp-inspection
+      - android-emulator-acceptance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require every named gate to pass
+        env:
+          STATIC_RESULT: ${{ needs.static-analysis.result }}
+          UNIT_RESULT: ${{ needs.unit-component-tests.result }}
+          STDIO_RESULT: ${{ needs.stdio-contract-tests.result }}
+          BUILD_RESULT: ${{ needs.build-wheel.result }}
+          SMOKE_RESULT: ${{ needs.installed-package-smoke.result }}
+          INSPECT_RESULT: ${{ needs.mcp-inspection.result }}
+          ANDROID_RESULT: ${{ needs.android-emulator-acceptance.result }}
+        run: |
+          test "$STATIC_RESULT" = success
+          test "$UNIT_RESULT" = success
+          test "$STDIO_RESULT" = success
+          test "$BUILD_RESULT" = success
+          test "$SMOKE_RESULT" = success
+          test "$INSPECT_RESULT" = success
+          test "$ANDROID_RESULT" = success

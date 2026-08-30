@@ -260,27 +260,27 @@ def _parse_system_flag(output: str) -> bool | None:
     if re.search(flag_pattern, output, re.I):
         # An explicit flags value without SYSTEM does not prove that the app
         # is third-party; OEMs add unrelated flags and omit some names.
-        return False if any(
-            match.group(2) is not None and int(match.group(2), 16) == 0
-            for match in re.finditer(flag_pattern, output, re.I)
-        ) else None
+        return (
+            False
+            if any(
+                match.group(2) is not None and int(match.group(2), 16) == 0
+                for match in re.finditer(flag_pattern, output, re.I)
+            )
+            else None
+        )
     return None
 
 
 def _parse_activity(output: str, package: str) -> str | None:
     """Parse a launcher component from resolve/query-activities output."""
 
-    component_pattern = re.compile(
-        rf"(?<![A-Za-z0-9_.]){re.escape(package)}/([^\s,}}]+)"
-    )
+    component_pattern = re.compile(rf"(?<![A-Za-z0-9_.]){re.escape(package)}/([^\s,}}]+)")
     match = component_pattern.search(output)
     if match:
         activity = match.group(1).strip()
         if activity and activity.casefold() not in {"null", "none"}:
             return activity
-    info_match = re.search(
-        rf"packageName={re.escape(package)}\b.*?\bname=([^\s}}]+)", output, re.S
-    )
+    info_match = re.search(rf"packageName={re.escape(package)}\b.*?\bname=([^\s}}]+)", output, re.S)
     if info_match:
         return info_match.group(1)
     return None
@@ -298,11 +298,14 @@ def _parse_app_metadata(output: str, package: str) -> _ParsedAppMetadata:
 def _is_shell_error_output(output: str) -> bool:
     """Recognize common ADB/Android shell failures when exit codes are hidden."""
 
-    return re.search(
-        r"(?im)^\s*(?:error(?::|\s)|adb:\s|cmd:\s*failure\b|"
-        r"exception\b|unknown command\b|unknown option\b|permission denied\b)",
-        output,
-    ) is not None
+    return (
+        re.search(
+            r"(?im)^\s*(?:error(?::|\s)|adb:\s|cmd:\s*failure\b|"
+            r"exception\b|unknown command\b|unknown option\b|permission denied\b)",
+            output,
+        )
+        is not None
+    )
 
 
 def normalized_coordinate_to_pixel(value: float, size: int) -> int:
@@ -1762,10 +1765,7 @@ class AndroidController:
                 app
                 for app in records
                 if normalized in app.package.casefold()
-                or (
-                    app.launcher_label is not None
-                    and normalized in app.launcher_label.casefold()
-                )
+                or (app.launcher_label is not None and normalized in app.launcher_label.casefold())
             ]
         if not include_system:
             records = [app for app in records if app.is_third_party is True]

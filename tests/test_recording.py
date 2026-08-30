@@ -241,6 +241,7 @@ async def test_natural_completion_is_ready_until_explicit_retrieval(tmp_path: Pa
     process.returncode = 0
     process.finished.set()
     config = RuntimeConfig(artifact_root=tmp_path)
+
     async def fixed_factory(
         _serial: str, _path: str, _duration: int, _bit_rate: int | None
     ) -> FakeProcess:

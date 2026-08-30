@@ -20,7 +20,7 @@ modification_statement = "Significantly rewritten for the local MCP session boun
 path = "src/mobile_use_mcp/controller.py"
 upstream_path = "minitap/mobile_use/controllers/android_controller.py; minitap/mobile_use/tools/utils.py"
 kind = "adapted"
-sha256 = "a8180ff41dd72ad4a77394800f1375a5405c4a01421dbda368cc6ab107a524cb"
+sha256 = "db9d16a2e4f1409e9766abc0b0163a910348181afa18b1ae49413c5e871964ca"
 modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, MCP-safe results, independent observation components, and screenshot-only capture."
 
 [[files]]
@@ -41,5 +41,5 @@ modification_statement = "Significantly rewritten to normalize and bound Android
 path = "src/mobile_use_mcp/recording.py"
 upstream_path = "minitap/mobile_use/utils/video.py; minitap/mobile_use/tools/mobile/video_recording.py"
 kind = "adapted"
-sha256 = "a7e7fab184bde296c386daf17392a775f92ea022cee30a532ab9da85660d1211"
+sha256 = "79545b5dd8fc80b8f0119c66f9189ebbebc23e5c205c9274a5d6dc8e69276500"
 modification_statement = "Significantly rewritten for owned bounded screen-recording processes, segment cleanup, and local artifact limits."
