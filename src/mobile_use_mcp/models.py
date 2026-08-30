@@ -224,13 +224,9 @@ class PackagePolicy(StrictModel):
         if "allowed_packages" in source and "allowed_app_packages" in source:
             raise ValueError("allowed_packages and allowed_app_packages cannot both be provided")
         if "allowed_system_packages" in source and "system_packages" in source:
-            raise ValueError(
-                "allowed_system_packages and system_packages cannot both be provided"
-            )
+            raise ValueError("allowed_system_packages and system_packages cannot both be provided")
         if "allowed_system_surfaces" in source and "system_surfaces" in source:
-            raise ValueError(
-                "allowed_system_surfaces and system_surfaces cannot both be provided"
-            )
+            raise ValueError("allowed_system_surfaces and system_surfaces cannot both be provided")
         raw: Any = source.get("allowed_system_surfaces", source.get("system_surfaces"))
         if raw is None:
             return source
@@ -711,68 +707,6 @@ class ScreenshotCapture(StrictModel):
     screenshot_png: bytes
 
 
-class ScreenshotResult(StrictModel):
-    """Typed metadata accompanying a hierarchy-free MCP image."""
-
-    success: bool
-    operation_id: str = Field(min_length=1, max_length=128)
-    serial: str = Field(min_length=1, max_length=256)
-    session_id: str | None = Field(default=None, max_length=128)
-    generation: int | None = Field(default=None, ge=1)
-    screen_revision: int = Field(default=0, ge=0)
-    captured_at: datetime
-    width: int = Field(gt=0)
-    height: int = Field(gt=0)
-    image_format: Literal["png", "jpeg"]
-    image_quality: int | None = Field(default=None, ge=1, le=100)
-    image_lossless: bool
-    image_width: int = Field(gt=0)
-    image_height: int = Field(gt=0)
-    quality_notice: str
-    lossless_fallback: dict[str, Any] | None = None
-    hierarchy_collected: bool = False
-    foreground_app_collected: bool = False
-
-
-class SnapshotResult(ScreenshotResult):
-    """Typed metadata for an immutable, pageable Android snapshot."""
-
-    snapshot_id: str = Field(min_length=1, max_length=128)
-    detail_level: Literal["compact", "full"]
-    foreground_app: ForegroundApp
-    warnings: list[str] = Field(default_factory=list, max_length=20)
-    total_elements: int = Field(ge=0)
-    returned_elements: int = Field(ge=0)
-    element_count: int = Field(ge=0)
-    truncated: bool
-    next_offset: int | None = Field(default=None, ge=0)
-    full_fallback: dict[str, Any] | None = None
-    elements: list[UIElement] = Field(default_factory=lambda: [])
-
-
-class SelectorAttempt(StrictModel):
-    selector: str
-    matched: bool
-    error: str | None = None
-    match_count: int = Field(default=0, ge=0)
-
-
-class ResolvedTarget(StrictModel):
-    bounds: Bounds
-    selector: str
-    matched_selector: str | None = None
-    element: UIElement | None = None
-    attempts: list[SelectorAttempt] = Field(default_factory=lambda: list[SelectorAttempt]())
-
-
-class OperationResult(StrictModel):
-    success: bool
-    message: str
-    error_code: str | None = None
-    suggestion: str | None = None
-    data: dict[str, Any] = {}
-
-
 class LifecycleError(StrictModel):
     """Safe, machine-readable details for a lifecycle business failure."""
 
@@ -798,6 +732,360 @@ class ResultMappingMixin:
 
     def keys(self) -> Iterator[str]:
         return iter(self.model_dump(mode="json"))  # type: ignore[attr-defined]
+
+
+class ToolResultBase(ResultMappingMixin, StrictModel):
+    """Common envelope carried by every public structured Android result.
+
+    The envelope deliberately keeps operational diagnostics separate from a
+    tool's typed payload.  This makes success and business-error responses
+    consumable through one stable protocol shape while retaining enough
+    session provenance for a host agent to decide whether another observation
+    is safe.
+    """
+
+    success: bool
+    operation_id: str = Field(min_length=1, max_length=128)
+    message: str
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    warnings: list[str] = Field(default_factory=list, max_length=20)
+    error_code: str | None = Field(default=None, max_length=128)
+    category: str | None = Field(default=None, max_length=64)
+    retryable: bool | None = None
+    suggestion: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+    error: LifecycleError | None = None
+
+
+class ScreenshotResult(ToolResultBase):
+    """Typed metadata accompanying a hierarchy-free MCP image.
+
+    Image bytes remain native ``ImageContent``; this model is the structured
+    metadata side channel.  Optional/default capture fields also let the same
+    schema describe a typed business failure without fabricating a screenshot.
+    """
+
+    serial: str | None = Field(default=None, max_length=256)
+    screen_revision: int = Field(default=0, ge=0)
+    captured_at: datetime | None = None
+    width: int = Field(default=0, ge=0)
+    height: int = Field(default=0, ge=0)
+    image_format: Literal["png", "jpeg"] = "jpeg"
+    image_quality: int | None = Field(default=None, ge=1, le=100)
+    image_lossless: bool = False
+    image_width: int = Field(default=0, ge=0)
+    image_height: int = Field(default=0, ge=0)
+    quality_notice: str = ""
+    lossless_fallback: dict[str, Any] | None = None
+    hierarchy_collected: bool = False
+    foreground_app_collected: bool = False
+
+
+class SnapshotResult(ScreenshotResult):
+    """Typed metadata for an immutable, pageable Android snapshot."""
+
+    snapshot_id: str | None = Field(default=None, max_length=128)
+    detail_level: Literal["compact", "full"] = "compact"
+    foreground_app: ForegroundApp = Field(default_factory=ForegroundApp)
+    total_elements: int = Field(default=0, ge=0)
+    returned_elements: int = Field(default=0, ge=0)
+    element_count: int = Field(default=0, ge=0)
+    truncated: bool = False
+    next_offset: int | None = Field(default=None, ge=0)
+    full_fallback: dict[str, Any] | None = None
+    elements: list[UIElement] = Field(default_factory=lambda: [])
+
+
+class SelectorAttempt(StrictModel):
+    selector: str = Field(max_length=2_000)
+    matched: bool
+    error: str | None = Field(default=None, max_length=512)
+    match_count: int = Field(default=0, ge=0)
+
+
+class ResolvedTarget(StrictModel):
+    bounds: Bounds
+    selector: str
+    matched_selector: str | None = None
+    element: UIElement | None = None
+    attempts: list[SelectorAttempt] = Field(default_factory=lambda: list[SelectorAttempt]())
+
+
+class ActionFailureAttempt(StrictModel):
+    """Bounded, typed evidence for an action that could not complete."""
+
+    attempt: int | None = Field(default=None, ge=1)
+    outcome: str | None = Field(default=None, max_length=128)
+    polls: int | None = Field(default=None, ge=0)
+    selector: str | None = Field(default=None, max_length=2_000)
+    matched: bool | None = None
+    match_count: int | None = Field(default=None, ge=0)
+    error: str | None = Field(default=None, max_length=512)
+    error_code: str | None = Field(default=None, max_length=128)
+
+
+class ActionFailureData(ResultMappingMixin, StrictModel):
+    """Typed, safe payload shared by business failures from action tools.
+
+    The full adapter exception remains in the bounded ``details`` envelope;
+    this payload exposes only stable fields that callers can branch on.
+    """
+
+    action: str | None = Field(default=None, max_length=64)
+    stage: str | None = Field(default=None, max_length=64)
+    reason: str | None = Field(default=None, max_length=128)
+    cause_code: str | None = Field(default=None, max_length=128)
+    current_package: str | None = Field(default=None, max_length=512)
+    target_package: str | None = Field(default=None, max_length=512)
+    target_surface: str | None = Field(default=None, max_length=128)
+    foreground_state: str | None = Field(default=None, max_length=64)
+    attempts: list[ActionFailureAttempt] = Field(
+        default_factory=lambda: list[ActionFailureAttempt](), max_length=50
+    )
+
+
+CommandStatus = Literal["not_attempted", "sent", "failed", "uncertain"]
+EffectStatus = Literal["verified", "unverified", "blocked"]
+
+
+class Point(StrictModel):
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+
+
+class TargetActionData(ResultMappingMixin, StrictModel):
+    """Typed selector audit and native coordinate used by a tap action."""
+
+    x: int = Field(ge=0)
+    y: int = Field(ge=0)
+    selector: str = Field(min_length=1, max_length=2_000)
+    matched_selector: str = Field(min_length=1, max_length=2_000)
+    attempts: list[SelectorAttempt] = Field(
+        default_factory=lambda: list[SelectorAttempt](), max_length=50
+    )
+    duration_ms: int | None = Field(default=None, ge=0, le=10_000)
+
+
+class TargetActionResult(ToolResultBase):
+    """Typed result for tap and long-press actions."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    selector: str | None = Field(default=None, max_length=2_000)
+    matched_selector: str | None = Field(default=None, max_length=2_000)
+    attempts: list[SelectorAttempt] = Field(
+        default_factory=lambda: list[SelectorAttempt](), max_length=50
+    )
+    x: int | None = Field(default=None, ge=0)
+    y: int | None = Field(default=None, ge=0)
+    duration_ms: int | None = Field(default=None, ge=0, le=10_000)
+    data: TargetActionData | ActionFailureData | None = None
+
+
+class SwipeActionData(ResultMappingMixin, StrictModel):
+    """Typed native coordinates and mode used by a swipe action."""
+
+    start: Point
+    end: Point
+    duration_ms: int = Field(ge=1, le=10_000)
+    screen_width: int | None = Field(default=None, ge=1)
+    screen_height: int | None = Field(default=None, ge=1)
+    mode: Literal["pixels", "percentage"]
+    coordinates: SwipePercentage | None = None
+
+
+class SwipeResult(ToolResultBase):
+    """Typed result for a native-pixel or normalized swipe."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    start: Point | None = None
+    end: Point | None = None
+    duration_ms: int | None = Field(default=None, ge=0, le=10_000)
+    mode: Literal["pixels", "percentage"] | None = None
+    data: SwipeActionData | ActionFailureData | None = None
+
+
+class TargetAudit(StrictModel):
+    """Safe selector information attached to a text-field action."""
+
+    selector: str = Field(min_length=1, max_length=2_000)
+    matched_selector: str = Field(min_length=1, max_length=2_000)
+    attempts: list[SelectorAttempt] = Field(
+        default_factory=lambda: list[SelectorAttempt](), max_length=50
+    )
+    focus_status: str = Field(default="verified", max_length=64)
+    focus_verification_available: bool = False
+
+
+class InputFocusStage(StrictModel):
+    status: str = Field(max_length=64)
+    verification_available: bool = False
+
+
+class InputExecutionStage(StrictModel):
+    status: CommandStatus
+    method: Literal["uiautomator2", "adb", "unknown"]
+    fallback_used: bool = False
+
+
+class InputEffectStage(StrictModel):
+    status: str = Field(max_length=64)
+    verified: bool = False
+    verification_available: bool = False
+
+
+class InputMethodRestorationStage(StrictModel):
+    status: str = Field(max_length=64)
+
+
+class InputStages(StrictModel):
+    focus: InputFocusStage = Field(default_factory=lambda: InputFocusStage(status="unverified"))
+    execution: InputExecutionStage = Field(
+        default_factory=lambda: InputExecutionStage(status="not_attempted", method="unknown")
+    )
+    effect: InputEffectStage = Field(default_factory=lambda: InputEffectStage(status="unverified"))
+    input_method_restoration: InputMethodRestorationStage = Field(
+        default_factory=lambda: InputMethodRestorationStage(status="unknown")
+    )
+
+
+class InputActionData(ResultMappingMixin, StrictModel):
+    """Typed, plaintext-free status for text input and clearing."""
+
+    method: Literal["uiautomator2", "adb", "unknown"]
+    command_status: CommandStatus
+    effect_status: str = Field(max_length=64)
+    effect_verified: bool
+    restoration_status: str = Field(max_length=64)
+    input_method_status: str = Field(max_length=64)
+    input_method_restoration: str = Field(max_length=64)
+    focus_status: str = Field(max_length=64)
+    verification_available: bool
+    requires_observation: bool
+    fallback_used: bool
+    attempts: int = Field(ge=0)
+    max_attempts: int | None = Field(default=None, ge=0)
+    character_count: int | None = Field(default=None, ge=0, le=10_000)
+    fallback_max_characters: int | None = Field(default=None, ge=0, le=2_000)
+    target: TargetAudit | None = None
+    selector: str | None = Field(default=None, max_length=2_000)
+    matched_selector: str | None = Field(default=None, max_length=2_000)
+    selector_attempts: list[SelectorAttempt] = Field(
+        default_factory=lambda: list[SelectorAttempt](), max_length=50
+    )
+    stages: InputStages = Field(default_factory=InputStages)
+
+
+class InputActionResult(ToolResultBase):
+    """Typed result for Android text input and clear-text actions."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    data: InputActionData | ActionFailureData | None = None
+
+
+class TextInputResult(InputActionResult):
+    """Typed result for Android text input."""
+
+
+class ClearTextResult(InputActionResult):
+    """Typed result for Android text clearing."""
+
+
+class KeyActionData(ResultMappingMixin, StrictModel):
+    key: str = Field(min_length=1, max_length=32)
+
+
+class KeyActionResult(ToolResultBase):
+    """Typed result for a key-event command."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    data: KeyActionData | ActionFailureData | None = None
+
+
+class LaunchActionResult(ToolResultBase):
+    """Typed envelope for App launch command and foreground verification."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    data: AppLaunchResult | ActionFailureData | None = None
+
+
+class TerminateActionResult(ToolResultBase):
+    """Typed envelope for App force-stop command and effect verification."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    data: AppTerminationResult | ActionFailureData | None = None
+
+
+class OpenUrlActionData(ResultMappingMixin, StrictModel):
+    command_status: CommandStatus = "sent"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    target_surface: Literal["browser"] = "browser"
+
+
+class OpenUrlActionResult(ToolResultBase):
+    """Typed result for opening an HTTP(S) URL on Android."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    data: OpenUrlActionData | ActionFailureData | None = None
+
+
+class FixedWaitData(ResultMappingMixin, StrictModel):
+    milliseconds: int = Field(ge=0, le=60_000)
+
+
+class FixedWaitResult(ToolResultBase):
+    """Typed result for a fixed-delay wait."""
+
+    command_status: CommandStatus = "not_attempted"
+    effect_status: EffectStatus = "unverified"
+    requires_observation: bool = True
+    data: FixedWaitData | ActionFailureData | None = None
+
+
+class UIElementsResult(ToolResultBase):
+    """Typed, pageable projection of one immutable UI snapshot."""
+
+    snapshot_id: str | None = Field(default=None, max_length=128)
+    serial: str | None = Field(default=None, max_length=256)
+    screen_revision: int = Field(default=0, ge=0)
+    captured_at: datetime | None = None
+    width: int = Field(default=0, ge=0)
+    height: int = Field(default=0, ge=0)
+    snapshot_total_elements: int = Field(default=0, ge=0)
+    total_matches: int = Field(default=0, ge=0)
+    count: int = Field(default=0, ge=0)
+    element_count: int = Field(default=0, ge=0)
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=100, ge=1, le=500)
+    has_more: bool = False
+    truncated: bool = False
+    next_offset: int | None = Field(default=None, ge=0)
+    query: str | None = Field(default=None, max_length=500)
+    package: str | None = Field(default=None, max_length=512)
+    interactive_only: bool = False
+    elements: list[UIElement] = Field(default_factory=lambda: list[UIElement]())
+
+
+class ForegroundAppResult(ToolResultBase):
+    """Typed result distinguishing an empty foreground from a failed read."""
+
+    foreground_state: Literal["empty", "occupied", "unavailable"] = "unavailable"
+    foreground_app: ForegroundApp = Field(default_factory=ForegroundApp)
 
 
 class RecordingSegment(StrictModel):
@@ -893,7 +1181,7 @@ RecordingRetrieveResult = RecordingStatusResult
 RecordingArtifactMetadata = RecordingArtifact
 
 
-class WaitResult(ResultMappingMixin, StrictModel):
+class WaitResult(ToolResultBase):
     """Typed result for a bounded Android condition wait.
 
     A successful wait identifies the exact immutable observation that proved
@@ -902,10 +1190,7 @@ class WaitResult(ResultMappingMixin, StrictModel):
     caller or a complete hierarchy.
     """
 
-    success: bool
-    operation_id: str = Field(min_length=1, max_length=128)
     condition: Literal["text", "element", "ui_change"]
-    message: str
     poll_count: int = Field(ge=0)
     polls: int | None = Field(default=None, ge=0, description="Compatibility alias for poll_count.")
     elapsed_ms: float = Field(ge=0)
@@ -923,8 +1208,6 @@ class WaitResult(ResultMappingMixin, StrictModel):
     last_safe_observation: dict[str, Any] | None = None
     last_error_stage: str | None = Field(default=None, max_length=64)
     last_error_code: str | None = Field(default=None, max_length=64)
-    error_code: str | None = Field(default=None, max_length=64)
-    suggestion: str | None = None
     data: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -1047,7 +1330,7 @@ class DoctorCheck(StrictModel):
     details: dict[str, Any] = Field(default_factory=dict)
 
 
-class DoctorResult(ResultMappingMixin, StrictModel):
+class DoctorResult(ToolResultBase):
     """Result of an Android environment diagnosis.
 
     ``success`` describes whether all required checks were ready.  The doctor
@@ -1055,18 +1338,11 @@ class DoctorResult(ResultMappingMixin, StrictModel):
     so operators receive the complete independent matrix in one call.
     """
 
-    success: bool
-    operation_id: str = Field(min_length=1, max_length=128)
-    overall_status: DoctorStatus
-    message: str = Field(max_length=1_000)
+    overall_status: DoctorStatus = DoctorStatus.UNAVAILABLE
+    message: str = Field(default="Android doctor could not complete.", max_length=1_000)
     serial: str | None = Field(default=None, max_length=256)
     checks: list[DoctorCheck] = Field(default_factory=lambda: [])
     config: dict[str, Any] = Field(default_factory=dict)
-    error_code: str | None = None
-    category: str | None = None
-    retryable: bool | None = None
-    suggestion: str | None = None
-    details: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def healthy(self) -> bool:

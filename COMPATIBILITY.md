@@ -87,3 +87,25 @@ Verified on 2026-07-11 with Android device `HUAWEI P20` (`EML-AL00`, HarmonyOS 3
 - App discovery still searches third-party package names rather than localized launcher labels.
 - Screenshot tools provide visible pixels as MCP image content; downloading an App's original
   remote image asset is not currently a supported capability.
+
+## Version 0.4.0 typed MCP contract
+
+- Every public `android_*` tool now advertises an explicit `outputSchema` through `tools/list`.
+  Clients should use the declared Pydantic-backed fields rather than infer result shapes from
+  implementation-specific dictionaries.
+- Successful results include an `operation_id`; session-bound tools also include `session_id` and
+  `generation` when available. Action results expose typed `command_status`, `effect_status`, and
+  `requires_observation` fields, plus selector, coordinate, app, or input evidence in `data`.
+- Business failures now set MCP `isError=true` and carry `error_code`, `category`, `retryable`,
+  safe `message`/`suggestion`, bounded `details`, and the same operation ID. MCP clients should
+  branch on `isError` and the stable error code; framework argument/schema validation remains a
+  protocol validation error.
+- Screenshot and snapshot tools retain native MCP image content while their structured metadata is
+  validated against the advertised schema. Image bytes are not duplicated in structured JSON.
+- Action and recording annotations now mark device-mutating/open-world behavior as destructive;
+  clients must treat annotation hints as safety signals, not authorization.
+
+The `0.3.x` direct-call compatibility projection (`result["data"]`) remains available for embedded
+Python callers, but MCP clients should migrate to `structuredContent` and the advertised schema.
+Update clients that assumed an action failure returned `isError=false`; this was a breaking protocol
+change in 0.4.0.

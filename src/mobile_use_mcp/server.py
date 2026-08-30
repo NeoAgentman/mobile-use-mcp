@@ -29,35 +29,59 @@ from mobile_use_mcp.doctor import run_doctor_bounded
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
 from mobile_use_mcp.models import (
+    ActionFailureAttempt,
+    ActionFailureData,
     AndroidPackageName,
     AndroidSystemSurface,
+    AppLaunchAttempt,
     AppLaunchResult,
     AppListResult,
     AppTerminationResult,
+    ClearTextResult,
     DeviceConnectResult,
     DeviceDisconnectResult,
     DeviceInfo,
     DeviceListResult,
     DeviceStatusResult,
     DoctorResult,
-    DoctorStatus,
+    FixedWaitData,
+    FixedWaitResult,
     ForegroundApp,
+    ForegroundAppResult,
+    InputActionData,
+    InputActionResult,
+    InputStages,
+    KeyActionData,
+    KeyActionResult,
+    LaunchActionResult,
     LifecycleError,
     LifecycleResult,
-    OperationResult,
+    OpenUrlActionData,
+    OpenUrlActionResult,
     PackagePolicy,
+    Point,
     RecordingArtifact,
     RecordingState,
     RecordingStatusResult,
     ScreenshotCapture,
     ScreenshotResult,
     ScreenSnapshot,
+    SelectorAttempt,
     SessionConnection,
     SessionLifecycle,
     SnapshotResult,
+    SwipeActionData,
     SwipePercentage,
+    SwipeResult,
     Target,
+    TargetActionData,
+    TargetActionResult,
+    TargetAudit,
+    TerminateActionResult,
+    TextInputResult,
+    ToolResultBase,
     UIElement,
+    UIElementsResult,
     WaitResult,
 )
 from mobile_use_mcp.processes import run_blocking
@@ -114,15 +138,33 @@ READ_ONLY = ToolAnnotations(
     idempotentHint=True,
     openWorldHint=False,
 )
-SESSION_WRITE = ToolAnnotations(
+CONNECT_WRITE = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=False,
     idempotentHint=False,
     openWorldHint=False,
 )
-OPEN_WORLD_WRITE = ToolAnnotations(
+DISCONNECT_WRITE = ToolAnnotations(
     readOnlyHint=False,
     destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+APP_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+RECORDING_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
+OPEN_WORLD_WRITE = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
     idempotentHint=False,
     openWorldHint=True,
 )
@@ -168,14 +210,34 @@ def _redact_exact(value: Any, secret: str | None) -> Any:
     return value
 
 
-def _failure(error: MobileUseError, *, secret: str | None = None) -> OperationResult:
-    return OperationResult(
-        success=False,
-        error_code=error.code,
-        message=_redact_secret(error.message, secret),
-        suggestion=_redact_secret(error.suggestion, secret),
-        data=_redact_secret(error.data, secret),
-    )
+def _bounded_safe_value(value: Any, *, depth: int = 0) -> Any:
+    """Keep structured error details scalar, bounded, and serializer-safe."""
+
+    if depth > 2:
+        return None
+    if isinstance(value, BaseModel):
+        return _bounded_safe_value(value.model_dump(mode="json"), depth=depth + 1)
+    if isinstance(value, str):
+        return value[:512]
+    if isinstance(value, int | float | bool) or value is None:
+        return value
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_bounded_safe_value(item, depth=depth + 1) for item in list(cast(Any, value))[:50]]
+    if isinstance(value, dict):
+        mapping = cast(dict[Any, Any], value)
+        return {
+            str(key): _bounded_safe_value(item, depth=depth + 1)
+            for key, item in list(mapping.items())[:50]
+        }
+    return None
+
+
+def _safe_error_details(error: MobileUseError, *, secret: str | None = None) -> dict[str, Any]:
+    """Return bounded error details after redacting an optional secret."""
+
+    redacted = _redact_secret(error.data, secret)
+    bounded = _bounded_safe_value(redacted)
+    return cast(dict[str, Any], bounded) if isinstance(bounded, dict) else {}
 
 
 def _recording_result(
@@ -200,9 +262,7 @@ def _recording_result(
     raw_state: Any = raw.get("state", default_state)
     try:
         state = (
-            raw_state
-            if isinstance(raw_state, RecordingState)
-            else RecordingState(str(raw_state))
+            raw_state if isinstance(raw_state, RecordingState) else RecordingState(str(raw_state))
         )
     except ValueError:
         state = default_state
@@ -265,20 +325,20 @@ def _recording_failure(
     *,
     operation_id: str,
     status: RecordingStatusResult | None = None,
-) -> RecordingStatusResult:
+) -> CallToolResult:
     """Build a typed recording failure while keeping local paths bounded."""
 
     current = status or session.recording_status(operation_id)
-    details = _redact_secret(error.data, None)
+    details = _safe_error_details(error)
     lifecycle_error = LifecycleError(
         code=error.code.value,
         category=error.category.value,
         retryable=error.retryable,
         message=error.message,
         suggestion=error.suggestion,
-        details=cast(dict[str, Any], details) if isinstance(details, dict) else {},
+        details=details,
     )
-    return RecordingStatusResult(
+    result = RecordingStatusResult(
         success=False,
         operation_id=operation_id,
         message=error.message,
@@ -295,17 +355,129 @@ def _recording_failure(
         suggestion=error.suggestion,
         details=lifecycle_error.details,
         error=lifecycle_error,
-        data=cast(dict[str, Any], details) if isinstance(details, dict) else {},
+        data=details,
+    )
+    payload = result.model_dump(mode="json")
+    return _TypedCallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        structuredContent=payload,
     )
 
 
-class _LifecycleCallToolResult(CallToolResult):
-    """MCP error result that also supports legacy direct-call mapping access."""
+class _TypedCallToolResult(CallToolResult):
+    """Typed MCP error result that also supports legacy direct-call mappings."""
 
     def __getitem__(self, key: str) -> Any:
         if self.structuredContent is None:
             raise KeyError(key)
         return self.structuredContent[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if self.structuredContent is None:
+            return default
+        return self.structuredContent.get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return self.structuredContent is not None and key in self.structuredContent
+
+    def keys(self) -> Any:
+        return self.structuredContent.keys() if self.structuredContent is not None else ()
+
+
+class _LifecycleCallToolResult(_TypedCallToolResult):
+    """Typed lifecycle failure with direct-call mapping compatibility."""
+
+
+def _typed_failure(
+    output_type: type[ToolResultBase],
+    *,
+    operation_id: str,
+    error: MobileUseError,
+    secret: str | None = None,
+    session_id: str | None = None,
+    generation: int | None = None,
+    warnings: list[str] | None = None,
+    data: Any = None,
+    **extra: Any,
+) -> _TypedCallToolResult:
+    """Serialize one business failure against a concrete output schema.
+
+    FastMCP validates ``structuredContent`` for a typed tool even when the
+    handler returns a ``CallToolResult``.  Constructing the declared model
+    here therefore keeps protocol errors typed instead of falling through to
+    a framework validation error.
+    """
+
+    details = _safe_error_details(error, secret=secret)
+    message = _redact_secret(error.message, secret)
+    suggestion = _redact_secret(error.suggestion, secret)
+    lifecycle_error = LifecycleError(
+        code=error.code.value,
+        category=error.category.value,
+        retryable=error.retryable,
+        message=message,
+        suggestion=suggestion,
+        details=details,
+    )
+    fields: dict[str, Any] = {
+        "success": False,
+        "operation_id": operation_id,
+        "message": message,
+        "session_id": session_id if session_id is not None else session.session_id,
+        "generation": generation if generation is not None else session.generation,
+        "warnings": list(warnings or [])[:20],
+        "error_code": error.code.value,
+        "category": error.category.value,
+        "retryable": error.retryable,
+        "suggestion": suggestion,
+        "details": details,
+        "error": lifecycle_error,
+    }
+    if "data" in output_type.model_fields:
+        # Action tools retain a small, typed failure payload for clients that
+        # need to branch on policy/target stages.  The complete adapter data
+        # remains available only through the separately bounded ``details``.
+        fields["data"] = data if data is not None else _action_failure_data(error, secret=secret)
+    for name, value in extra.items():
+        if name in output_type.model_fields:
+            fields[name] = value
+    # Action models expose these statuses at the envelope level.  Preserve
+    # stage evidence supplied by the controller while failing closed when an
+    # adapter returned an unknown value.
+    error_data = error.data
+    if "command_status" in output_type.model_fields:
+        command_status = error_data.get("command_status")
+        fields["command_status"] = (
+            command_status
+            if command_status in {"not_attempted", "sent", "failed", "uncertain"}
+            else "not_attempted"
+        )
+    if "effect_status" in output_type.model_fields:
+        effect_status = error_data.get("effect_status")
+        fields["effect_status"] = (
+            effect_status
+            if effect_status in {"verified", "unverified", "blocked"}
+            else "unverified"
+        )
+    if "requires_observation" in output_type.model_fields:
+        fields["requires_observation"] = bool(error_data.get("requires_observation", True))
+    try:
+        result = output_type(**fields)
+    except Exception:
+        # A malformed adapter payload must never turn a business failure into
+        # an opaque framework error.  The common envelope is guaranteed to be
+        # valid; specialized optional fields are discarded in this fallback.
+        safe_fields = {
+            key: value for key, value in fields.items() if key in ToolResultBase.model_fields
+        }
+        result = output_type(**safe_fields)
+    payload = result.model_dump(mode="json")
+    return _TypedCallToolResult(
+        isError=True,
+        content=[TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))],
+        structuredContent=payload,
+    )
 
 
 def _lifecycle_failure(
@@ -322,24 +494,7 @@ def _lifecycle_failure(
 ) -> _LifecycleCallToolResult:
     """Build one typed lifecycle failure and mark it as an MCP business error."""
 
-    def safe_value(value: Any, depth: int = 0) -> Any:
-        if depth > 2:
-            return None
-        if isinstance(value, str):
-            return value[:512]
-        if isinstance(value, int | float | bool) or value is None:
-            return value
-        if isinstance(value, list):
-            items = cast(list[Any], value)
-            return [safe_value(item, depth + 1) for item in items[:50]]
-        if isinstance(value, dict):
-            nested = cast(dict[Any, Any], value)
-            return {
-                str(key): safe_value(item, depth + 1) for key, item in list(nested.items())[:50]
-            }
-        return None
-
-    safe_details = {str(key): safe_value(value) for key, value in error.data.items()}
+    safe_details = _safe_error_details(error)
     lifecycle_error = LifecycleError(
         code=error.code.value,
         category=error.category.value,
@@ -499,6 +654,22 @@ async def android_list_devices(limit: int = 50, offset: int = 0) -> DeviceListRe
                 state=session.state,
             ),
         )
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.ADB_UNAVAILABLE,
+            "Failed to list Android devices.",
+            "Check the configured ADB executable and retry android_list_devices.",
+            retryable_override=True,
+        )
+        return cast(
+            DeviceListResult,
+            _lifecycle_failure(
+                DeviceListResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+            ),
+        )
     page = devices[offset : offset + limit]
     return DeviceListResult(
         success=True,
@@ -556,28 +727,44 @@ async def android_doctor(
             mutating=False,
         )
     except MobileUseError as error:
-        return DoctorResult(
-            success=False,
-            operation_id=operation_id,
-            overall_status=DoctorStatus.UNAVAILABLE,
-            message=error.message,
-            serial=serial,
-            error_code=error.code.value,
-            category=error.category.value,
-            retryable=error.retryable,
-            suggestion=error.suggestion,
-            details=error.data,
-            config={
-                "adb_host": session.config.adb_host,
-                "adb_port": session.config.adb_port,
-            },
+        return cast(
+            DoctorResult,
+            _typed_failure(
+                DoctorResult,
+                operation_id=operation_id,
+                error=error,
+                serial=serial,
+                config={
+                    "adb_host": session.config.adb_host,
+                    "adb_port": session.config.adb_port,
+                },
+            ),
+        )
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Android doctor could not complete.",
+            "Retry android_doctor after checking the local MCP runtime.",
+        )
+        return cast(
+            DoctorResult,
+            _typed_failure(
+                DoctorResult,
+                operation_id=operation_id,
+                error=error,
+                serial=serial,
+                config={
+                    "adb_host": session.config.adb_host,
+                    "adb_port": session.config.adb_port,
+                },
+            ),
         )
 
 
 @mcp.tool(
     name="android_connect",
     title="Connect Android device",
-    annotations=SESSION_WRITE,
+    annotations=CONNECT_WRITE,
     structured_output=True,
 )
 async def android_connect(
@@ -796,12 +983,31 @@ async def android_status() -> DeviceStatusResult:
                 device=session.device,
             ),
         )
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Failed to read Android session status.",
+            "Retry android_status; if it persists, restart the local MCP server.",
+        )
+        return cast(
+            DeviceStatusResult,
+            _lifecycle_failure(
+                DeviceStatusResult,
+                operation_id=operation_id,
+                error=error,
+                state=session.state,
+                session_id=session.session_id,
+                generation=session.generation,
+                device=session.device,
+                connected=session.connected,
+            ),
+        )
 
 
 @mcp.tool(
     name="android_disconnect",
     title="Disconnect Android device",
-    annotations=SESSION_WRITE,
+    annotations=DISCONNECT_WRITE,
     structured_output=True,
 )
 async def android_disconnect() -> DeviceDisconnectResult:
@@ -846,6 +1052,7 @@ async def android_disconnect() -> DeviceDisconnectResult:
     name="android_snapshot",
     title="Observe Android screen",
     annotations=READ_ONLY,
+    structured_output=True,
 )
 async def android_snapshot(
     detail_level: Annotated[
@@ -894,7 +1101,7 @@ async def android_snapshot(
         int,
         Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
     ] = 60,
-) -> CallToolResult:
+) -> SnapshotResult:
     """Read visible content from the current Android app and capture its screen.
 
     Use this for mobile browsing and data collection such as titles, counts, descriptions, lists,
@@ -944,23 +1151,26 @@ async def android_snapshot(
             mutating=False,
         )
     except MobileUseError as error:
-        failure = _failure(error).model_dump(mode="json")
-        return CallToolResult(
-            isError=True,
-            content=[TextContent(type="text", text=json.dumps(failure, ensure_ascii=False))],
-            structuredContent=failure,
+        return cast(
+            SnapshotResult,
+            _typed_failure(
+                SnapshotResult,
+                operation_id=operation_id,
+                error=error,
+            ),
         )
     except Exception:
-        failure = OperationResult(
-            success=False,
-            error_code="OPERATION_FAILED",
-            message="Failed to capture the Android screen.",
-            suggestion="Verify the device is connected, unlocked, and responsive, then retry.",
-        ).model_dump(mode="json")
-        return CallToolResult(
-            isError=True,
-            content=[TextContent(type="text", text=json.dumps(failure, ensure_ascii=False))],
-            structuredContent=failure,
+        return cast(
+            SnapshotResult,
+            _typed_failure(
+                SnapshotResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Failed to capture the Android screen.",
+                    "Verify the device is connected, unlocked, and responsive, then retry.",
+                ),
+            ),
         )
 
     total_elements = len(snapshot.elements)
@@ -977,6 +1187,7 @@ async def android_snapshot(
         success=True,
         snapshot_id=snapshot_id,
         operation_id=operation_id,
+        message="Android screen snapshot captured.",
         session_id=snapshot.session_id,
         generation=snapshot.generation,
         screen_revision=snapshot.screen_revision,
@@ -1009,12 +1220,15 @@ async def android_snapshot(
         ),
         elements=returned_elements,
     ).model_dump(mode="json")
-    return CallToolResult(
-        content=[
-            TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
-            Image(data=image_data, format=image_format).to_image_content(),
-        ],
-        structuredContent=metadata,
+    return cast(
+        SnapshotResult,
+        CallToolResult(
+            content=[
+                TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
+                Image(data=image_data, format=image_format).to_image_content(),
+            ],
+            structuredContent=metadata,
+        ),
     )
 
 
@@ -1022,6 +1236,7 @@ async def android_snapshot(
     name="android_screenshot",
     title="Capture Android screenshot",
     annotations=READ_ONLY,
+    structured_output=True,
 )
 async def android_screenshot(
     image_format: Annotated[
@@ -1032,7 +1247,7 @@ async def android_screenshot(
         int,
         Field(ge=1, le=100, description="JPEG quality only; ignored for lossless PNG."),
     ] = 60,
-) -> CallToolResult:
+) -> ScreenshotResult:
     """Return only an original-resolution screenshot and basic metadata.
 
     This does not cache a pageable UI hierarchy. Use android_snapshot when locating targets or
@@ -1056,18 +1271,26 @@ async def android_screenshot(
             mutating=False,
         )
     except MobileUseError as error:
-        failure = _failure(error).model_dump(mode="json")
-        return CallToolResult(
-            isError=True,
-            content=[TextContent(type="text", text=json.dumps(failure))],
-            structuredContent=failure,
+        return cast(
+            ScreenshotResult,
+            _typed_failure(
+                ScreenshotResult,
+                operation_id=operation_id,
+                error=error,
+            ),
         )
     except Exception:
-        failure = _observation_failure("capture the Android screenshot")
-        return CallToolResult(
-            isError=True,
-            content=[TextContent(type="text", text=json.dumps(failure))],
-            structuredContent=failure,
+        return cast(
+            ScreenshotResult,
+            _typed_failure(
+                ScreenshotResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Failed to capture the Android screenshot.",
+                    "Verify the device is connected, unlocked, and responsive, then retry.",
+                ),
+            ),
         )
     image_data, image_width, image_height = encode_screenshot(
         snapshot.screenshot_png,
@@ -1077,6 +1300,7 @@ async def android_screenshot(
     metadata = ScreenshotResult(
         success=True,
         operation_id=operation_id,
+        message="Android screenshot captured.",
         serial=snapshot.serial,
         session_id=session.session_id,
         generation=session.generation,
@@ -1091,12 +1315,15 @@ async def android_screenshot(
         foreground_app_collected=False,
         **_image_delivery_metadata("android_screenshot", image_format, image_quality),
     ).model_dump(mode="json")
-    return CallToolResult(
-        content=[
-            TextContent(type="text", text=json.dumps(metadata)),
-            Image(data=image_data, format=image_format).to_image_content(),
-        ],
-        structuredContent=metadata,
+    return cast(
+        ScreenshotResult,
+        CallToolResult(
+            content=[
+                TextContent(type="text", text=json.dumps(metadata)),
+                Image(data=image_data, format=image_format).to_image_content(),
+            ],
+            structuredContent=metadata,
+        ),
     )
 
 
@@ -1133,7 +1360,7 @@ async def android_get_ui_elements(
             )
         ),
     ] = False,
-) -> dict[str, Any]:
+) -> UIElementsResult:
     """Filter and page UI nodes from one unchanged cached snapshot.
 
     The default page size is 100. Query searches text, content description, resource ID, class,
@@ -1172,9 +1399,23 @@ async def android_get_ui_elements(
             mutating=False,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            UIElementsResult,
+            _typed_failure(UIElementsResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _observation_failure("read Android UI elements")
+        return cast(
+            UIElementsResult,
+            _typed_failure(
+                UIElementsResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Failed to read Android UI elements.",
+                    "Verify the device is connected, unlocked, and responsive, then retry.",
+                ),
+            ),
+        )
 
     elements = snapshot.elements
     if interactive_only:
@@ -1204,31 +1445,33 @@ async def android_get_ui_elements(
     page = elements[offset : offset + limit]
     next_offset = offset + len(page)
     has_more = next_offset < len(elements)
-    return {
-        "success": True,
-        "snapshot_id": resolved_snapshot_id,
-        "serial": snapshot.serial,
-        "session_id": snapshot.session_id,
-        "generation": snapshot.generation,
-        "screen_revision": snapshot.screen_revision,
-        "captured_at": snapshot.captured_at.isoformat(),
-        "width": snapshot.width,
-        "height": snapshot.height,
-        "warnings": snapshot.warnings,
-        "snapshot_total_elements": len(snapshot.elements),
-        "total_matches": len(elements),
-        "count": len(page),
-        "element_count": len(page),
-        "offset": offset,
-        "limit": limit,
-        "has_more": has_more,
-        "truncated": has_more,
-        "next_offset": next_offset if has_more else None,
-        "query": query,
-        "package": package,
-        "interactive_only": interactive_only,
-        "elements": [element.model_dump(mode="json") for element in page],
-    }
+    return UIElementsResult(
+        success=True,
+        operation_id=operation_id,
+        message="Android UI elements read.",
+        snapshot_id=resolved_snapshot_id,
+        serial=snapshot.serial,
+        session_id=snapshot.session_id,
+        generation=snapshot.generation,
+        screen_revision=snapshot.screen_revision,
+        captured_at=snapshot.captured_at,
+        width=snapshot.width,
+        height=snapshot.height,
+        warnings=snapshot.warnings,
+        snapshot_total_elements=len(snapshot.elements),
+        total_matches=len(elements),
+        count=len(page),
+        element_count=len(page),
+        offset=offset,
+        limit=limit,
+        has_more=has_more,
+        truncated=has_more,
+        next_offset=next_offset if has_more else None,
+        query=query,
+        package=package,
+        interactive_only=interactive_only,
+        elements=page,
+    )
 
 
 @mcp.tool(
@@ -1237,7 +1480,7 @@ async def android_get_ui_elements(
     annotations=READ_ONLY,
     structured_output=True,
 )
-async def android_get_foreground_app() -> dict[str, Any]:
+async def android_get_foreground_app() -> ForegroundAppResult:
     """Return the package and activity currently in the foreground."""
 
     operation_id = session.new_operation_id()
@@ -1250,15 +1493,32 @@ async def android_get_foreground_app() -> dict[str, Any]:
             mutating=False,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            ForegroundAppResult,
+            _typed_failure(ForegroundAppResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _observation_failure("read the foreground Android app")
-    return {
-        "success": True,
-        "operation_id": operation_id,
-        "foreground_state": "empty" if foreground.package is None else "occupied",
-        "foreground_app": foreground.model_dump(mode="json"),
-    }
+        return cast(
+            ForegroundAppResult,
+            _typed_failure(
+                ForegroundAppResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.FOREGROUND_UNAVAILABLE,
+                    "Failed to read the foreground Android app.",
+                    "Verify the device is connected and responsive, then retry.",
+                ),
+            ),
+        )
+    return ForegroundAppResult(
+        success=True,
+        operation_id=operation_id,
+        message="Android foreground app read.",
+        session_id=session.session_id,
+        generation=session.generation,
+        foreground_state="empty" if foreground.package is None else "occupied",
+        foreground_app=foreground,
+    )
 
 
 @mcp.tool(
@@ -1468,13 +1728,8 @@ class _WaitState:
         self.last_error_code = code
 
 
-class _WaitCallToolResult(CallToolResult):
-    """MCP error result that remains mapping-compatible for direct callers."""
-
-    def __getitem__(self, key: str) -> Any:
-        if self.structuredContent is None:
-            raise KeyError(key)
-        return self.structuredContent[key]
+class _WaitCallToolResult(_TypedCallToolResult):
+    """Wait-specific name retained for readable type annotations."""
 
 
 def _snapshot_fingerprint(snapshot: ScreenSnapshot) -> tuple[object, ...]:
@@ -1559,9 +1814,7 @@ def _wait_element_match(snapshot: ScreenSnapshot, target: Target) -> tuple[int, 
             }
         ]
         selected = (
-            text_matches[target.text_index]
-            if target.text_index < len(text_matches)
-            else None
+            text_matches[target.text_index] if target.text_index < len(text_matches) else None
         )
         candidates = [selected] if selected is not None else []
     return candidates[0] if candidates else None
@@ -1616,7 +1869,7 @@ def _wait_error_with_evidence(
 ) -> MobileUseError:
     """Attach wait diagnostics to an early device/session failure."""
 
-    details = dict(error.data)
+    details = _safe_error_details(error)
     details.update(
         {
             "operation_id": state.operation_id,
@@ -1652,7 +1905,7 @@ def _wait_failure(
 ) -> _WaitCallToolResult:
     """Serialize a wait failure and mark it as an MCP business error."""
 
-    details = dict(error.data)
+    details = _safe_error_details(error)
     last_observation = details.get("last_observation")
     last_observation_data = (
         cast(dict[str, Any], last_observation) if isinstance(last_observation, dict) else None
@@ -1683,9 +1936,7 @@ def _wait_failure(
             else None
         ),
         screen_revision=(
-            int(last_observation_data.get("screen_revision", 0))
-            if last_observation_data
-            else 0
+            int(last_observation_data.get("screen_revision", 0)) if last_observation_data else 0
         ),
         baseline_snapshot_id=baseline_snapshot_id,
         baseline_screen_revision=baseline_screen_revision,
@@ -1697,12 +1948,21 @@ def _wait_failure(
             else None
         ),
         last_error_code=(
-            str(details["last_error_code"])
-            if details.get("last_error_code") is not None
-            else None
+            str(details["last_error_code"]) if details.get("last_error_code") is not None else None
         ),
         error_code=error.code.value,
+        category=error.category.value,
+        retryable=error.retryable,
         suggestion=error.suggestion,
+        details=details,
+        error=LifecycleError(
+            code=error.code.value,
+            category=error.category.value,
+            retryable=error.retryable,
+            message=error.message,
+            suggestion=error.suggestion,
+            details=details,
+        ),
         data=details,
     ).model_dump(mode="json")
     return _WaitCallToolResult(
@@ -1979,24 +2239,6 @@ async def _run_condition_wait(
         raise
 
 
-def _observation_failure(action: str) -> dict[str, Any]:
-    return OperationResult(
-        success=False,
-        error_code="OPERATION_FAILED",
-        message=f"Failed to {action}.",
-        suggestion="Verify the device is connected, unlocked, and responsive, then retry.",
-    ).model_dump(mode="json")
-
-
-def _unexpected_failure(action: str) -> dict[str, Any]:
-    return OperationResult(
-        success=False,
-        error_code="OPERATION_FAILED",
-        message=f"Android {action} failed.",
-        suggestion="Call android_snapshot to inspect the current device state, then retry.",
-    ).model_dump(mode="json")
-
-
 def _configured_method(instance: Any, name: str) -> Any | None:
     """Find an explicitly implemented/injected method without Mock auto-attrs."""
 
@@ -2150,6 +2392,164 @@ def _safe_input_data(value: Any, *, secret: str | None = None) -> dict[str, obje
             if str(key).casefold() not in sensitive_keys
         }
     return cast(dict[str, object], _redact_secret(unknown("unknown"), secret))
+
+
+def _target_audit(value: Any) -> TargetAudit | None:
+    """Normalize target focus metadata without retaining field contents."""
+
+    if not isinstance(value, dict):
+        return None
+    raw = cast(dict[str, Any], value)
+    selector = raw.get("selector")
+    if not isinstance(selector, str) or not selector:
+        return None
+    matched_selector = raw.get("matched_selector", selector)
+    if not isinstance(matched_selector, str) or not matched_selector:
+        matched_selector = selector
+    return TargetAudit(
+        selector=selector,
+        matched_selector=matched_selector,
+        attempts=_selector_attempts(raw.get("attempts")),
+        focus_status=str(raw.get("focus_status", "verified")),
+        focus_verification_available=bool(raw.get("focus_verification_available", False)),
+    )
+
+
+def _input_action_data(
+    value: Any,
+    *,
+    secret: str | None = None,
+    character_count: int | None = None,
+    fallback_max_characters: int | None = None,
+    target_details: dict[str, object] | None = None,
+) -> InputActionData:
+    """Convert controller input status into a plaintext-free typed payload."""
+
+    raw = _safe_input_data(value, secret=secret)
+    method_value = raw.get("method")
+    method = cast(
+        Literal["uiautomator2", "adb", "unknown"],
+        method_value if method_value in {"uiautomator2", "adb"} else "unknown",
+    )
+    command_value = raw.get("command_status")
+    command_status = cast(
+        Literal["not_attempted", "sent", "failed", "uncertain"],
+        command_value
+        if command_value in {"not_attempted", "sent", "failed", "uncertain"}
+        else "sent",
+    )
+    effect_status = str(raw.get("effect_status", "unverified"))
+    restoration_status = str(
+        raw.get("restoration_status", raw.get("input_method_status", "unknown"))
+    )
+    focus_status = str(raw.get("focus_status", "unverified"))
+    verification_available = bool(raw.get("verification_available", False))
+    requires_observation = bool(raw.get("requires_observation", effect_status != "verified"))
+    attempts_value = raw.get("attempts", 1)
+    attempts = int(attempts_value) if isinstance(attempts_value, int) else 1
+    max_attempts_value = raw.get("max_attempts")
+    max_attempts = int(max_attempts_value) if isinstance(max_attempts_value, int) else None
+    stages_value = raw.get("stages")
+    if isinstance(stages_value, dict):
+        try:
+            stages = InputStages.model_validate(stages_value)
+        except (TypeError, ValueError):
+            stages = InputStages.model_validate(
+                {
+                    "focus": {
+                        "status": focus_status,
+                        "verification_available": verification_available,
+                    },
+                    "execution": {
+                        "status": command_status,
+                        "method": method,
+                        "fallback_used": bool(raw.get("fallback_used", False)),
+                    },
+                    "effect": {
+                        "status": effect_status,
+                        "verified": bool(raw.get("effect_verified", effect_status == "verified")),
+                        "verification_available": verification_available,
+                    },
+                    "input_method_restoration": {"status": restoration_status},
+                }
+            )
+    else:
+        stages = InputStages.model_validate(
+            {
+                "focus": {
+                    "status": focus_status,
+                    "verification_available": verification_available,
+                },
+                "execution": {
+                    "status": command_status,
+                    "method": method,
+                    "fallback_used": bool(raw.get("fallback_used", False)),
+                },
+                "effect": {
+                    "status": effect_status,
+                    "verified": bool(raw.get("effect_verified", effect_status == "verified")),
+                    "verification_available": verification_available,
+                },
+                "input_method_restoration": {"status": restoration_status},
+            }
+        )
+    target = _target_audit(target_details)
+    selector_attempts = target.attempts if target is not None else []
+    return InputActionData(
+        method=method,
+        command_status=command_status,
+        effect_status=effect_status,
+        effect_verified=bool(raw.get("effect_verified", effect_status == "verified")),
+        restoration_status=restoration_status,
+        input_method_status=str(raw.get("input_method_status", restoration_status)),
+        input_method_restoration=str(raw.get("input_method_restoration", restoration_status)),
+        focus_status=focus_status,
+        verification_available=verification_available,
+        requires_observation=requires_observation,
+        fallback_used=bool(raw.get("fallback_used", False)),
+        attempts=attempts,
+        max_attempts=max_attempts,
+        character_count=character_count,
+        fallback_max_characters=fallback_max_characters,
+        target=target,
+        selector=target.selector if target is not None else None,
+        matched_selector=target.matched_selector if target is not None else None,
+        selector_attempts=selector_attempts,
+        stages=stages,
+    )
+
+
+def _input_action_success(
+    value: Any,
+    *,
+    operation_id: str,
+    message: str,
+    result_type: type[InputActionResult] = InputActionResult,
+    secret: str | None = None,
+    character_count: int | None = None,
+    fallback_max_characters: int | None = None,
+    target_details: dict[str, object] | None = None,
+) -> InputActionResult:
+    """Build the common typed result for text input and clearing."""
+
+    data = _input_action_data(
+        value,
+        secret=secret,
+        character_count=character_count,
+        fallback_max_characters=fallback_max_characters,
+        target_details=target_details,
+    )
+    return result_type(
+        success=True,
+        operation_id=operation_id,
+        message=message,
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status=data.command_status,
+        effect_status=("verified" if data.effect_verified else "unverified"),
+        requires_observation=data.requires_observation,
+        data=data,
+    )
 
 
 async def _resolve_and_focus_target(
@@ -2312,13 +2712,137 @@ async def _resolve_and_dispatch_target(
     return result
 
 
+def _selector_attempts(value: Any) -> list[SelectorAttempt]:
+    """Normalize an adapter selector ledger into the public typed shape."""
+
+    if not isinstance(value, list):
+        return []
+    items = cast(list[Any], value)
+    attempts: list[SelectorAttempt] = []
+    for item in items[:50]:
+        with suppress(Exception):
+            attempts.append(
+                item if isinstance(item, SelectorAttempt) else SelectorAttempt.model_validate(item)
+            )
+    return attempts
+
+
+def _action_failure_data(
+    error: MobileUseError,
+    *,
+    secret: str | None = None,
+) -> ActionFailureData:
+    """Project safe, stable action failure fields into the typed payload."""
+
+    details = _safe_error_details(error, secret=secret)
+
+    def text_value(name: str, *, limit: int) -> str | None:
+        value = details.get(name)
+        return value[:limit] if isinstance(value, str) else None
+
+    attempts_value = details.get("attempts")
+    attempts: list[ActionFailureAttempt] = []
+    if isinstance(attempts_value, list):
+        failure_attempts = cast(list[Any], attempts_value)
+        for raw in failure_attempts[:50]:
+            if not isinstance(raw, dict):
+                continue
+            item = cast(dict[str, Any], raw)
+            candidate: dict[str, Any] = {}
+            for name in (
+                "attempt",
+                "outcome",
+                "polls",
+                "selector",
+                "matched",
+                "match_count",
+                "error",
+                "error_code",
+            ):
+                if name in item:
+                    candidate[name] = item[name]
+            with suppress(Exception):
+                attempts.append(ActionFailureAttempt.model_validate(candidate))
+
+    return ActionFailureData(
+        action=text_value("action", limit=64),
+        stage=text_value("stage", limit=64),
+        reason=text_value("reason", limit=128),
+        cause_code=(
+            text_value("cause_code", limit=128)
+            or text_value("error_code", limit=128)
+            or error.code.value
+        ),
+        current_package=text_value("current_package", limit=512),
+        target_package=text_value("target_package", limit=512),
+        target_surface=text_value("target_surface", limit=128),
+        foreground_state=text_value("foreground_state", limit=64),
+        attempts=attempts,
+    )
+
+
+def _target_action_success(
+    details: Any,
+    *,
+    operation_id: str,
+    message: str,
+    duration_ms: int | None = None,
+) -> TargetActionResult:
+    """Build a typed target-action result from the controller audit payload."""
+
+    raw = cast(dict[str, Any], details) if isinstance(details, dict) else {}
+    selector_value = raw.get("selector")
+    selector = selector_value[:2_000] if isinstance(selector_value, str) else "target"
+    matched_value = raw.get("matched_selector")
+    matched_selector = (
+        matched_value[:2_000] if isinstance(matched_value, str) and matched_value else selector
+    )
+    attempts = _selector_attempts(raw.get("attempts"))
+    action_duration = raw.get("duration_ms", duration_ms)
+    if (
+        not isinstance(action_duration, int)
+        or isinstance(action_duration, bool)
+        or not 0 <= action_duration <= 10_000
+    ):
+        action_duration = duration_ms
+    x = raw.get("x")
+    y = raw.get("y")
+    x_value = int(x) if isinstance(x, int) and not isinstance(x, bool) and x >= 0 else None
+    y_value = int(y) if isinstance(y, int) and not isinstance(y, bool) and y >= 0 else None
+    data = TargetActionData(
+        x=x_value if x_value is not None else 0,
+        y=y_value if y_value is not None else 0,
+        selector=selector,
+        matched_selector=matched_selector,
+        attempts=attempts,
+        duration_ms=action_duration,
+    )
+    return TargetActionResult(
+        success=True,
+        operation_id=operation_id,
+        message=message.format(selector=selector),
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status="sent",
+        effect_status="unverified",
+        requires_observation=True,
+        selector=selector,
+        matched_selector=matched_selector,
+        attempts=attempts,
+        x=x_value,
+        y=y_value,
+        duration_ms=action_duration,
+        data=data,
+    )
+
+
 @mcp.tool(
     name="android_tap",
     title="Tap Android UI target",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
-async def android_tap(target: Target) -> dict[str, Any]:
+async def android_tap(target: Target) -> TargetActionResult:
     """Tap using an opaque ref, provenance-bound bounds, or semantic fallbacks.
 
     A successful call means the input command was sent, not that the expected UI state appeared.
@@ -2338,20 +2862,39 @@ async def android_tap(target: Target) -> dict[str, Any]:
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            TargetActionResult,
+            _typed_failure(TargetActionResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("tap")
-    return OperationResult(
-        success=True,
-        message=f"Tapped using {details['selector']}.",
-        data=details,
-    ).model_dump(mode="json")
+        return cast(
+            TargetActionResult,
+            _typed_failure(
+                TargetActionResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android tap failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    return _target_action_success(
+        details,
+        operation_id=operation_id,
+        message="Tapped using {selector}.",
+    )
 
 
 @mcp.tool(
     name="android_long_press",
     title="Long press Android UI target",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_long_press(
@@ -2360,7 +2903,7 @@ async def android_long_press(
         int,
         Field(ge=100, le=10_000, description="Press duration in milliseconds."),
     ] = 1_000,
-) -> dict[str, Any]:
+) -> TargetActionResult:
     """Long press an opaque ref, provenance-bound bounds, or semantic fallbacks.
 
     Observe again afterward to verify the resulting UI state.
@@ -2384,20 +2927,40 @@ async def android_long_press(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            TargetActionResult,
+            _typed_failure(TargetActionResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("long press")
-    return OperationResult(
-        success=True,
-        message=f"Long pressed using {details['selector']}.",
-        data=details,
-    ).model_dump(mode="json")
+        return cast(
+            TargetActionResult,
+            _typed_failure(
+                TargetActionResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android long press failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    return _target_action_success(
+        details,
+        operation_id=operation_id,
+        message="Long pressed using {selector}.",
+        duration_ms=duration_ms,
+    )
 
 
 @mcp.tool(
     name="android_swipe",
     title="Swipe Android screen",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_swipe(
@@ -2457,7 +3020,7 @@ async def android_swipe(
         float | None,
         Field(default=None, ge=0, le=1, description="Normalized end Y in [0, 1]."),
     ] = None,
-) -> dict[str, Any]:
+) -> SwipeResult:
     """Swipe in pixels or one validated normalized-coordinate mode.
 
     Screenshot previews may be visually scaled by the host. Pixel mode uses the reported native
@@ -2466,6 +3029,14 @@ async def android_swipe(
     prefer flat coordinates, ``coordinate_mode="percentage"`` (or ``"percent"``) interprets
     the four coordinate values as normalized values.
     """
+
+    operation_id = session.new_operation_id()
+
+    def invalid(error: MobileUseError) -> SwipeResult:
+        return cast(
+            SwipeResult,
+            _typed_failure(SwipeResult, operation_id=operation_id, error=error),
+        )
 
     pixel_values = (start_x, start_y, end_x, end_y)
     flat_percentage_values = (
@@ -2480,26 +3051,26 @@ async def android_swipe(
     explicit_pixels = coordinate_mode == "pixels"
     normalized: SwipePercentage | None = None
     if coordinate_mode not in {None, "pixels", "percentage", "percent"}:
-        return _failure(
+        return invalid(
             MobileUseError(
                 ErrorCode.INVALID_COORDINATES,
                 "coordinate_mode must be pixels or percentage.",
                 'Use coordinate_mode="pixels" or coordinate_mode="percentage".',
             )
-        ).model_dump(mode="json")
+        )
     if explicit_percentage:
         if (
             percentage is not None
             or has_flat_percentage
             or not all(value is not None for value in pixel_values)
         ):
-            return _failure(
+            return invalid(
                 MobileUseError(
                     ErrorCode.INVALID_COORDINATES,
                     "Flat percentage mode requires all four coordinate values and no other mode.",
                     'Pass four start/end values with coordinate_mode="percentage" only.',
                 )
-            ).model_dump(mode="json")
+            )
         try:
             normalized = SwipePercentage(
                 start_x=float(cast(float, start_x)),
@@ -2508,30 +3079,30 @@ async def android_swipe(
                 end_y=float(cast(float, end_y)),
             )
         except (TypeError, ValueError):
-            return _failure(
+            return invalid(
                 MobileUseError(
                     ErrorCode.INVALID_COORDINATES,
                     "Percentage coordinates must be numbers in the [0, 1] range.",
                     "Use four normalized values between 0 and 1.",
                 )
-            ).model_dump(mode="json")
+            )
         has_pixels = False
     elif explicit_pixels and (percentage is not None or has_flat_percentage):
-        return _failure(
+        return invalid(
             MobileUseError(
                 ErrorCode.INVALID_COORDINATES,
                 "Pixel mode cannot be combined with percentage coordinates.",
                 "Provide only the four integer pixel coordinates.",
             )
-        ).model_dump(mode="json")
+        )
     if percentage is not None and has_flat_percentage:
-        return _failure(
+        return invalid(
             MobileUseError(
                 ErrorCode.INVALID_COORDINATES,
                 "Use either percentage or the flat percentage fields, not both.",
                 "Provide exactly one complete swipe coordinate mode.",
             )
-        ).model_dump(mode="json")
+        )
     if (
         (has_pixels and (percentage is not None or has_flat_percentage))
         or (has_pixels and not all(value is not None for value in pixel_values))
@@ -2543,39 +3114,39 @@ async def android_swipe(
             )
         )
     ):
-        return _failure(
+        return invalid(
             MobileUseError(
                 ErrorCode.INVALID_COORDINATES,
                 "Swipe coordinates must use all four pixel values or one percentage mode.",
                 "Provide start_x/start_y/end_x/end_y, or percentage with all four "
                 "normalized values.",
             )
-        ).model_dump(mode="json")
+        )
     if not explicit_percentage:
         percentage_value: Any = percentage
         if percentage_value is not None and not isinstance(percentage_value, SwipePercentage):
             try:
                 normalized = SwipePercentage.model_validate(percentage_value)
             except (TypeError, ValueError):
-                return _failure(
+                return invalid(
                     MobileUseError(
                         ErrorCode.INVALID_COORDINATES,
                         "Percentage coordinates must contain four values in the [0, 1] range.",
                         "Provide percentage.start_x, start_y, end_x, and end_y between 0 and 1.",
                     )
-                ).model_dump(mode="json")
+                )
         elif percentage_value is not None:
             normalized = percentage_value
         if has_flat_percentage:
             if not all(value is not None for value in flat_percentage_values):
-                return _failure(
+                return invalid(
                     MobileUseError(
                         ErrorCode.INVALID_COORDINATES,
                         "All four flat percentage coordinates are required.",
                         "Provide start_x_percent, start_y_percent, end_x_percent, and "
                         "end_y_percent.",
                     )
-                ).model_dump(mode="json")
+                )
             try:
                 normalized = SwipePercentage(
                     start_x=cast(float, start_x_percent),
@@ -2584,23 +3155,22 @@ async def android_swipe(
                     end_y=cast(float, end_y_percent),
                 )
             except (TypeError, ValueError):
-                return _failure(
+                return invalid(
                     MobileUseError(
                         ErrorCode.INVALID_COORDINATES,
                         "Percentage coordinates must be numbers in the [0, 1] range.",
                         "Use four normalized values between 0 and 1.",
                     )
-                ).model_dump(mode="json")
+                )
     if not has_pixels and normalized is None:
-        return _failure(
+        return invalid(
             MobileUseError(
                 ErrorCode.INVALID_COORDINATES,
                 "Swipe coordinates were not provided.",
                 "Provide all four pixel coordinates or one complete percentage mode.",
             )
-        ).model_dump(mode="json")
+        )
 
-    operation_id = session.new_operation_id()
     try:
 
         async def act(context: Any) -> dict[str, object]:
@@ -2659,28 +3229,92 @@ async def android_swipe(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            SwipeResult,
+            _typed_failure(SwipeResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("swipe")
-    return OperationResult(
+        return cast(
+            SwipeResult,
+            _typed_failure(
+                SwipeResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android swipe failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    raw_details = cast(dict[str, Any], details) if isinstance(details, dict) else {}
+    try:
+        data = SwipeActionData(
+            start=Point.model_validate(raw_details["start"]),
+            end=Point.model_validate(raw_details["end"]),
+            duration_ms=duration_ms,
+            screen_width=(
+                int(raw_details["screen_width"])
+                if isinstance(raw_details.get("screen_width"), int)
+                and raw_details["screen_width"] > 0
+                else None
+            ),
+            screen_height=(
+                int(raw_details["screen_height"])
+                if isinstance(raw_details.get("screen_height"), int)
+                and raw_details["screen_height"] > 0
+                else None
+            ),
+            mode="percentage" if normalized is not None else "pixels",
+            coordinates=normalized,
+        )
+    except (KeyError, TypeError, ValueError):
+        return cast(
+            SwipeResult,
+            _typed_failure(
+                SwipeResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android swipe completed without usable coordinate evidence.",
+                    "Observe the current screen before deciding whether another swipe is needed.",
+                    data={
+                        "command_status": "sent",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    return SwipeResult(
         success=True,
+        operation_id=operation_id,
         message=(
             "Swiped using normalized coordinates converted to native pixels."
             if normalized is not None
             else "Swiped using native pixel coordinates."
         ),
-        data={
-            **details,
-            "mode": "percentage" if normalized is not None else "pixels",
-            "duration_ms": duration_ms,
-        },
-    ).model_dump(mode="json")
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status="sent",
+        effect_status="unverified",
+        requires_observation=True,
+        start=data.start,
+        end=data.end,
+        duration_ms=duration_ms,
+        mode=data.mode,
+        data=data,
+    )
 
 
 @mcp.tool(
     name="android_type_text",
     title="Type text on Android",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_type_text(
@@ -2701,7 +3335,7 @@ async def android_type_text(
             )
         ),
     ] = None,
-) -> dict[str, Any]:
+) -> TextInputResult:
     """Focus and type while reporting command/effect/IME stages separately.
 
     The text is used only inside the device operation and in-memory effect
@@ -2722,9 +3356,7 @@ async def android_type_text(
             ):
                 target_details, expected_element = await _resolve_and_focus_target(_context, target)
                 session.advance_screen_revision(operation=_context)
-                target_package = (
-                    expected_element.package if expected_element is not None else None
-                )
+                target_package = expected_element.package if expected_element is not None else None
                 await _authorize_action(
                     _context,
                     controller,
@@ -2761,34 +3393,53 @@ async def android_type_text(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error, secret=text).model_dump(mode="json")
+        return cast(
+            TextInputResult,
+            _typed_failure(
+                TextInputResult,
+                operation_id=operation_id,
+                error=error,
+                secret=text,
+            ),
+        )
     except Exception:
-        return _unexpected_failure("text input")
-    data: dict[str, Any] = {
-        **_safe_input_data(method, secret=text),
-        "character_count": len(text),
-    }
-    if target_details is not None:
-        safe_target_details = _redact_secret(target_details, text)
-        data["target"] = safe_target_details
-        for key in ("selector", "matched_selector", "attempts"):
-            if key in target_details:
-                data[key] = safe_target_details[key]
-    return OperationResult(
-        success=True,
+        return cast(
+            TextInputResult,
+            _typed_failure(
+                TextInputResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android text input failed.",
+                    "Call android_snapshot to inspect the field before retrying text input.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    typed = _input_action_success(
+        method,
+        operation_id=operation_id,
+        result_type=TextInputResult,
+        secret=text,
+        character_count=len(text),
+        target_details=target_details,
         message=(
             "Text input command completed; observe the field to verify the effect."
-            if not data.get("effect_verified", False)
+            if not _input_action_data(method, secret=text).effect_verified
             else "Text was entered and verified in the focused field."
         ),
-        data=data,
-    ).model_dump(mode="json")
+    )
+    return cast(TextInputResult, typed)
 
 
 @mcp.tool(
     name="android_clear_text",
     title="Clear focused Android text",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_clear_text(
@@ -2808,7 +3459,7 @@ async def android_clear_text(
             )
         ),
     ] = None,
-) -> dict[str, Any]:
+) -> ClearTextResult:
     """Focus and clear text with bounded attempts and an explicit empty check."""
 
     bounded_max_characters = max(1, min(max_characters, 2_000))
@@ -2826,9 +3477,7 @@ async def android_clear_text(
             ):
                 target_details, expected_element = await _resolve_and_focus_target(_context, target)
                 session.advance_screen_revision(operation=_context)
-                target_package = (
-                    expected_element.package if expected_element is not None else None
-                )
+                target_package = expected_element.package if expected_element is not None else None
                 await _authorize_action(
                     _context,
                     controller,
@@ -2865,33 +3514,54 @@ async def android_clear_text(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            ClearTextResult,
+            _typed_failure(ClearTextResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("text clearing")
-    data = {
-        **_safe_input_data(method),
-        "fallback_max_characters": bounded_max_characters,
-    }
-    if target_details is not None:
-        data["target"] = target_details
-        for key in ("selector", "matched_selector", "attempts"):
-            if key in target_details:
-                data[key] = target_details[key]
-    return OperationResult(
-        success=True,
-        message=(
-            "Text clear command completed and the field is empty."
-            if data.get("effect_verified", False)
-            else "Text clear command completed; observe the field to verify it is empty."
+        return cast(
+            ClearTextResult,
+            _typed_failure(
+                ClearTextResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android text clearing failed.",
+                    "Call android_snapshot to inspect the field before retrying clear text.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    data = _input_action_data(
+        method,
+        fallback_max_characters=bounded_max_characters,
+        target_details=target_details,
+    )
+    return cast(
+        ClearTextResult,
+        _input_action_success(
+            method,
+            operation_id=operation_id,
+            result_type=ClearTextResult,
+            fallback_max_characters=bounded_max_characters,
+            target_details=target_details,
+            message=(
+                "Text clear command completed and the field is empty."
+                if data.effect_verified
+                else "Text clear command completed; observe the field to verify it is empty."
+            ),
         ),
-        data=data,
-    ).model_dump(mode="json")
+    )
 
 
 @mcp.tool(
     name="android_press_key",
     title="Press Android key",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_press_key(
@@ -2901,7 +3571,7 @@ async def android_press_key(
             description=("One of: back, home, enter, delete, tab, menu, volume_up, volume_down.")
         ),
     ],
-) -> dict[str, Any]:
+) -> KeyActionResult:
     """Press back, home, enter, delete, tab, menu, or a volume key.
 
     Success means the key command was sent; observe again to verify any UI transition.
@@ -2928,18 +3598,46 @@ async def android_press_key(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            KeyActionResult,
+            _typed_failure(KeyActionResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("key press")
-    return OperationResult(success=True, message=f"Pressed Android key {key!r}.").model_dump(
-        mode="json"
+        return cast(
+            KeyActionResult,
+            _typed_failure(
+                KeyActionResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android key press failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    data = KeyActionData(key=key)
+    return KeyActionResult(
+        success=True,
+        operation_id=operation_id,
+        message=f"Pressed Android key {key!r}.",
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status="sent",
+        effect_status="unverified",
+        requires_observation=True,
+        data=data,
     )
 
 
 @mcp.tool(
     name="android_launch_app",
     title="Launch Android app",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_launch_app(
@@ -2970,7 +3668,7 @@ async def android_launch_app(
         int,
         Field(ge=1, le=5, description="Consecutive foreground reads required for readiness."),
     ] = 2,
-) -> dict[str, Any]:
+) -> LaunchActionResult:
     """Open an installed Android mobile App and wait until it reaches the foreground.
 
     Use this for requests such as 打开手机上的小红书 or open the shopping App. This tool requires an
@@ -3012,36 +3710,151 @@ async def android_launch_app(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        launch_data: AppLaunchResult | None = None
+        raw_attempts = error.data.get("attempts")
+        if isinstance(raw_attempts, list):
+            attempts: list[AppLaunchAttempt] = []
+            launch_attempt_items = cast(list[Any], raw_attempts)
+            for item in launch_attempt_items[:50]:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    raw_attempt = cast(dict[str, Any], item)
+                    foreground_value = raw_attempt.get("foreground_app", ForegroundApp())
+                    foreground = (
+                        foreground_value
+                        if isinstance(foreground_value, ForegroundApp)
+                        else ForegroundApp.model_validate(foreground_value)
+                    )
+                    attempts.append(
+                        AppLaunchAttempt(
+                            attempt=max(1, int(raw_attempt.get("attempt", len(attempts) + 1))),
+                            outcome=str(raw_attempt.get("outcome", "unknown")),
+                            polls=max(0, int(raw_attempt.get("polls", 0))),
+                            foreground_app=foreground,
+                            command_status=cast(
+                                Literal["sent", "failed", "uncertain"],
+                                raw_attempt.get("command_status", "uncertain"),
+                            ),
+                            effect_status=cast(
+                                Literal["verified", "blocked", "unverified"],
+                                raw_attempt.get("effect_status", "unverified"),
+                            ),
+                            blocker=(
+                                ForegroundApp.model_validate(raw_attempt["blocker"])
+                                if isinstance(raw_attempt.get("blocker"), dict)
+                                else None
+                            ),
+                            error_code=(
+                                str(raw_attempt["error_code"])
+                                if raw_attempt.get("error_code") is not None
+                                else None
+                            ),
+                        )
+                    )
+                except Exception:
+                    continue
+            launch_data = AppLaunchResult(
+                requested_package=package,
+                command_status="uncertain" if error.code == ErrorCode.TIMEOUT else "failed",
+                effect_status="blocked" if attempts else "unverified",
+                verification_available=bool(attempts),
+                stabilized=False,
+                foreground_app=ForegroundApp(),
+                attempts=attempts,
+            )
+        return cast(
+            LaunchActionResult,
+            _typed_failure(
+                LaunchActionResult,
+                operation_id=operation_id,
+                error=error,
+                data=launch_data,
+            ),
+        )
     except Exception:
-        return _unexpected_failure("app launch")
+        return cast(
+            LaunchActionResult,
+            _typed_failure(
+                LaunchActionResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android app launch failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
     if isinstance(launch, AppLaunchResult):
-        data = launch.model_dump(mode="json")
+        data = launch
     elif isinstance(launch, ForegroundApp):
-        data = {
-            "foreground_app": launch.model_dump(mode="json"),
-            "requested_package": package,
-            "command_status": "sent",
-            "effect_status": "unverified",
-            "verification_available": False,
-            "stabilized": False,
-            "requires_observation": True,
-        }
+        data = AppLaunchResult(
+            requested_package=package,
+            command_status="sent",
+            effect_status="unverified",
+            verification_available=False,
+            stabilized=False,
+            foreground_app=launch,
+            attempts=[],
+        )
     elif isinstance(launch, dict):
-        data = cast(dict[str, Any], launch)
+        raw = cast(dict[str, Any], launch)
+        try:
+            data = AppLaunchResult.model_validate(
+                {
+                    "requested_package": package,
+                    "foreground_app": raw.get("foreground_app", ForegroundApp()),
+                    "attempts": raw.get("attempts", []),
+                    **raw,
+                }
+            )
+        except Exception:
+            data = AppLaunchResult(
+                requested_package=package,
+                command_status="sent",
+                effect_status="unverified",
+                verification_available=False,
+                stabilized=False,
+                foreground_app=ForegroundApp(),
+                attempts=[],
+            )
     else:
-        data = {"requested_package": package, "effect_status": "unverified"}
-    return OperationResult(
+        data = AppLaunchResult(
+            requested_package=package,
+            command_status="sent",
+            effect_status="unverified",
+            verification_available=False,
+            stabilized=False,
+            foreground_app=ForegroundApp(),
+            attempts=[],
+        )
+    effect_status = (
+        data.effect_status
+        if data.effect_status in {"verified", "blocked", "unverified"}
+        else "unverified"
+    )
+    return LaunchActionResult(
         success=True,
+        operation_id=operation_id,
         message=f"Launched Android app {package!r}.",
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status=data.command_status,
+        effect_status=effect_status,
+        requires_observation=effect_status != "verified",
         data=data,
-    ).model_dump(mode="json")
+    )
 
 
 @mcp.tool(
     name="android_terminate_app",
     title="Terminate Android app",
-    annotations=SESSION_WRITE,
+    annotations=APP_WRITE,
     structured_output=True,
 )
 async def android_terminate_app(
@@ -3053,7 +3866,7 @@ async def android_terminate_app(
             description="Exact installed Android package name to force-stop.",
         ),
     ],
-) -> dict[str, Any]:
+) -> TerminateActionResult:
     """Force-stop one exact package and report whether its effect was observable."""
 
     operation_id = session.new_operation_id()
@@ -3077,28 +3890,81 @@ async def android_terminate_app(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            TerminateActionResult,
+            _typed_failure(TerminateActionResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("app termination")
+        return cast(
+            TerminateActionResult,
+            _typed_failure(
+                TerminateActionResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android app termination failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
     if isinstance(termination, AppTerminationResult):
-        data = termination.model_dump(mode="json")
+        data = termination
     elif isinstance(termination, dict):
-        data = cast(dict[str, Any], termination)
+        raw = cast(dict[str, Any], termination)
+        try:
+            data = AppTerminationResult.model_validate(
+                {
+                    "requested_package": package,
+                    "targeted_package": package,
+                    "command_status": "sent",
+                    "effect_status": "unverified",
+                    "effect_verified": False,
+                    "verification_available": False,
+                    "requires_observation": True,
+                    **raw,
+                }
+            )
+        except Exception:
+            data = AppTerminationResult(
+                requested_package=package,
+                targeted_package=package,
+                command_status="sent",
+                effect_status="unverified",
+                effect_verified=False,
+                verification_available=False,
+                requires_observation=True,
+            )
     else:
-        data = {
-            "requested_package": package,
-            "targeted_package": package,
-            "command_status": "sent",
-            "effect_status": "unverified",
-            "effect_verified": False,
-            "verification_available": False,
-            "requires_observation": True,
-        }
-    return OperationResult(
+        data = AppTerminationResult(
+            requested_package=package,
+            targeted_package=package,
+            command_status="sent",
+            effect_status="unverified",
+            effect_verified=False,
+            verification_available=False,
+            requires_observation=True,
+        )
+    effect_status = (
+        data.effect_status
+        if data.effect_status in {"verified", "blocked", "unverified"}
+        else "unverified"
+    )
+    return TerminateActionResult(
         success=True,
+        operation_id=operation_id,
         message=f"Terminated Android app {package!r}.",
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status=data.command_status,
+        effect_status=effect_status,
+        requires_observation=data.requires_observation,
         data=data,
-    ).model_dump(mode="json")
+    )
 
 
 @mcp.tool(
@@ -3116,7 +3982,7 @@ async def android_open_url(
             description="Absolute http:// or https:// URL to open.",
         ),
     ],
-) -> dict[str, Any]:
+) -> OpenUrlActionResult:
     """Send one absolute HTTP or HTTPS URL to the Android default browser.
 
     Success means the open command was sent; observe afterward for a chooser, permission dialog,
@@ -3144,18 +4010,46 @@ async def android_open_url(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return cast(
+            OpenUrlActionResult,
+            _typed_failure(OpenUrlActionResult, operation_id=operation_id, error=error),
+        )
     except Exception:
-        return _unexpected_failure("URL open")
-    return OperationResult(success=True, message="Opened the URL on Android.").model_dump(
-        mode="json"
+        return cast(
+            OpenUrlActionResult,
+            _typed_failure(
+                OpenUrlActionResult,
+                operation_id=operation_id,
+                error=MobileUseError(
+                    ErrorCode.OPERATION_FAILED,
+                    "Android URL open failed.",
+                    "Call android_snapshot to inspect the current device state, then retry.",
+                    data={
+                        "command_status": "uncertain",
+                        "effect_status": "unverified",
+                        "requires_observation": True,
+                    },
+                ),
+            ),
+        )
+    data = OpenUrlActionData()
+    return OpenUrlActionResult(
+        success=True,
+        operation_id=operation_id,
+        message="Opened the URL on Android; observe the resulting surface.",
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status="sent",
+        effect_status="unverified",
+        requires_observation=True,
+        data=data,
     )
 
 
 @mcp.tool(
     name="android_start_recording",
     title="Start Android screen recording",
-    annotations=SESSION_WRITE,
+    annotations=RECORDING_WRITE,
     structured_output=True,
 )
 async def android_start_recording(
@@ -3202,14 +4096,20 @@ async def android_start_recording(
             mutating=True,
         )
     except MobileUseError as error:
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     except Exception:
         error = MobileUseError(
             ErrorCode.OPERATION_FAILED,
             "Android screen recording start failed.",
             "Check android_status and retry after confirming the device is ready.",
         )
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     return _recording_result(
         details,
         operation_id=operation_id,
@@ -3221,7 +4121,7 @@ async def android_start_recording(
 @mcp.tool(
     name="android_stop_recording",
     title="Stop Android screen recording",
-    annotations=SESSION_WRITE,
+    annotations=RECORDING_WRITE,
     structured_output=True,
 )
 async def android_stop_recording(
@@ -3260,14 +4160,20 @@ async def android_stop_recording(
             mutating=True,
         )
     except MobileUseError as error:
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     except Exception:
         error = MobileUseError(
             ErrorCode.OPERATION_FAILED,
             "Android screen recording stop failed.",
             "Inspect android_status before retrying recording cleanup.",
         )
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     return _recording_result(
         details,
         operation_id=operation_id,
@@ -3295,14 +4201,20 @@ async def android_recording_status() -> RecordingStatusResult:
             mutating=False,
         )
     except MobileUseError as error:
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     except Exception:
         error = MobileUseError(
             ErrorCode.OPERATION_FAILED,
             "Android recording status could not be read.",
             "Retry android_recording_status after checking the MCP server.",
         )
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     if isinstance(result, RecordingStatusResult):
         return result.model_copy(update={"operation_id": operation_id}, deep=True)
     return _recording_result(
@@ -3320,7 +4232,7 @@ android_get_recording_status = android_recording_status
 @mcp.tool(
     name="android_retrieve_recording",
     title="Retrieve Android recording artifact",
-    annotations=SESSION_WRITE,
+    annotations=RECORDING_WRITE,
     structured_output=True,
 )
 async def android_retrieve_recording(
@@ -3350,14 +4262,20 @@ async def android_retrieve_recording(
             mutating=True,
         )
     except MobileUseError as error:
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     except Exception:
         error = MobileUseError(
             ErrorCode.OPERATION_FAILED,
             "Android recording artifact retrieval failed.",
             "Use a retained artifact_id from android_recording_status and retry.",
         )
-        return _recording_failure(error, operation_id=operation_id)
+        return cast(
+            RecordingStatusResult,
+            _recording_failure(error, operation_id=operation_id),
+        )
     if isinstance(details, RecordingStatusResult):
         return details.model_copy(update={"operation_id": operation_id}, deep=True)
     return _recording_result(
@@ -3540,10 +4458,7 @@ async def android_wait_for_ui_change(
     """
 
     if baseline_revision is not None:
-        if (
-            baseline_screen_revision is not None
-            and baseline_revision != baseline_screen_revision
-        ):
+        if baseline_screen_revision is not None and baseline_revision != baseline_screen_revision:
             raise ValueError("baseline_revision and baseline_screen_revision must agree")
         baseline_screen_revision = baseline_revision
     if baseline_snapshot_id is None and baseline_screen_revision is None:
@@ -3574,7 +4489,7 @@ async def android_wait(
             description="Fixed sleep duration; this does not wait for any UI condition.",
         ),
     ] = 1_000,
-) -> dict[str, Any]:
+) -> FixedWaitResult:
     """Sleep for a fixed delay and invalidate the cached snapshot.
 
     This is not a condition wait and does not observe whether an element appeared. Call
@@ -3596,12 +4511,22 @@ async def android_wait(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
-    return OperationResult(
+        return cast(
+            FixedWaitResult,
+            _typed_failure(FixedWaitResult, operation_id=operation_id, error=error),
+        )
+    data = FixedWaitData(milliseconds=milliseconds)
+    return FixedWaitResult(
         success=True,
-        message=f"Waited {milliseconds} milliseconds.",
-        data={"milliseconds": milliseconds},
-    ).model_dump(mode="json")
+        operation_id=operation_id,
+        message=f"Waited {milliseconds} milliseconds; observe the screen before acting.",
+        session_id=session.session_id,
+        generation=session.generation,
+        command_status="sent",
+        effect_status="unverified",
+        requires_observation=True,
+        data=data,
+    )
 
 
 def main() -> None:

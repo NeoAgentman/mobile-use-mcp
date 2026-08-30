@@ -256,7 +256,7 @@ async def test_stdio_action_tool_validates_nested_target_and_returns_session_err
             read_timeout_seconds=timedelta(seconds=5),
         )
 
-    assert result.isError is False
+    assert result.isError is True
     assert result.structuredContent is not None
     assert result.structuredContent["success"] is False
     assert result.structuredContent["error_code"] == "NOT_CONNECTED"

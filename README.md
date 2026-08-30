@@ -407,17 +407,36 @@ Failure responses include every attempted selector and recommend taking a fresh 
 
 ## Error model
 
-Expected operational failures return structured data instead of internal tracebacks:
+Every public tool advertises a typed output schema through MCP `tools/list`. Expected operational
+failures return MCP `isError=true` with the same structured envelope instead of internal
+tracebacks. Framework argument/schema errors remain protocol validation errors:
 
 ```json
 {
   "success": false,
+  "operation_id": "op-...",
   "error_code": "DEVICE_DISCONNECTED",
+  "category": "device",
+  "retryable": true,
   "message": "Android device 'ABC123' is no longer connected and ready.",
   "suggestion": "Reconnect the device, verify `adb devices -l`, then call android_connect again.",
-  "data": {}
+  "details": {},
+  "error": {
+    "code": "DEVICE_DISCONNECTED",
+    "category": "device",
+    "retryable": true,
+    "message": "Android device 'ABC123' is no longer connected and ready.",
+    "suggestion": "Reconnect the device, verify `adb devices -l`, then call android_connect again.",
+    "details": {}
+  }
 }
 ```
+
+Action successes additionally report typed `command_status`, `effect_status`, and
+`requires_observation` fields. The `data` object contains selector attempts, native coordinates,
+input stages, or app postcondition evidence. Screenshot tools return native MCP image content and
+typed metadata; image bytes are not copied into structured JSON. See
+[`COMPATIBILITY.md`](COMPATIBILITY.md) for the 0.4.0 migration note.
 
 Stable error codes include:
 
