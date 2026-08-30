@@ -186,6 +186,32 @@ async def test_stdio_android_doctor_returns_independent_capability_matrix() -> N
     assert checks[0]["status"] == "unavailable"
 
 
+async def test_stdio_recording_status_is_typed_and_idle_without_a_device() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "mobile_use_mcp"],
+        cwd=project_root,
+    )
+
+    async with (
+        stdio_client(parameters) as (read_stream, write_stream),
+        ClientSession(read_stream, write_stream) as client,
+    ):
+        await client.initialize()
+        result = await client.call_tool(
+            "android_recording_status",
+            read_timeout_seconds=timedelta(seconds=5),
+        )
+
+    assert result.isError is False
+    assert result.structuredContent is not None
+    assert result.structuredContent["success"] is True
+    assert result.structuredContent["state"] == "idle"
+    assert result.structuredContent["artifact_id"] is None
+    assert result.structuredContent["operation_id"]
+
+
 async def test_stdio_action_tool_validates_nested_target_and_returns_session_error() -> None:
     project_root = Path(__file__).resolve().parents[1]
     parameters = StdioServerParameters(

@@ -1793,8 +1793,23 @@ class AndroidController:
     ) -> dict[str, object]:
         return await self.recording.start(max_duration_seconds, bit_rate)
 
-    async def stop_recording(self) -> dict[str, object]:
-        return await self.recording.stop()
+    async def stop_recording(self, artifact_id: str | None = None) -> dict[str, object]:
+        return await self.recording.stop(artifact_id)
+
+    def bind_recording_context(self, session_id: str | None, generation: int | None) -> None:
+        """Stamp recordings created by this controller with session provenance."""
+
+        self.recording.bind_session(session_id, generation)
+
+    def recording_status(self, operation_id: str | None = None) -> dict[str, object]:
+        """Return the owned recording state without touching the Android device."""
+
+        return self.recording.status(operation_id)
+
+    async def retrieve_recording(self, artifact_id: str) -> dict[str, object]:
+        """Claim one retained recording artifact by opaque ID."""
+
+        return await self.recording.retrieve(artifact_id)
 
     def disconnect(self) -> None:
         self.recording.abort()

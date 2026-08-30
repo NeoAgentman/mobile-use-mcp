@@ -27,6 +27,9 @@ from mobile_use_mcp.models import (
     LifecycleError,
     PackagePolicy,
     PackagePolicySummary,
+    RecordingState,
+    RecordingStatusResult,
+    RecordingStatusSummary,
     ResolvedTarget,
     ScreenSnapshot,
     SessionConnection,
@@ -144,6 +147,10 @@ class DeviceSession:
         self.controller_factory = controller_impl
         self._device: DeviceInfo | None = None
         self._controller: AndroidController | None = None
+        # Recording artifacts outlive a controller disconnect by design. Keep
+        # manager references so a valid completed artifact remains retrievable
+        # until its configured retention policy evicts it.
+        self._recording_managers: list[Any] = []
         self._snapshot_store = snapshot_store or SnapshotStore(
             max_entries=self.config.snapshot_max_entries,
             max_bytes=self.config.snapshot_max_bytes,
@@ -849,6 +856,7 @@ class DeviceSession:
         self._state = SessionLifecycle.READY
         self._last_error = None
         self._clear_snapshot_unchecked()
+        self._register_recording_manager(controller, self._session_id, self._generation)
         return SessionConnection(
             session_id=self._session_id,
             generation=self._generation,
@@ -856,6 +864,24 @@ class DeviceSession:
             device=selected,
             policy=self.policy_summary(),
         )
+
+    def _register_recording_manager(
+        self,
+        controller: Any,
+        session_id: str | None,
+        generation: int | None,
+    ) -> None:
+        """Remember a controller's recording owner and bind session identity."""
+
+        binder = getattr(controller, "bind_recording_context", None)
+        if callable(binder):
+            with suppress(Exception):
+                binder(session_id, generation)
+        manager = getattr(controller, "recording", None)
+        if manager is None:
+            return
+        if all(existing is not manager for existing in self._recording_managers):
+            self._recording_managers.append(manager)
 
     def _detach_controller_locked(self) -> AndroidController | None:
         """Release the current controller while the lifecycle lock is held."""
@@ -1863,10 +1889,111 @@ class DeviceSession:
             self._state = SessionLifecycle.READY
             self._last_error = None
 
+    def _recording_manager_status(self, operation_id: str | None = None) -> RecordingStatusResult:
+        """Read the most recent manager without requiring a live controller."""
+
+        for manager in reversed(self._recording_managers):
+            reader = getattr(manager, "status", None)
+            if not callable(reader):
+                continue
+            try:
+                value = reader(operation_id)
+                if isinstance(value, RecordingStatusResult):
+                    return value
+                if isinstance(value, dict):
+                    return RecordingStatusResult.model_validate(value)
+            except Exception:
+                # Status is diagnostic; a broken retired manager must not hide
+                # the current session lifecycle status.
+                continue
+        return RecordingStatusResult(
+            success=True,
+            operation_id=operation_id or _new_operation_id(),
+            message="No Android screen recording is active.",
+            state=RecordingState.IDLE,
+            serial=self._device.serial if self._device is not None else None,
+            session_id=self._session_id,
+            generation=self._generation,
+        )
+
+    def recording_status(self, operation_id: str | None = None) -> RecordingStatusResult:
+        """Return typed recording state, including retained artifact metadata."""
+
+        return self._recording_manager_status(operation_id)
+
+    get_recording_status = recording_status
+
+    async def start_recording(
+        self,
+        max_duration_seconds: int,
+        bit_rate: int | None = None,
+        *,
+        operation: OperationContext | None = None,
+    ) -> dict[str, object]:
+        """Start recording through the currently owned Android controller."""
+
+        try:
+            controller = self.require_controller(operation=operation)
+        except TypeError:
+            # Keep injected legacy controller seams that expose a zero-argument
+            # ``require_controller`` compatible with the session wrapper.
+            controller = self.require_controller()
+        return await controller.start_recording(max_duration_seconds, bit_rate)
+
+    async def stop_recording(
+        self,
+        artifact_id: str | None = None,
+        *,
+        operation: OperationContext | None = None,
+    ) -> dict[str, object]:
+        """Stop or finalize the current recording through the session owner."""
+
+        try:
+            controller = self.require_controller(operation=operation)
+        except TypeError:
+            controller = self.require_controller()
+        if artifact_id is None:
+            return await controller.stop_recording()
+        return await controller.stop_recording(artifact_id)
+
+    async def retrieve_recording(self, artifact_id: str) -> dict[str, object]:
+        """Claim a retained artifact without accepting a filesystem path."""
+
+        last_error: MobileUseError | None = None
+        for manager in reversed(self._recording_managers):
+            retriever = getattr(manager, "retrieve", None)
+            if not callable(retriever):
+                continue
+            try:
+                value = retriever(artifact_id)
+                if inspect.isawaitable(value):
+                    value = await value
+                if isinstance(value, RecordingStatusResult):
+                    return value.model_dump(mode="json")
+                if isinstance(value, dict):
+                    return cast(dict[str, object], value)
+            except MobileUseError as error:
+                last_error = error
+                if error.code not in {
+                    ErrorCode.RECORDING_ARTIFACT_NOT_FOUND,
+                    ErrorCode.RECORDING_ARTIFACT_EXPIRED,
+                }:
+                    raise
+        if last_error is not None:
+            raise last_error
+        raise MobileUseError(
+            ErrorCode.NOT_CONNECTED,
+            "No Android recording owner is available in this session.",
+            "Connect an Android device before retrieving a recording artifact.",
+        )
+
+    get_recording = retrieve_recording
+
     def status(self, operation_id: str | None = None) -> DeviceStatusResult:
         """Return a safe typed status snapshot without probing the device."""
 
         op_id = operation_id or _new_operation_id()
+        recording = self._recording_manager_status(op_id)
         with self._state_lock:
             state = self.state
             device = self._device
@@ -1911,6 +2038,14 @@ class DeviceSession:
                 details=last_error.details if last_error else {},
                 policy=self.policy_summary(),
                 package_policy=self.policy_summary(),
+                recording=RecordingStatusSummary(
+                    state=recording.state,
+                    artifact_id=recording.artifact_id,
+                    artifact=recording.artifact,
+                    warnings=recording.warnings,
+                ),
+                recording_state=recording.state,
+                recording_artifact_id=recording.artifact_id,
             )
 
     def get_status(self, operation_id: str | None = None) -> DeviceStatusResult:

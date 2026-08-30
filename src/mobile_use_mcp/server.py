@@ -6,7 +6,7 @@ import json
 import signal
 import sys
 from collections.abc import AsyncGenerator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import isawaitable
@@ -46,6 +46,9 @@ from mobile_use_mcp.models import (
     LifecycleResult,
     OperationResult,
     PackagePolicy,
+    RecordingArtifact,
+    RecordingState,
+    RecordingStatusResult,
     ScreenshotCapture,
     ScreenshotResult,
     ScreenSnapshot,
@@ -68,6 +71,8 @@ screen recording. Connect the device, resolve the installed package with android
 possible, and compose snapshot/tap/swipe/input tools for multi-step mobile workflows.
 Observe again after actions. The tools operate Android only, not iOS. Screenshots capture visible
 pixels but do not download an app's original remote media file unless another tool provides it.
+Recording artifacts are owned by the server: use the returned artifact_id with
+android_retrieve_recording, never submit a local filesystem path for cleanup.
 Call android_doctor to diagnose the local ADB, device, uiautomator2, and capability state before
 starting a workflow. Use android_wait_for_text, android_wait_for_element, or
 android_wait_for_ui_change for bounded condition synchronization; android_wait is only a fixed
@@ -170,6 +175,127 @@ def _failure(error: MobileUseError, *, secret: str | None = None) -> OperationRe
         message=_redact_secret(error.message, secret),
         suggestion=_redact_secret(error.suggestion, secret),
         data=_redact_secret(error.data, secret),
+    )
+
+
+def _recording_result(
+    details: Any,
+    *,
+    operation_id: str,
+    default_state: RecordingState,
+    message: str,
+) -> RecordingStatusResult:
+    """Normalize legacy controller dictionaries into the recording schema."""
+
+    if isinstance(details, RecordingStatusResult):
+        return details.model_copy(update={"operation_id": operation_id}, deep=True)
+    raw: dict[str, Any] = cast(dict[str, Any], details) if isinstance(details, dict) else {}
+    raw_artifact: Any = raw.get("artifact")
+    artifact: RecordingArtifact | None = None
+    if isinstance(raw_artifact, RecordingArtifact):
+        artifact = raw_artifact
+    elif isinstance(raw_artifact, dict):
+        with suppress(Exception):
+            artifact = RecordingArtifact.model_validate(raw_artifact)
+    raw_state: Any = raw.get("state", default_state)
+    try:
+        state = (
+            raw_state
+            if isinstance(raw_state, RecordingState)
+            else RecordingState(str(raw_state))
+        )
+    except ValueError:
+        state = default_state
+    warnings_value: Any = raw.get("warnings", artifact.warnings if artifact is not None else [])
+    warning_items = cast(list[Any], warnings_value) if isinstance(warnings_value, list) else []
+    warnings = [str(value) for value in warning_items]
+    segment_paths_value: Any = raw.get(
+        "segment_paths", artifact.segment_paths if artifact is not None else []
+    )
+    segment_path_items = (
+        cast(list[Any], segment_paths_value) if isinstance(segment_paths_value, list) else []
+    )
+    segment_paths = [str(value) for value in segment_path_items]
+    data: Any = raw.get("data")
+    compatibility_data: dict[str, Any] = (
+        cast(dict[str, Any], data) if isinstance(data, dict) else dict(raw)
+    )
+    return RecordingStatusResult(
+        success=bool(raw.get("success", True)),
+        operation_id=operation_id,
+        message=str(raw.get("message", message)),
+        state=state,
+        serial=cast(str | None, raw.get("serial")),
+        session_id=cast(str | None, raw.get("session_id")),
+        generation=cast(int | None, raw.get("generation")),
+        artifact_id=cast(
+            str | None,
+            raw.get("artifact_id", artifact.artifact_id if artifact is not None else None),
+        ),
+        artifact=artifact,
+        max_duration_seconds=cast(int | None, raw.get("max_duration_seconds")),
+        bit_rate=cast(int | None, raw.get("bit_rate")),
+        duration_seconds=cast(
+            float | None,
+            raw.get(
+                "duration_seconds", artifact.duration_seconds if artifact is not None else None
+            ),
+        ),
+        recording_path=cast(
+            str | None,
+            raw.get("recording_path", artifact.recording_path if artifact is not None else None),
+        ),
+        segment_paths=segment_paths,
+        segment_count=int(raw.get("segment_count", artifact.segment_count if artifact else 0)),
+        warnings=warnings[:20],
+        retrieved=bool(raw.get("retrieved", False)),
+        error_code=cast(str | None, raw.get("error_code")),
+        category=cast(str | None, raw.get("category")),
+        retryable=cast(bool | None, raw.get("retryable")),
+        suggestion=cast(str | None, raw.get("suggestion")),
+        details=cast(dict[str, Any], raw.get("details", {}))
+        if isinstance(raw.get("details", {}), dict)
+        else {},
+        data=compatibility_data,
+    )
+
+
+def _recording_failure(
+    error: MobileUseError,
+    *,
+    operation_id: str,
+    status: RecordingStatusResult | None = None,
+) -> RecordingStatusResult:
+    """Build a typed recording failure while keeping local paths bounded."""
+
+    current = status or session.recording_status(operation_id)
+    details = _redact_secret(error.data, None)
+    lifecycle_error = LifecycleError(
+        code=error.code.value,
+        category=error.category.value,
+        retryable=error.retryable,
+        message=error.message,
+        suggestion=error.suggestion,
+        details=cast(dict[str, Any], details) if isinstance(details, dict) else {},
+    )
+    return RecordingStatusResult(
+        success=False,
+        operation_id=operation_id,
+        message=error.message,
+        state=current.state,
+        serial=current.serial,
+        session_id=current.session_id,
+        generation=current.generation,
+        artifact_id=current.artifact_id,
+        artifact=current.artifact,
+        warnings=current.warnings,
+        error_code=error.code.value,
+        category=error.category.value,
+        retryable=error.retryable,
+        suggestion=error.suggestion,
+        details=lifecycle_error.details,
+        error=lifecycle_error,
+        data=cast(dict[str, Any], details) if isinstance(details, dict) else {},
     )
 
 
@@ -3049,11 +3175,13 @@ async def android_start_recording(
             description="Optional device screenrecord bit rate in bits per second.",
         ),
     ] = None,
-) -> dict[str, Any]:
+) -> RecordingStatusResult:
     """Start one bounded screen recording with automatic segment rollover.
 
-    Call android_stop_recording to retrieve host-local output paths. Do not start a second recording
-    while one is active; disconnect aborts and cleans up unfinished recording state.
+    Call android_stop_recording to claim the completed artifact. A natural completion enters the
+    ready state and remains retrievable with android_retrieve_recording. Do not start a second
+    recording while one is active or while a ready artifact is unclaimed; disconnect aborts and
+    cleans up unfinished recording state.
     """
 
     operation_id = session.new_operation_id()
@@ -3061,9 +3189,10 @@ async def android_start_recording(
 
         async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            return await session.require_controller().start_recording(
+            return await session.start_recording(
                 max_duration_seconds,
                 bit_rate,
+                operation=_context,
             )
 
         details = await session.run_operation(
@@ -3073,14 +3202,20 @@ async def android_start_recording(
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return _recording_failure(error, operation_id=operation_id)
     except Exception:
-        return _unexpected_failure("screen recording start")
-    return OperationResult(
-        success=True,
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Android screen recording start failed.",
+            "Check android_status and retry after confirming the device is ready.",
+        )
+        return _recording_failure(error, operation_id=operation_id)
+    return _recording_result(
+        details,
+        operation_id=operation_id,
+        default_state=RecordingState.RECORDING,
         message="Android screen recording started.",
-        data=details,
-    ).model_dump(mode="json")
+    )
 
 
 @mcp.tool(
@@ -3089,11 +3224,24 @@ async def android_start_recording(
     annotations=SESSION_WRITE,
     structured_output=True,
 )
-async def android_stop_recording() -> dict[str, Any]:
-    """Stop the active recording and return MCP-host-local output paths.
+async def android_stop_recording(
+    artifact_id: Annotated[
+        str | None,
+        Field(
+            min_length=41,
+            max_length=41,
+            pattern=r"^artifact-[0-9a-f]{32}$",
+            description=(
+                "Optional ready artifact_id to claim after natural completion; omit to stop the "
+                "active recording."
+            ),
+        ),
+    ] = None,
+) -> RecordingStatusResult:
+    """Stop and claim the active recording, returning its retained artifact metadata.
 
-    Multiple segment paths may be returned when ffmpeg is unavailable. Recordings can contain
-    sensitive screen content.
+    Calling this after natural completion retrieves the ready artifact. Multiple segment paths may
+    be returned when ffmpeg is unavailable. Recordings can contain sensitive screen content.
     """
 
     operation_id = session.new_operation_id()
@@ -3101,7 +3249,9 @@ async def android_stop_recording() -> dict[str, Any]:
 
         async def act(_context: Any) -> Any:
             session.clear_snapshot()
-            return await session.require_controller().stop_recording()
+            if artifact_id is None:
+                return await session.stop_recording(operation=_context)
+            return await session.stop_recording(artifact_id, operation=_context)
 
         details = await session.run_operation(
             "stop_recording",
@@ -3110,14 +3260,117 @@ async def android_stop_recording() -> dict[str, Any]:
             mutating=True,
         )
     except MobileUseError as error:
-        return _failure(error).model_dump(mode="json")
+        return _recording_failure(error, operation_id=operation_id)
     except Exception:
-        return _unexpected_failure("screen recording stop")
-    return OperationResult(
-        success=True,
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Android screen recording stop failed.",
+            "Inspect android_status before retrying recording cleanup.",
+        )
+        return _recording_failure(error, operation_id=operation_id)
+    return _recording_result(
+        details,
+        operation_id=operation_id,
+        default_state=RecordingState.READY,
         message="Android screen recording stopped.",
-        data=details,
-    ).model_dump(mode="json")
+    )
+
+
+@mcp.tool(
+    name="android_recording_status",
+    title="Get Android recording status",
+    annotations=READ_ONLY,
+    structured_output=True,
+)
+async def android_recording_status() -> RecordingStatusResult:
+    """Return recording state and metadata for the current session owner."""
+
+    operation_id = session.new_operation_id()
+    try:
+        result = await session.run_operation(
+            "recording_status",
+            lambda _context: session.recording_status(operation_id),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=False,
+        )
+    except MobileUseError as error:
+        return _recording_failure(error, operation_id=operation_id)
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Android recording status could not be read.",
+            "Retry android_recording_status after checking the MCP server.",
+        )
+        return _recording_failure(error, operation_id=operation_id)
+    if isinstance(result, RecordingStatusResult):
+        return result.model_copy(update={"operation_id": operation_id}, deep=True)
+    return _recording_result(
+        result,
+        operation_id=operation_id,
+        default_state=RecordingState.IDLE,
+        message="Android recording status read.",
+    )
+
+
+# Compatibility spelling for clients that prefer a verb in read tool names.
+android_get_recording_status = android_recording_status
+
+
+@mcp.tool(
+    name="android_retrieve_recording",
+    title="Retrieve Android recording artifact",
+    annotations=SESSION_WRITE,
+    structured_output=True,
+)
+async def android_retrieve_recording(
+    artifact_id: Annotated[
+        str,
+        Field(
+            min_length=41,
+            max_length=41,
+            pattern=r"^artifact-[0-9a-f]{32}$",
+            description="Opaque artifact_id returned by Android recording tools.",
+        ),
+    ],
+) -> RecordingStatusResult:
+    """Claim one retained recording by server-generated ID.
+
+    The client cannot provide a local path. The manager validates ownership and containment before
+    returning metadata and leaves the artifact subject to the configured TTL/count/byte policy.
+    """
+
+    operation_id = session.new_operation_id()
+    try:
+        details = await session.run_operation(
+            "retrieve_recording",
+            lambda _context: session.retrieve_recording(artifact_id),
+            operation_id=operation_id,
+            retry_safe=True,
+            mutating=True,
+        )
+    except MobileUseError as error:
+        return _recording_failure(error, operation_id=operation_id)
+    except Exception:
+        error = MobileUseError(
+            ErrorCode.OPERATION_FAILED,
+            "Android recording artifact retrieval failed.",
+            "Use a retained artifact_id from android_recording_status and retry.",
+        )
+        return _recording_failure(error, operation_id=operation_id)
+    if isinstance(details, RecordingStatusResult):
+        return details.model_copy(update={"operation_id": operation_id}, deep=True)
+    return _recording_result(
+        details,
+        operation_id=operation_id,
+        default_state=RecordingState.READY,
+        message="Android recording artifact retrieved.",
+    )
+
+
+# Compatibility spelling for callers that use ``get`` rather than
+# ``retrieve`` for a retained artifact.
+android_get_recording = android_retrieve_recording
 
 
 @mcp.tool(

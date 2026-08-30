@@ -71,7 +71,7 @@ If the state is `unauthorized`, unlock the phone and accept the USB debugging pr
 ### Runtime configuration and diagnostics
 
 The stdio process reads one frozen, validated runtime configuration at startup. Defaults keep the
-normal local ADB server (`127.0.0.1:5037`), original snapshot limits, temporary recording files,
+normal local ADB server (`127.0.0.1:5037`), original snapshot limits, owned recording artifacts,
 and warning-level logging. Every setting is optional; malformed values stop startup with a
 value-free stderr diagnostic rather than falling back silently.
 
@@ -316,7 +316,9 @@ capacity eviction returns `SNAPSHOT_STALE`, and both instruct the agent to obser
 | `android_terminate_app` | Force-stop a package and report the observed effect |
 | `android_open_url` | Open an HTTP or HTTPS URL |
 | `android_start_recording` | Start a bounded screen recording with automatic segment rollover |
-| `android_stop_recording` | Stop, pull, and optionally merge recording segments |
+| `android_stop_recording` | Stop/claim a recording, pull, and optionally merge segments |
+| `android_recording_status` | Read recording state and retained artifact metadata |
+| `android_retrieve_recording` | Claim a retained artifact by server-generated ID |
 | `android_wait` | Sleep for a bounded fixed delay and advance the screen revision |
 | `android_wait_for_text` | Wait for text/content description in the complete hierarchy |
 | `android_wait_for_element` | Wait for a `Target` in the complete hierarchy |
@@ -337,8 +339,11 @@ force-stop with an unavailable postcondition is explicitly marked unverified.
 Recordings are limited to 5–1800 seconds. Device-side temporary files use randomized names and are
 removed after transfer. Android's per-recording time limit is handled with 170-second segments. If
 `ffmpeg` is available, multiple segments are losslessly concatenated; otherwise the tool returns
-the segment paths and a warning. Returned paths are local to the MCP host and may contain sensitive
-screen content.
+the segment paths and a warning. Every completed artifact has a server-generated `artifact_id`,
+remains in the `ready` state until claimed, and is retained below the configured TTL/count/byte
+limits. Use `android_retrieve_recording` (or stop after natural completion) to claim it; a new
+recording cannot overwrite an unclaimed ready artifact. Returned paths are local to the MCP host and
+may contain sensitive screen content.
 
 ## Target selection
 
