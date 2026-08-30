@@ -71,14 +71,62 @@ class Bounds(StrictModel):
         return 0 <= center_x < screen_width and 0 <= center_y < screen_height
 
 
+class BoundsProvenance(StrictModel):
+    """Capture identity attached to coordinates copied from an observation.
+
+    Bounds are only safe to reuse while the session generation and screen
+    revision that produced them are still current.  ``snapshot_id`` is also
+    carried so an expired/evicted observation can produce a useful diagnostic.
+    The values are metadata, not an encoding of an Android selector.
+    """
+
+    snapshot_id: str | None = Field(default=None, max_length=128)
+    session_id: str | None = Field(default=None, max_length=128)
+    generation: int | None = Field(default=None, ge=1)
+    screen_revision: int = Field(default=0, ge=0)
+
+    @property
+    def revision(self) -> int:
+        return self.screen_revision
+
+
+class SwipePercentage(StrictModel):
+    """Normalized [0, 1] coordinates for a resolution-independent swipe."""
+
+    start_x: float = Field(ge=0, le=1)
+    start_y: float = Field(ge=0, le=1)
+    end_x: float = Field(ge=0, le=1)
+    end_y: float = Field(ge=0, le=1)
+
+
 class Target(StrictModel):
     """A UI target with deterministic selector fallbacks."""
 
+    element_ref: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Opaque temporary element reference returned by android_snapshot. It is bound to "
+            "the originating session generation and screen revision."
+        ),
+    )
+    snapshot_id: str | None = Field(
+        default=None,
+        max_length=128,
+        description="Snapshot that supplied bounds or an element_ref, when available.",
+    )
     bounds: Bounds | None = Field(
         default=None,
         description=(
             "Current on-screen bounds from android_snapshot. Bounds are tried first and their "
             "center is used for the action; refresh after the UI changes."
+        ),
+    )
+    bounds_provenance: BoundsProvenance | None = Field(
+        default=None,
+        description=(
+            "Session/generation/screen-revision provenance returned with snapshot bounds. "
+            "Required for coordinate actions on a connected session."
         ),
     )
     resource_id: str | None = Field(
@@ -110,14 +158,40 @@ class Target(StrictModel):
 
     @model_validator(mode="after")
     def require_selector(self) -> "Target":
-        if self.bounds is None and not self.resource_id and not self.text:
-            raise ValueError("At least one of bounds, resource_id, or text is required")
+        if (
+            self.element_ref is None
+            and self.bounds is None
+            and not self.resource_id
+            and not self.text
+        ):
+            raise ValueError(
+                "At least one of element_ref, bounds, resource_id, or text is required"
+            )
         return self
 
 
 class UIElement(StrictModel):
     """A compact, platform-neutral representation of an Android UI node."""
 
+    element_ref: str | None = Field(
+        default=None,
+        max_length=128,
+        description=(
+            "Opaque temporary reference for this observed node. It carries no raw selector "
+            "data and expires with the observation's session generation/revision."
+        ),
+    )
+    bounds_provenance: BoundsProvenance | None = Field(
+        default=None,
+        description=(
+            "Capture identity for the node's bounds, if the node came from a session snapshot."
+        ),
+    )
+    node_index: int | None = Field(
+        default=None,
+        ge=0,
+        description="Flattened hierarchy position used only to disambiguate identical nodes.",
+    )
     text: str | None = Field(default=None, max_length=2_000)
     content_description: str | None = Field(default=None, max_length=2_000)
     resource_id: str | None = Field(default=None, max_length=512)
@@ -263,13 +337,15 @@ class SelectorAttempt(StrictModel):
     selector: str
     matched: bool
     error: str | None = None
+    match_count: int = Field(default=0, ge=0)
 
 
 class ResolvedTarget(StrictModel):
     bounds: Bounds
     selector: str
+    matched_selector: str | None = None
     element: UIElement | None = None
-    attempts: list[SelectorAttempt] = []
+    attempts: list[SelectorAttempt] = Field(default_factory=lambda: list[SelectorAttempt]())
 
 
 class OperationResult(StrictModel):

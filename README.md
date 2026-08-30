@@ -12,8 +12,9 @@ and UI elements, plans actions, and calls MCP tools directly.
 - Return screenshots as native MCP image content
 - Encode original-resolution screenshots as PNG or quality-controlled JPEG
 - Return compact or full UIAutomator accessibility hierarchies with query and pagination
-- Tap or long press using bounds, resource ID, or text fallbacks
-- Swipe using validated screen coordinates
+- Tap or long press using opaque observed-element references, provenance-bound bounds, resource ID,
+  or text fallbacks
+- Swipe using validated screen pixels or resolution-independent percentage coordinates
 - Type and clear text in the focused field
 - Press a bounded set of Android keys
 - List, launch, and terminate apps
@@ -181,7 +182,8 @@ Use `--scope project` instead if the configuration should only apply to one proj
 1. Call `android_list_devices`.
 2. Call `android_connect`, specifying a serial when more than one device is online.
 3. Call `android_snapshot` to receive the screenshot and current UI elements.
-4. Prefer a target containing bounds plus resource ID or text.
+4. Prefer an `element_ref` from the current snapshot. When copying bounds, copy its
+   `bounds_provenance` as well.
 5. Perform one action.
 6. Call `android_snapshot` again to verify the resulting state.
 7. If an action fails, use the returned selector attempts and refresh the snapshot.
@@ -267,9 +269,9 @@ previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while capacity
 
 | Tool | Purpose |
 |---|---|
-| `android_tap` | Tap using bounds, resource ID, or text fallbacks |
-| `android_long_press` | Long press a target |
-| `android_swipe` | Swipe between validated pixel coordinates |
+| `android_tap` | Tap using an opaque ref, provenance-bound bounds, or selector fallbacks |
+| `android_long_press` | Long press an opaque ref, provenance-bound bounds, or selector fallbacks |
+| `android_swipe` | Swipe between validated pixel coordinates or normalized percentages |
 | `android_type_text` | Optionally focus a target, then type text |
 | `android_clear_text` | Optionally focus a target, then clear text with a delete-key fallback |
 | `android_press_key` | Press back/home/enter/delete/tab/menu/volume keys |
@@ -278,7 +280,7 @@ previous session stale; an expired ID returns `SNAPSHOT_EXPIRED`, while capacity
 | `android_open_url` | Open an HTTP or HTTPS URL |
 | `android_start_recording` | Start a bounded screen recording with automatic segment rollover |
 | `android_stop_recording` | Stop, pull, and optionally merge recording segments |
-| `android_wait` | Sleep for a bounded fixed delay and invalidate the cached snapshot |
+| `android_wait` | Sleep for a bounded fixed delay and advance the screen revision |
 
 `android_launch_app` reports every launch attempt, polling count, and the last foreground App. A
 permission controller, chooser, or other foreground blocker is reported separately from an App
@@ -296,7 +298,15 @@ Tap and long-press tools accept a `target` object:
 
 ```json
 {
+  "element_ref": "el-...",
+  "snapshot_id": "s-...",
   "bounds": {"x": 20, "y": 100, "width": 280, "height": 80},
+  "bounds_provenance": {
+    "snapshot_id": "s-...",
+    "session_id": "session-...",
+    "generation": 3,
+    "screen_revision": 7
+  },
   "resource_id": "com.example:id/continue",
   "resource_id_index": 0,
   "text": "Continue",
@@ -304,7 +314,12 @@ Tap and long-press tools accept a `target` object:
 }
 ```
 
-The server tries selectors in this order:
+The server evaluates every supplied selector and records all attempts. If two semantic selectors
+identify different nodes, it returns `SELECTOR_CONFLICT` and dispatches no device command. When
+the target comes from an active session snapshot, `element_ref` is preferred and provides the
+strongest identity check.
+
+For a target without an opaque reference, the server tries selectors in this order:
 
 1. Valid on-screen bounds
 2. Resource ID and occurrence index
@@ -314,7 +329,17 @@ The server tries selectors in this order:
 snapshot node whose accessible label is in `content_description`, pass that value through the
 target's `text` field. `class_name` and `package` are available as query filters through
 `android_get_ui_elements`, not as action selectors. Bounds use original device pixels and become
-stale after the UI changes.
+stale after the UI changes. A connected-session coordinate target must include the
+`bounds_provenance` returned with the snapshot element; its session ID, generation, screen
+revision, and (when present) snapshot ID are checked before ADB dispatch. References and
+provenance from expired, evicted, prior-generation, removed, disabled, or off-screen elements are
+rejected without issuing a tap or long-press command.
+
+`android_swipe` accepts either all four existing pixel fields (`start_x`, `start_y`, `end_x`,
+`end_y`) or one `percentage` object with four values in `[0, 1]` (the equivalent flat
+`*_percent` fields, or `coordinate_mode="percentage"` with flat values, are also accepted).
+Mixing modes or supplying a partial mode is rejected. The result always reports the actual native
+pixels sent to Android, including the conversion for percentage mode.
 
 Failure responses include every attempted selector and recommend taking a fresh snapshot.
 
@@ -350,6 +375,15 @@ Stable error codes include:
 - `BUSY`
 - `UNSUPPORTED`
 - `SNAPSHOT_NOT_FOUND`
+- `SNAPSHOT_EXPIRED`
+- `SNAPSHOT_STALE`
+- `ELEMENT_REF_NOT_FOUND`
+- `ELEMENT_REF_EXPIRED`
+- `ELEMENT_REF_STALE`
+- `ELEMENT_REMOVED`
+- `ELEMENT_DISABLED`
+- `TARGET_OFF_SCREEN`
+- `SELECTOR_CONFLICT`
 
 ## Development and verification
 
@@ -395,8 +429,8 @@ device verification results.
 - Screen recording availability and supported resolution depend on the Android device's built-in
   `screenrecord` implementation.
 - UI elements are snapshots, not stable DOM nodes. Observe again after navigation, animation, or
-  scrolling. Only the latest `snapshot_id` can be paged, and state-changing operations invalidate
-  it deliberately.
+  scrolling. Identified snapshots can be paged while retained, but `element_ref` and copied bounds
+  are only valid for their originating session generation and screen revision.
 - `detail_level="full"` can produce a large tool result. Prefer pagination and query first.
 - `max_text_length` is a per-node limit, not a total response budget; full mode does not disable it.
 - `interactive_only=true` intentionally hides most static text nodes and should not be used for

@@ -286,6 +286,14 @@ mobile-use-mcp/
 - [x] stale snapshot 返回结构化 `SNAPSHOT_NOT_FOUND`
 - [x] 真机 stdio MCP snapshot 到分页链路验证
 
+## Post-MVP：安全目标引用与分辨率无关手势
+
+- [x] UI elements 返回不透明 `element_ref` 和 session/generation/revision bounds provenance
+- [x] 动作前验证引用、坐标来源、当前完整 hierarchy、元素存在性、enabled 状态和屏幕范围
+- [x] resource ID、text/content-description 语义选择器搜索完整 hierarchy，不受 compact 分页限制
+- [x] 多选择器身份冲突返回 `SELECTOR_CONFLICT`，不发送设备命令
+- [x] `android_swipe` 严格区分像素坐标和 `[0, 1]` 百分比坐标并返回实际像素
+
 ## Post-MVP：Agent 可发现性与调用提示
 
 - [x] MCP initialize 返回服务级 instructions

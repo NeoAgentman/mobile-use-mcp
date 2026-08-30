@@ -20,6 +20,7 @@ from mobile_use_mcp.config import (
     format_startup_error,
     load_runtime_config,
 )
+from mobile_use_mcp.controller import normalized_coordinate_to_pixel
 from mobile_use_mcp.doctor import run_doctor_bounded
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.images import encode_screenshot
@@ -40,6 +41,7 @@ from mobile_use_mcp.models import (
     SessionConnection,
     SessionLifecycle,
     SnapshotResult,
+    SwipePercentage,
     Target,
     UIElement,
 )
@@ -151,15 +153,11 @@ def _lifecycle_failure(
         if isinstance(value, dict):
             nested = cast(dict[Any, Any], value)
             return {
-                str(key): safe_value(item, depth + 1)
-                for key, item in list(nested.items())[:50]
+                str(key): safe_value(item, depth + 1) for key, item in list(nested.items())[:50]
             }
         return None
 
-    safe_details = {
-        str(key): safe_value(value)
-        for key, value in error.data.items()
-    }
+    safe_details = {str(key): safe_value(value) for key, value in error.data.items()}
     lifecycle_error = LifecycleError(
         code=error.code.value,
         category=error.category.value,
@@ -242,9 +240,8 @@ async def _capture_screenshot_only(controller: Any) -> ScreenshotCapture:
     def available(name: str) -> Any:
         instance_method = getattr(controller, name, None)
         controller_type = cast(type[Any], type(controller))
-        if (
-            getattr(controller_type, name, None) is not None
-            or name in getattr(controller, "__dict__", {})
+        if getattr(controller_type, name, None) is not None or name in getattr(
+            controller, "__dict__", {}
         ):
             return instance_method
         if hasattr(instance_method, "assert_awaited"):
@@ -630,7 +627,8 @@ async def android_snapshot(
     comments, buttons, and form fields. Defaults to compact mode with at most 200 nodes. A truncated
     result includes snapshot_id and next_offset: prefer android_get_ui_elements on that unchanged
     snapshot for filtering or pagination, and use full only when focused retrieval is insufficient.
-    Any action, wait, reconnect, or disconnect invalidates the cached snapshot.
+    Actions and waits advance the screen revision and invalidate copied element refs/bounds;
+    retained snapshot IDs remain pageable until TTL or capacity eviction.
     """
 
     if not 1 <= max_elements <= 500:
@@ -644,6 +642,7 @@ async def android_snapshot(
     effective_max_text_length = min(max_text_length, session.config.snapshot_max_text_length)
     operation_id = session.new_operation_id()
     try:
+
         async def capture(context: Any) -> tuple[Any, str]:
             context.checkpoint("observation")
             # Take provenance before the potentially slow Android read.  A
@@ -692,9 +691,7 @@ async def android_snapshot(
 
     total_elements = len(snapshot.elements)
     returned_elements = (
-        snapshot.elements
-        if detail_level == "full"
-        else snapshot.elements[:effective_max_elements]
+        snapshot.elements if detail_level == "full" else snapshot.elements[:effective_max_elements]
     )
     truncated = len(returned_elements) < total_elements
     image_data, image_width, image_height = encode_screenshot(
@@ -770,6 +767,7 @@ async def android_screenshot(
 
     operation_id = session.new_operation_id()
     try:
+
         async def capture(_context: Any) -> ScreenshotCapture:
             # This path intentionally does not call ``controller.snapshot``:
             # hierarchy and foreground reads are unrelated to a visual-only
@@ -867,11 +865,13 @@ async def android_get_ui_elements(
     The default page size is 100. Query searches text, content description, resource ID, class,
     and package; package is an additional exact filter. Filters are applied before pagination, so
     reset offset to zero when changing them. Omitting snapshot_id captures a new hierarchy with up
-    to 2000 characters per node. Actions and android_wait invalidate prior snapshot IDs.
+    to 2000 characters per node. Actions and android_wait advance the revision; retained IDs
+    remain readable until TTL or capacity eviction.
     """
 
     operation_id = session.new_operation_id()
     try:
+
         async def read_snapshot(_context: Any) -> tuple[Any, str]:
             if snapshot_id is None:
                 observation_context = session.observation_context()
@@ -1048,6 +1048,113 @@ def _unexpected_failure(action: str) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
+def _configured_method(instance: Any, name: str) -> Any | None:
+    """Find an explicitly implemented/injected method without Mock auto-attrs."""
+
+    method = getattr(instance, name, None)
+    if not callable(method):
+        return None
+    owner = cast(type[Any], type(instance))
+    if (
+        getattr(owner, name, None) is not None
+        or name in getattr(instance, "__dict__", {})
+        or hasattr(method, "assert_awaited")
+    ):
+        return method
+    return None
+
+
+def _target_requires_validation(target: Target) -> bool:
+    """Identify targets that cannot safely bypass the session resolver."""
+
+    return any(
+        value is not None
+        for value in (
+            target.element_ref,
+            target.bounds_provenance,
+            target.snapshot_id,
+            target.resource_id,
+            target.text,
+        )
+    )
+
+
+async def _resolve_and_dispatch_target(
+    context: Any,
+    target: Target,
+    *,
+    long_press: bool = False,
+    duration_ms: int = 1_000,
+) -> dict[str, object]:
+    """Validate a target before advancing the revision and dispatching input."""
+
+    controller = session.require_controller()
+    tap_resolved = _configured_method(
+        controller,
+        "long_press_resolved" if long_press else "tap_resolved",
+    )
+    snapshot_reader = _configured_method(controller, "snapshot")
+    resolved = None
+    should_validate = (
+        tap_resolved is not None
+        or snapshot_reader is not None
+        or session.session_id is not None
+        or _target_requires_validation(target)
+    )
+    if should_validate:
+        _snapshot, resolved = await session.resolve_target(
+            target,
+            operation=context,
+            controller=controller,
+        )
+    # Invalidate copied bounds/ref capabilities only after all validation has
+    # completed; a stale/conflicting target therefore sends no device command.
+    session.advance_screen_revision(operation=context)
+    context.checkpoint("dispatch")
+    if tap_resolved is not None and resolved is not None:
+        result = tap_resolved(resolved, duration_ms) if long_press else tap_resolved(resolved)
+        if isawaitable(result):
+            result = await result
+        if isinstance(result, dict):
+            # Keep the resolver's audit trail authoritative even when an
+            # injected adapter returns only an execution-specific payload.
+            # Built-in controllers already include these fields, while the
+            # defaults make the MCP contract stable for lightweight fakes.
+            details = dict(cast(dict[str, object], result))
+            x, y = resolved.bounds.center
+            details.setdefault("x", x)
+            details.setdefault("y", y)
+            details["selector"] = resolved.selector
+            details["matched_selector"] = resolved.matched_selector or resolved.selector
+            details["attempts"] = [
+                attempt.model_dump(mode="json") for attempt in resolved.attempts
+            ]
+            if long_press:
+                details.setdefault("duration_ms", duration_ms)
+            return details
+        x, y = resolved.bounds.center
+        fallback: dict[str, object] = {
+            "x": x,
+            "y": y,
+            "selector": resolved.selector,
+            "matched_selector": resolved.matched_selector or resolved.selector,
+            "attempts": [attempt.model_dump(mode="json") for attempt in resolved.attempts],
+        }
+        if long_press:
+            fallback["duration_ms"] = duration_ms
+        return fallback
+    if should_validate:
+        raise MobileUseError(
+            ErrorCode.UNSUPPORTED,
+            "The active Android controller cannot dispatch a resolved target.",
+            "Reconnect with the built-in Android controller and retry the action.",
+        )
+    result = controller.long_press(target, duration_ms) if long_press else controller.tap(target)
+    if isawaitable(result):
+        result = await result
+    return result
+
+
 @mcp.tool(
     name="android_tap",
     title="Tap Android UI target",
@@ -1055,7 +1162,7 @@ def _unexpected_failure(action: str) -> dict[str, Any]:
     structured_output=True,
 )
 async def android_tap(target: Target) -> dict[str, Any]:
-    """Tap using bounds, resource ID, then exact text/content description fallbacks.
+    """Tap using an opaque ref, provenance-bound bounds, or semantic fallbacks.
 
     A successful call means the input command was sent, not that the expected UI state appeared.
     Observe again afterward; wait briefly first when the page animates or loads asynchronously.
@@ -1063,9 +1170,9 @@ async def android_tap(target: Target) -> dict[str, Any]:
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> Any:
-            session.clear_snapshot()
-            return await session.require_controller().tap(target)
+            return await _resolve_and_dispatch_target(_context, target)
 
         details = await session.run_operation(
             "tap",
@@ -1097,16 +1204,21 @@ async def android_long_press(
         Field(ge=100, le=10_000, description="Press duration in milliseconds."),
     ] = 1_000,
 ) -> dict[str, Any]:
-    """Long press a target using original-device-pixel bounds or semantic fallbacks.
+    """Long press an opaque ref, provenance-bound bounds, or semantic fallbacks.
 
     Observe again afterward to verify the resulting UI state.
     """
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> Any:
-            session.clear_snapshot()
-            return await session.require_controller().long_press(target, duration_ms)
+            return await _resolve_and_dispatch_target(
+                _context,
+                target,
+                long_press=True,
+                duration_ms=duration_ms,
+            )
 
         details = await session.run_operation(
             "long_press",
@@ -1132,34 +1244,251 @@ async def android_long_press(
     structured_output=True,
 )
 async def android_swipe(
-    start_x: Annotated[int, Field(ge=0, description="Start X in original device pixels.")],
-    start_y: Annotated[int, Field(ge=0, description="Start Y in original device pixels.")],
-    end_x: Annotated[int, Field(ge=0, description="End X in original device pixels.")],
-    end_y: Annotated[int, Field(ge=0, description="End Y in original device pixels.")],
+    start_x: Annotated[
+        int | float | None,
+        Field(default=None, ge=0, description="Start X in original device pixels."),
+    ] = None,
+    start_y: Annotated[
+        int | float | None,
+        Field(default=None, ge=0, description="Start Y in original device pixels."),
+    ] = None,
+    end_x: Annotated[
+        int | float | None,
+        Field(default=None, ge=0, description="End X in original device pixels."),
+    ] = None,
+    end_y: Annotated[
+        int | float | None,
+        Field(default=None, ge=0, description="End Y in original device pixels."),
+    ] = None,
     duration_ms: Annotated[
         int,
         Field(ge=1, le=10_000, description="Swipe duration in milliseconds."),
     ] = 400,
+    coordinate_mode: Annotated[
+        Literal["pixels", "percentage", "percent"] | None,
+        Field(
+            default=None,
+            description=(
+                "Optional explicit mode for the four flat coordinates. Use percentage/percent "
+                "to interpret them as normalized values; omitted mode requires integer pixels."
+            ),
+        ),
+    ] = None,
+    percentage: Annotated[
+        SwipePercentage | None,
+        Field(
+            default=None,
+            description=(
+                "Normalized coordinates in [0, 1]. Use this instead of all four pixel "
+                "coordinates; do not mix the two modes."
+            ),
+        ),
+    ] = None,
+    start_x_percent: Annotated[
+        float | None,
+        Field(default=None, ge=0, le=1, description="Normalized start X in [0, 1]."),
+    ] = None,
+    start_y_percent: Annotated[
+        float | None,
+        Field(default=None, ge=0, le=1, description="Normalized start Y in [0, 1]."),
+    ] = None,
+    end_x_percent: Annotated[
+        float | None,
+        Field(default=None, ge=0, le=1, description="Normalized end X in [0, 1]."),
+    ] = None,
+    end_y_percent: Annotated[
+        float | None,
+        Field(default=None, ge=0, le=1, description="Normalized end Y in [0, 1]."),
+    ] = None,
 ) -> dict[str, Any]:
-    """Swipe between coordinates in original device pixels on the current screen.
+    """Swipe in pixels or one validated normalized-coordinate mode.
 
-    Screenshot previews may be visually scaled by the host. Use the reported device width and
-    height, and observe again after the swipe because old bounds and snapshots become stale.
+    Screenshot previews may be visually scaled by the host. Pixel mode uses the reported native
+    width and height. Percentage mode converts each value against the current native dimensions;
+    all four values are required and pixel/percentage fields cannot be mixed. For clients that
+    prefer flat coordinates, ``coordinate_mode="percentage"`` (or ``"percent"``) interprets
+    the four coordinate values as normalized values.
     """
+
+    pixel_values = (start_x, start_y, end_x, end_y)
+    flat_percentage_values = (
+        start_x_percent,
+        start_y_percent,
+        end_x_percent,
+        end_y_percent,
+    )
+    has_pixels = any(value is not None for value in pixel_values)
+    has_flat_percentage = any(value is not None for value in flat_percentage_values)
+    explicit_percentage = coordinate_mode in {"percentage", "percent"}
+    explicit_pixels = coordinate_mode == "pixels"
+    normalized: SwipePercentage | None = None
+    if coordinate_mode not in {None, "pixels", "percentage", "percent"}:
+        return _failure(
+            MobileUseError(
+                ErrorCode.INVALID_COORDINATES,
+                "coordinate_mode must be pixels or percentage.",
+                'Use coordinate_mode="pixels" or coordinate_mode="percentage".',
+            )
+        ).model_dump(mode="json")
+    if explicit_percentage:
+        if (
+            percentage is not None
+            or has_flat_percentage
+            or not all(value is not None for value in pixel_values)
+        ):
+            return _failure(
+                MobileUseError(
+                    ErrorCode.INVALID_COORDINATES,
+                    "Flat percentage mode requires all four coordinate values and no other mode.",
+                    'Pass four start/end values with coordinate_mode="percentage" only.',
+                )
+            ).model_dump(mode="json")
+        try:
+            normalized = SwipePercentage(
+                start_x=float(cast(float, start_x)),
+                start_y=float(cast(float, start_y)),
+                end_x=float(cast(float, end_x)),
+                end_y=float(cast(float, end_y)),
+            )
+        except (TypeError, ValueError):
+            return _failure(
+                MobileUseError(
+                    ErrorCode.INVALID_COORDINATES,
+                    "Percentage coordinates must be numbers in the [0, 1] range.",
+                    "Use four normalized values between 0 and 1.",
+                )
+            ).model_dump(mode="json")
+        has_pixels = False
+    elif explicit_pixels and (percentage is not None or has_flat_percentage):
+        return _failure(
+            MobileUseError(
+                ErrorCode.INVALID_COORDINATES,
+                "Pixel mode cannot be combined with percentage coordinates.",
+                "Provide only the four integer pixel coordinates.",
+            )
+        ).model_dump(mode="json")
+    if percentage is not None and has_flat_percentage:
+        return _failure(
+            MobileUseError(
+                ErrorCode.INVALID_COORDINATES,
+                "Use either percentage or the flat percentage fields, not both.",
+                "Provide exactly one complete swipe coordinate mode.",
+            )
+        ).model_dump(mode="json")
+    if (
+        (has_pixels and (percentage is not None or has_flat_percentage))
+        or (has_pixels and not all(value is not None for value in pixel_values))
+        or (has_pixels and any(value is not None and value < 0 for value in pixel_values))
+        or (
+            has_pixels
+            and not all(
+                isinstance(value, int) and not isinstance(value, bool) for value in pixel_values
+            )
+        )
+    ):
+        return _failure(
+            MobileUseError(
+                ErrorCode.INVALID_COORDINATES,
+                "Swipe coordinates must use all four pixel values or one percentage mode.",
+                "Provide start_x/start_y/end_x/end_y, or percentage with all four "
+                "normalized values.",
+            )
+        ).model_dump(mode="json")
+    if not explicit_percentage:
+        percentage_value: Any = percentage
+        if percentage_value is not None and not isinstance(percentage_value, SwipePercentage):
+            try:
+                normalized = SwipePercentage.model_validate(percentage_value)
+            except (TypeError, ValueError):
+                return _failure(
+                    MobileUseError(
+                        ErrorCode.INVALID_COORDINATES,
+                        "Percentage coordinates must contain four values in the [0, 1] range.",
+                        "Provide percentage.start_x, start_y, end_x, and end_y between 0 and 1.",
+                    )
+                ).model_dump(mode="json")
+        elif percentage_value is not None:
+            normalized = percentage_value
+        if has_flat_percentage:
+            if not all(value is not None for value in flat_percentage_values):
+                return _failure(
+                    MobileUseError(
+                        ErrorCode.INVALID_COORDINATES,
+                        "All four flat percentage coordinates are required.",
+                        "Provide start_x_percent, start_y_percent, end_x_percent, and "
+                        "end_y_percent.",
+                    )
+                ).model_dump(mode="json")
+            try:
+                normalized = SwipePercentage(
+                    start_x=cast(float, start_x_percent),
+                    start_y=cast(float, start_y_percent),
+                    end_x=cast(float, end_x_percent),
+                    end_y=cast(float, end_y_percent),
+                )
+            except (TypeError, ValueError):
+                return _failure(
+                    MobileUseError(
+                        ErrorCode.INVALID_COORDINATES,
+                        "Percentage coordinates must be numbers in the [0, 1] range.",
+                        "Use four normalized values between 0 and 1.",
+                    )
+                ).model_dump(mode="json")
+    if not has_pixels and normalized is None:
+        return _failure(
+            MobileUseError(
+                ErrorCode.INVALID_COORDINATES,
+                "Swipe coordinates were not provided.",
+                "Provide all four pixel coordinates or one complete percentage mode.",
+            )
+        ).model_dump(mode="json")
 
     operation_id = session.new_operation_id()
     try:
-        async def act(_context: Any) -> None:
-            session.clear_snapshot()
-            await session.require_controller().swipe(
-                start_x,
-                start_y,
-                end_x,
-                end_y,
-                duration_ms,
-            )
 
-        await session.run_operation(
+        async def act(context: Any) -> dict[str, object]:
+            controller = session.require_controller()
+            session.advance_screen_revision(operation=context)
+            context.checkpoint("dispatch")
+            if normalized is not None:
+                percentage_method = _configured_method(controller, "swipe_percentage")
+                if percentage_method is not None:
+                    result = percentage_method(normalized, duration_ms)
+                    if isawaitable(result):
+                        result = await result
+                    if isinstance(result, dict):
+                        return cast(dict[str, object], result)
+                # An injected controller can still support percentage mode by
+                # exposing only a complete snapshot and its existing pixel
+                # swipe method.
+                current = await session.capture_complete_snapshot(
+                    controller,
+                    min(2_000, session.config.snapshot_max_text_length),
+                )
+
+                actual = (
+                    normalized_coordinate_to_pixel(normalized.start_x, current.width),
+                    normalized_coordinate_to_pixel(normalized.start_y, current.height),
+                    normalized_coordinate_to_pixel(normalized.end_x, current.width),
+                    normalized_coordinate_to_pixel(normalized.end_y, current.height),
+                )
+                result = controller.swipe(*actual, duration_ms)
+            else:
+                assert all(value is not None for value in pixel_values)
+                actual = cast(tuple[int, int, int, int], pixel_values)
+                result = controller.swipe(*actual, duration_ms)
+            if isawaitable(result):
+                result = await result
+            result_value: Any = result
+            if isinstance(result_value, dict):
+                return cast(dict[str, object], result_value)
+            return {
+                "start": {"x": actual[0], "y": actual[1]},
+                "end": {"x": actual[2], "y": actual[3]},
+                "duration_ms": duration_ms,
+            }
+
+        details = await session.run_operation(
             "swipe",
             act,
             operation_id=operation_id,
@@ -1171,10 +1500,14 @@ async def android_swipe(
         return _unexpected_failure("swipe")
     return OperationResult(
         success=True,
-        message=f"Swiped from ({start_x}, {start_y}) to ({end_x}, {end_y}).",
+        message=(
+            "Swiped using normalized coordinates converted to native pixels."
+            if normalized is not None
+            else "Swiped using native pixel coordinates."
+        ),
         data={
-            "start": {"x": start_x, "y": start_y},
-            "end": {"x": end_x, "y": end_y},
+            **details,
+            "mode": "percentage" if normalized is not None else "pixels",
             "duration_ms": duration_ms,
         },
     ).model_dump(mode="json")
@@ -1213,11 +1546,26 @@ async def android_type_text(
 
     operation_id = session.new_operation_id()
     try:
-        async def act(_context: Any) -> Any:
-            session.clear_snapshot()
-            return await session.require_controller().type_text(text, target)
 
-        method = await session.run_operation(
+        async def act(_context: Any) -> tuple[Any, dict[str, object] | None]:
+            controller = session.require_controller()
+            target_details: dict[str, object] | None = None
+            if target is not None and (
+                _configured_method(controller, "snapshot") is not None
+                or session.session_id is not None
+                or _target_requires_validation(target)
+            ):
+                target_details = await _resolve_and_dispatch_target(_context, target)
+                session.advance_screen_revision(operation=_context)
+                result = controller.type_text(text, None)
+            else:
+                session.clear_snapshot()
+                result = controller.type_text(text, target)
+            if isawaitable(result):
+                result = await result
+            return result, target_details
+
+        method, target_details = await session.run_operation(
             "type_text",
             act,
             operation_id=operation_id,
@@ -1227,10 +1575,16 @@ async def android_type_text(
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("text input")
+    data: dict[str, Any] = {"method": method, "character_count": len(text)}
+    if target_details is not None:
+        data["target"] = target_details
+        for key in ("selector", "matched_selector", "attempts"):
+            if key in target_details:
+                data[key] = target_details[key]
     return OperationResult(
         success=True,
         message="Text was entered into the focused field.",
-        data={"method": method, "character_count": len(text)},
+        data=data,
     ).model_dump(mode="json")
 
 
@@ -1266,11 +1620,26 @@ async def android_clear_text(
 
     operation_id = session.new_operation_id()
     try:
-        async def act(_context: Any) -> Any:
-            session.clear_snapshot()
-            return await session.require_controller().clear_text(max_characters, target)
 
-        method = await session.run_operation(
+        async def act(_context: Any) -> tuple[Any, dict[str, object] | None]:
+            controller = session.require_controller()
+            target_details: dict[str, object] | None = None
+            if target is not None and (
+                _configured_method(controller, "snapshot") is not None
+                or session.session_id is not None
+                or _target_requires_validation(target)
+            ):
+                target_details = await _resolve_and_dispatch_target(_context, target)
+                session.advance_screen_revision(operation=_context)
+                result = controller.clear_text(max_characters, None)
+            else:
+                session.clear_snapshot()
+                result = controller.clear_text(max_characters, target)
+            if isawaitable(result):
+                result = await result
+            return result, target_details
+
+        method, target_details = await session.run_operation(
             "clear_text",
             act,
             operation_id=operation_id,
@@ -1280,10 +1649,16 @@ async def android_clear_text(
         return _failure(error).model_dump(mode="json")
     except Exception:
         return _unexpected_failure("text clearing")
+    data = {"method": method, "fallback_max_characters": max_characters}
+    if target_details is not None:
+        data["target"] = target_details
+        for key in ("selector", "matched_selector", "attempts"):
+            if key in target_details:
+                data[key] = target_details[key]
     return OperationResult(
         success=True,
         message="Cleared the focused Android text field.",
-        data={"method": method, "fallback_max_characters": max_characters},
+        data=data,
     ).model_dump(mode="json")
 
 
@@ -1308,6 +1683,7 @@ async def android_press_key(
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().press_key(key)
@@ -1352,6 +1728,7 @@ async def android_launch_app(
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> Any:
             session.clear_snapshot()
             return await session.require_controller().launch_app(package)
@@ -1393,6 +1770,7 @@ async def android_terminate_app(
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().terminate_app(package)
@@ -1436,6 +1814,7 @@ async def android_open_url(
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> None:
             session.clear_snapshot()
             await session.require_controller().open_url(url)
@@ -1487,6 +1866,7 @@ async def android_start_recording(
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> Any:
             session.clear_snapshot()
             return await session.require_controller().start_recording(
@@ -1526,6 +1906,7 @@ async def android_stop_recording() -> dict[str, Any]:
 
     operation_id = session.new_operation_id()
     try:
+
         async def act(_context: Any) -> Any:
             session.clear_snapshot()
             return await session.require_controller().stop_recording()
@@ -1571,6 +1952,7 @@ async def android_wait(
 
     operation_id = session.new_operation_id()
     try:
+
         async def wait_fixed(context: Any) -> None:
             session.clear_snapshot()
             await context.sleep(milliseconds / 1_000)

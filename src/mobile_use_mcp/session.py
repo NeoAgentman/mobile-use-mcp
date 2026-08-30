@@ -10,7 +10,7 @@ import inspect
 from collections.abc import Callable
 from contextlib import suppress
 from threading import Lock, RLock
-from typing import Any, cast
+from typing import Any, Never, cast
 from uuid import uuid4
 
 from mobile_use_mcp.config import RuntimeConfig
@@ -18,17 +18,22 @@ from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.devices import DeviceRegistry
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
+    BoundsProvenance,
     DeviceDisconnectResult,
     DeviceInfo,
     DeviceStatusResult,
     LifecycleError,
+    ResolvedTarget,
     ScreenSnapshot,
     SessionConnection,
     SessionLifecycle,
     SnapshotContext,
+    Target,
+    UIElement,
 )
 from mobile_use_mcp.operations import OperationContext, OperationGateway, current_operation
 from mobile_use_mcp.processes import run_blocking
+from mobile_use_mcp.selectors import resolve_target
 from mobile_use_mcp.snapshot import SnapshotStore
 
 ControllerFactory = Callable[[str], AndroidController]
@@ -570,9 +575,7 @@ class DeviceSession:
 
         active_operation = _effective_operation(operation)
         alias_revision = (
-            expected_screen_revision
-            if expected_screen_revision is not None
-            else expected_revision
+            expected_screen_revision if expected_screen_revision is not None else expected_revision
         )
 
         def store() -> str:
@@ -583,16 +586,13 @@ class DeviceSession:
                     screen_revision=self._screen_revision,
                 )
                 context_mismatch = expected_context is not None and current != expected_context
-                alias_mismatch = (
-                    expected_context is None
-                    and (
-                        (expected_session_id is not None
-                         and current.session_id != expected_session_id)
-                        or (expected_generation is not None
-                            and current.generation != expected_generation)
-                        or (alias_revision is not None
-                            and current.screen_revision != alias_revision)
+                alias_mismatch = expected_context is None and (
+                    (expected_session_id is not None and current.session_id != expected_session_id)
+                    or (
+                        expected_generation is not None
+                        and current.generation != expected_generation
                     )
+                    or (alias_revision is not None and current.screen_revision != alias_revision)
                 )
                 if context_mismatch or alias_mismatch:
                     expected_sid = (
@@ -628,9 +628,24 @@ class DeviceSession:
                 stamped.session_id = current.session_id
                 stamped.generation = current.generation
                 stamped.screen_revision = current.screen_revision
+                assigned_snapshot_id = f"s-{uuid4().hex}"
+                stamped.snapshot_id = assigned_snapshot_id
+                # Element references are random capabilities, never encoded
+                # selectors. Each reference carries provenance in a separate
+                # typed field so copied coordinates cannot silently outlive
+                # their session generation or screen revision.
+                for element in stamped.elements:
+                    element.element_ref = f"el-{uuid4().hex}"
+                    element.bounds_provenance = BoundsProvenance(
+                        snapshot_id=assigned_snapshot_id,
+                        session_id=current.session_id,
+                        generation=current.generation,
+                        screen_revision=current.screen_revision,
+                    )
                 # The store owns the opaque identifier.  A caller-provided ID
                 # must never allow an observation to overwrite another entry.
-                stamped.snapshot_id = None
+                # The generated ID is supplied explicitly so its value is
+                # included in the store's byte accounting.
 
                 # Preserve the identity behavior of the old unbound core API
                 # only for the exact same object stored twice.  MCP captures
@@ -652,9 +667,13 @@ class DeviceSession:
                     stamped.session_id = None
                     stamped.generation = None
                     stamped.screen_revision = 0
-                    stored = self._snapshot_store.put(stamped, clone=False)
+                    stored = self._snapshot_store.put(
+                        stamped,
+                        snapshot_id=assigned_snapshot_id,
+                        clone=False,
+                    )
                 else:
-                    stored = self._snapshot_store.put(stamped)
+                    stored = self._snapshot_store.put(stamped, snapshot_id=assigned_snapshot_id)
                     # Publish the provenance on the caller's result object as
                     # well.  The store retained a deep copy, so this
                     # convenience mutation cannot make its entry mutable.
@@ -662,6 +681,20 @@ class DeviceSession:
                     snapshot.generation = current.generation
                     snapshot.screen_revision = current.screen_revision
                     snapshot.snapshot_id = stored.snapshot_id
+                    for source, stored_element in zip(
+                        snapshot.elements,
+                        stored.elements,
+                        strict=True,
+                    ):
+                        source.element_ref = stored_element.element_ref
+                        source.bounds_provenance = (
+                            stored_element.bounds_provenance.model_copy(deep=True)
+                            if stored_element.bounds_provenance is not None
+                            else None
+                        )
+                for source, _stored_element in zip(snapshot.elements, stored.elements, strict=True):
+                    if source.bounds_provenance is not None:
+                        source.bounds_provenance.snapshot_id = stored.snapshot_id
                 self._legacy_snapshot_input = snapshot
                 self._snapshot_id = stored.snapshot_id
                 self._snapshot = stored
@@ -761,6 +794,15 @@ class DeviceSession:
 
         def advance() -> int:
             with self._state_lock:
+                current_id = self._snapshot_id
+                current_snapshot = self._snapshot
+                if (
+                    current_id is not None
+                    and current_snapshot is not None
+                    and current_snapshot.session_id is None
+                    and not self._current_snapshot_revision_managed
+                ):
+                    self._snapshot_store.forget(current_id)
                 self._screen_revision += 1
                 self._clear_snapshot_unchecked()
                 return self._screen_revision
@@ -770,6 +812,647 @@ class DeviceSession:
     # Descriptive aliases used by embedders and tests.
     advance_revision = advance_screen_revision
     mark_screen_changed = advance_screen_revision
+
+    @staticmethod
+    def _element_identity(element: UIElement) -> tuple[object, ...]:
+        """Return stable node identity fields while ignoring volatile state."""
+
+        return (
+            element.text,
+            element.content_description,
+            element.resource_id,
+            element.class_name,
+            element.package,
+            element.clickable,
+            element.focusable,
+            element.scrollable,
+        )
+
+    def _find_current_element(
+        self,
+        source_snapshot: ScreenSnapshot,
+        source_element: UIElement,
+        current_snapshot: ScreenSnapshot,
+    ) -> UIElement | None:
+        """Find the same observed node in a fresh complete hierarchy."""
+
+        source_candidates = [
+            index
+            for index, candidate in enumerate(source_snapshot.elements)
+            if self._element_identity(candidate) == self._element_identity(source_element)
+        ]
+        source_position = next(
+            (
+                index
+                for index, candidate in enumerate(source_snapshot.elements)
+                if candidate.element_ref == source_element.element_ref
+            ),
+            None,
+        )
+        ordinal = (
+            source_candidates.index(source_position)
+            if source_position is not None and source_position in source_candidates
+            else 0
+        )
+        if source_element.node_index is not None:
+            indexed = [
+                candidate
+                for candidate in current_snapshot.elements
+                if candidate.node_index == source_element.node_index
+                and self._element_identity(candidate) == self._element_identity(source_element)
+            ]
+            if indexed:
+                return indexed[0]
+        current_candidates = [
+            candidate
+            for candidate in current_snapshot.elements
+            if self._element_identity(candidate) == self._element_identity(source_element)
+        ]
+        if ordinal < len(current_candidates):
+            return current_candidates[ordinal]
+        return None
+
+    def _raise_stale_target(
+        self,
+        *,
+        code: ErrorCode,
+        message: str,
+        suggestion: str,
+        expected: SnapshotContext | None = None,
+        actual: SnapshotContext | None = None,
+        data: dict[str, object] | None = None,
+        selector: str = "element_ref_or_bounds",
+    ) -> Never:
+        details = dict(data or {})
+        details.setdefault(
+            "attempts",
+            [
+                {
+                    "selector": selector,
+                    "matched": False,
+                    "error": message,
+                    "match_count": 0,
+                }
+            ],
+        )
+        details.setdefault("matched_selector", None)
+        if expected is not None:
+            details.update(
+                {
+                    "expected_session_id": expected.session_id,
+                    "expected_generation": expected.generation,
+                    "expected_screen_revision": expected.screen_revision,
+                }
+            )
+        if actual is not None:
+            details.update(
+                {
+                    "current_session_id": actual.session_id,
+                    "current_generation": actual.generation,
+                    "current_screen_revision": actual.screen_revision,
+                }
+            )
+        raise MobileUseError(code, message, suggestion, data=details)
+
+    @staticmethod
+    def _annotate_target_error(
+        error: MobileUseError,
+        *,
+        selector: str,
+    ) -> MobileUseError:
+        """Add the common target ledger to snapshot lookup failures."""
+
+        details = dict(error.data)
+        details.setdefault(
+            "attempts",
+            [
+                {
+                    "selector": selector,
+                    "matched": False,
+                    "error": error.message,
+                    "match_count": 0,
+                }
+            ],
+        )
+        details.setdefault("matched_selector", None)
+        return MobileUseError(
+            error.code,
+            error.message,
+            error.suggestion,
+            data=details,
+            retryable_override=error.retryable,
+        )
+
+    @staticmethod
+    async def _capture_complete_snapshot(controller: Any, max_text_length: int) -> ScreenSnapshot:
+        """Capture an action-time hierarchy without response pagination."""
+
+        reader = controller.snapshot
+        try:
+            result = reader(
+                interactive_only=False,
+                max_elements=None,
+                max_text_length=max_text_length,
+            )
+        except TypeError as error:
+            # Small injected fakes often expose a no-argument snapshot method.
+            # Only fall back for signature mismatches, preserving adapter
+            # TypeErrors as real failures.
+            if "unexpected keyword" not in str(error) and "positional argument" not in str(error):
+                raise
+            result = reader()
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, ScreenSnapshot):
+            raise TypeError("Android controller did not return a screen snapshot")
+        return result
+
+    # Keep the complete-read seam public for injected controllers and server
+    # orchestration without exposing the private implementation name.
+    capture_complete_snapshot = _capture_complete_snapshot
+
+    async def resolve_target(
+        self,
+        target: Target,
+        *,
+        operation: OperationContext | None = None,
+        controller: Any | None = None,
+    ) -> tuple[ScreenSnapshot, ResolvedTarget]:
+        """Validate a target against the current session before dispatch.
+
+        Opaque references and copied bounds are capabilities, not hints: their
+        provenance must still match the active session generation and screen
+        revision, and a fresh complete hierarchy must contain the referenced
+        enabled node at the same bounds.
+        """
+
+        active_operation = _effective_operation(operation)
+        _checkpoint(active_operation, "target_resolve")
+        with self._state_lock:
+            current_context = SnapshotContext(
+                session_id=self._session_id,
+                generation=self._generation,
+                screen_revision=self._screen_revision,
+            )
+        if controller is None:
+            controller = self.require_controller(operation=active_operation)
+
+        source_snapshot: ScreenSnapshot | None = None
+        source_element: UIElement | None = None
+        ref_snapshot_id: str | None = None
+        if target.element_ref is not None:
+            snapshot_id, source_snapshot, source_element = self._snapshot_store.find_element_ref(
+                target.element_ref
+            )
+            ref_snapshot_id = snapshot_id
+            if target.snapshot_id is not None and target.snapshot_id != snapshot_id:
+                raise MobileUseError(
+                    ErrorCode.SELECTOR_CONFLICT,
+                    "The element_ref and snapshot_id identify different observations.",
+                    "Copy both values from the same android_snapshot result.",
+                    data={
+                        "element_ref": target.element_ref,
+                        "snapshot_id": target.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": True,
+                                "error": None,
+                                "match_count": 1,
+                            },
+                            {
+                                "selector": "snapshot_id",
+                                "matched": False,
+                                "error": "Observation identity conflict",
+                                "match_count": 0,
+                            },
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            provenance = source_element.bounds_provenance
+            if provenance is None:
+                self._raise_stale_target(
+                    code=ErrorCode.ELEMENT_REF_STALE,
+                    message="The Android element reference has no capture provenance.",
+                    suggestion="Call android_snapshot and use an element_ref from that result.",
+                    data={"element_ref": target.element_ref},
+                )
+            if provenance.session_id is None or provenance.generation is None:
+                self._raise_stale_target(
+                    code=ErrorCode.ELEMENT_REF_STALE,
+                    message="The Android element reference is not bound to a live session.",
+                    suggestion=(
+                        "Call android_snapshot after android_connect and use its element_ref."
+                    ),
+                    data={"element_ref": target.element_ref},
+                )
+            expected = SnapshotContext(
+                session_id=provenance.session_id,
+                generation=provenance.generation,
+                screen_revision=provenance.screen_revision,
+            )
+            if expected != current_context:
+                self._raise_stale_target(
+                    code=ErrorCode.ELEMENT_REF_STALE,
+                    message="The Android element reference belongs to an older screen revision.",
+                    suggestion=(
+                        "Call android_snapshot and use an element_ref from the current screen."
+                    ),
+                    expected=expected,
+                    actual=current_context,
+                    data={"element_ref": target.element_ref},
+                )
+            if not source_element.enabled:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_DISABLED,
+                    "The referenced Android element was disabled when observed.",
+                    "Choose an enabled element from a fresh android_snapshot.",
+                    data={
+                        "element_ref": target.element_ref,
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": False,
+                                "error": "The referenced Android element was disabled.",
+                                "match_count": 1,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+
+        if target.bounds_provenance is not None:
+            expected = SnapshotContext(
+                session_id=target.bounds_provenance.session_id,
+                generation=target.bounds_provenance.generation,
+                screen_revision=target.bounds_provenance.screen_revision,
+            )
+            if expected != current_context:
+                self._raise_stale_target(
+                    code=ErrorCode.ELEMENT_REF_STALE,
+                    message="The Android bounds belong to an older screen revision.",
+                    suggestion="Call android_snapshot and use bounds from the current screen.",
+                    expected=expected,
+                    actual=current_context,
+                )
+            provenance_snapshot_id = target.bounds_provenance.snapshot_id
+            if (
+                provenance_snapshot_id is not None
+                and target.snapshot_id is not None
+                and provenance_snapshot_id != target.snapshot_id
+            ):
+                raise MobileUseError(
+                    ErrorCode.SELECTOR_CONFLICT,
+                    "The snapshot_id and bounds provenance identify different observations.",
+                    "Copy both values from the same android_snapshot result.",
+                    data={
+                        "snapshot_id": target.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "snapshot_id",
+                                "matched": False,
+                                "error": "Observation identity conflict",
+                                "match_count": 0,
+                            },
+                            {
+                                "selector": "bounds_provenance",
+                                "matched": False,
+                                "error": "Observation identity conflict",
+                                "match_count": 0,
+                            },
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            if (
+                provenance_snapshot_id is not None
+                and ref_snapshot_id is not None
+                and provenance_snapshot_id != ref_snapshot_id
+            ):
+                raise MobileUseError(
+                    ErrorCode.SELECTOR_CONFLICT,
+                    "The element_ref and bounds provenance identify different observations.",
+                    "Copy both values from the same android_snapshot result.",
+                    data={
+                        "element_ref": target.element_ref,
+                        "snapshot_id": target.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": True,
+                                "error": None,
+                                "match_count": 1,
+                            },
+                            {
+                                "selector": "bounds_provenance",
+                                "matched": False,
+                                "error": "Observation identity conflict",
+                                "match_count": 0,
+                            },
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            if provenance_snapshot_id is not None or target.snapshot_id is not None:
+                source_id = provenance_snapshot_id or target.snapshot_id
+                assert source_id is not None
+                try:
+                    source_snapshot = self.get_snapshot(source_id)
+                except MobileUseError as error:
+                    raise self._annotate_target_error(
+                        error,
+                        selector="bounds_provenance",
+                    ) from error
+        elif target.snapshot_id is not None:
+            try:
+                source_snapshot = self.get_snapshot(target.snapshot_id)
+            except MobileUseError as error:
+                raise self._annotate_target_error(error, selector="snapshot_id") from error
+            expected = SnapshotContext(
+                session_id=source_snapshot.session_id,
+                generation=source_snapshot.generation,
+                screen_revision=source_snapshot.screen_revision,
+            )
+            if expected != current_context:
+                self._raise_stale_target(
+                    code=ErrorCode.ELEMENT_REF_STALE,
+                    message="The Android bounds belong to an older screen revision.",
+                    suggestion="Call android_snapshot and use bounds from the current screen.",
+                    expected=expected,
+                    actual=current_context,
+                    data={"snapshot_id": target.snapshot_id},
+                )
+
+        if (
+            target.bounds is not None
+            and current_context.session_id is not None
+            and target.bounds_provenance is None
+        ):
+            raise MobileUseError(
+                ErrorCode.INVALID_TARGET,
+                "Coordinate targets on a connected Android session require bounds provenance.",
+                "Copy bounds and bounds_provenance from the current android_snapshot, or use a "
+                "resource-id/text selector.",
+                data={
+                    "attempts": [
+                        {
+                            "selector": "bounds",
+                            "matched": False,
+                            "error": "Missing bounds provenance.",
+                            "match_count": 0,
+                        }
+                    ],
+                    "matched_selector": None,
+                },
+            )
+
+        current_snapshot = await self._capture_complete_snapshot(
+            controller,
+            min(2_000, self.config.snapshot_max_text_length),
+        )
+        _checkpoint(active_operation, "target_resolve")
+        with self._state_lock:
+            latest_context = SnapshotContext(
+                session_id=self._session_id,
+                generation=self._generation,
+                screen_revision=self._screen_revision,
+            )
+        if latest_context != current_context:
+            self._raise_stale_target(
+                code=ErrorCode.ELEMENT_REF_STALE,
+                message="The Android screen changed while the target was being resolved.",
+                suggestion="Call android_snapshot and use a target from the current screen.",
+                expected=current_context,
+                actual=latest_context,
+                data={"element_ref": target.element_ref},
+            )
+
+        if target.bounds is not None and not target.bounds.is_within(
+            current_snapshot.width,
+            current_snapshot.height,
+        ):
+            raise MobileUseError(
+                ErrorCode.TARGET_OFF_SCREEN,
+                "The Android target bounds are off-screen in the current observation.",
+                "Call android_snapshot and choose bounds inside the current screen.",
+                data={
+                    "attempts": [
+                        {
+                            "selector": "bounds",
+                            "matched": False,
+                            "error": "Center is outside the current screen.",
+                            "match_count": 0,
+                        }
+                    ],
+                    "matched_selector": None,
+                },
+            )
+
+        if source_snapshot is not None and source_snapshot.session_id != current_context.session_id:
+            self._raise_stale_target(
+                code=ErrorCode.ELEMENT_REF_STALE,
+                message="The Android target belongs to another connected session.",
+                suggestion="Call android_snapshot and use a target from this session.",
+            )
+
+        if target.bounds is not None and source_snapshot is not None and source_element is None:
+            source_bounds_element = next(
+                (
+                    element
+                    for element in source_snapshot.elements
+                    if element.bounds == target.bounds
+                ),
+                None,
+            )
+            if source_bounds_element is not None:
+                if not source_bounds_element.enabled:
+                    raise MobileUseError(
+                        ErrorCode.ELEMENT_DISABLED,
+                        "The Android element supplying these bounds is disabled.",
+                        "Choose an enabled element from a fresh android_snapshot.",
+                        data={
+                            "snapshot_id": source_snapshot.snapshot_id,
+                            "attempts": [
+                                {
+                                    "selector": "bounds",
+                                    "matched": False,
+                                    "error": (
+                                        "The Android element supplying these bounds is disabled."
+                                    ),
+                                    "match_count": 1,
+                                }
+                            ],
+                            "matched_selector": None,
+                        },
+                    )
+                current_bounds_element = self._find_current_element(
+                    source_snapshot,
+                    source_bounds_element,
+                    current_snapshot,
+                )
+                if current_bounds_element is None:
+                    raise MobileUseError(
+                        ErrorCode.ELEMENT_REMOVED,
+                        "The Android element supplying these bounds is no longer present.",
+                        "Call android_snapshot and use bounds from the current screen.",
+                        data={
+                            "snapshot_id": source_snapshot.snapshot_id,
+                            "attempts": [
+                                {
+                                    "selector": "bounds",
+                                    "matched": False,
+                                    "error": (
+                                        "The Android element supplying these bounds is no longer "
+                                        "present."
+                                    ),
+                                    "match_count": 1,
+                                }
+                            ],
+                            "matched_selector": None,
+                        },
+                    )
+                if current_bounds_element.bounds != source_bounds_element.bounds:
+                    raise MobileUseError(
+                        ErrorCode.ELEMENT_REF_STALE,
+                        "The Android element supplying these bounds moved since it was observed.",
+                        "Call android_snapshot and use bounds from the current screen.",
+                        data={
+                            "snapshot_id": source_snapshot.snapshot_id,
+                            "attempts": [
+                                {
+                                    "selector": "bounds",
+                                    "matched": False,
+                                    "error": (
+                                        "The Android element supplying these bounds moved since it "
+                                        "was observed."
+                                    ),
+                                    "match_count": 1,
+                                }
+                            ],
+                            "matched_selector": None,
+                        },
+                    )
+                if not current_bounds_element.enabled:
+                    raise MobileUseError(
+                        ErrorCode.ELEMENT_DISABLED,
+                        "The Android element supplying these bounds is disabled.",
+                        "Choose an enabled element from a fresh android_snapshot.",
+                        data={
+                            "snapshot_id": source_snapshot.snapshot_id,
+                            "attempts": [
+                                {
+                                    "selector": "bounds",
+                                    "matched": False,
+                                    "error": (
+                                        "The Android element supplying these bounds is disabled."
+                                    ),
+                                    "match_count": 1,
+                                }
+                            ],
+                            "matched_selector": None,
+                        },
+                    )
+
+        if source_element is not None:
+            current_element = self._find_current_element(
+                source_snapshot or current_snapshot,
+                source_element,
+                current_snapshot,
+            )
+            if current_element is None:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_REMOVED,
+                    "The referenced Android element is no longer present on screen.",
+                    "Call android_snapshot and use an element_ref from the current screen.",
+                    data={
+                        "element_ref": target.element_ref,
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": False,
+                                "error": (
+                                    "The referenced Android element is no longer present on screen."
+                                ),
+                                "match_count": 0,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            # Give the resolver an internal capability marker while keeping
+            # the public fresh hierarchy free of stale reference values.
+            current_elements = [
+                element.model_copy(deep=True) for element in current_snapshot.elements
+            ]
+            current_index = next(
+                index
+                for index, element in enumerate(current_snapshot.elements)
+                if element is current_element
+            )
+            current_elements[current_index].element_ref = target.element_ref
+            if current_element.bounds != source_element.bounds:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_REF_STALE,
+                    "The referenced Android element moved since it was observed.",
+                    "Call android_snapshot and use an element_ref from the current screen.",
+                    data={
+                        "element_ref": target.element_ref,
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": False,
+                                "error": (
+                                    "The referenced Android element moved since it was observed."
+                                ),
+                                "match_count": 1,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            if target.bounds is not None and target.bounds != source_element.bounds:
+                raise MobileUseError(
+                    ErrorCode.SELECTOR_CONFLICT,
+                    "The supplied bounds and element_ref identify different UI elements.",
+                    "Use bounds copied from the same element observation.",
+                    data={
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": True,
+                                "error": None,
+                                "match_count": 1,
+                            },
+                            {
+                                "selector": "bounds",
+                                "matched": True,
+                                "error": None,
+                                "match_count": 1,
+                            },
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            resolved = resolve_target(
+                target,
+                current_elements,
+                screen_width=current_snapshot.width,
+                screen_height=current_snapshot.height,
+            )
+        else:
+            resolved = resolve_target(
+                target,
+                current_snapshot.elements,
+                screen_width=current_snapshot.width,
+                screen_height=current_snapshot.height,
+            )
+        return current_snapshot, resolved
+
+    # Compatibility aliases used by integrations that call the seam by its
+    # validation-oriented name.
+    validate_target = resolve_target
+    prepare_target = resolve_target
 
     def require_controller(
         self,

@@ -75,6 +75,9 @@ class SnapshotStore:
         self._entries: OrderedDict[str, _SnapshotEntry] = OrderedDict()
         self._expired: OrderedDict[str, float] = OrderedDict()
         self._evicted: OrderedDict[str, float] = OrderedDict()
+        self._element_refs: dict[str, str] = {}
+        self._expired_element_refs: OrderedDict[str, float] = OrderedDict()
+        self._evicted_element_refs: OrderedDict[str, float] = OrderedDict()
         self._total_bytes = 0
         self._lock = RLock()
 
@@ -153,6 +156,38 @@ class SnapshotStore:
         while len(target) > max(16, self.max_entries * 4):
             target.popitem(last=False)
 
+    @staticmethod
+    def _snapshot_element_refs(snapshot: ScreenSnapshot) -> tuple[str, ...]:
+        return tuple(
+            element.element_ref for element in snapshot.elements if element.element_ref is not None
+        )
+
+    def _index_entry(self, snapshot_id: str, snapshot: ScreenSnapshot) -> None:
+        for element_ref in self._snapshot_element_refs(snapshot):
+            self._element_refs[element_ref] = snapshot_id
+            self._expired_element_refs.pop(element_ref, None)
+            self._evicted_element_refs.pop(element_ref, None)
+
+    def _forget_entry_refs(
+        self,
+        snapshot_id: str,
+        *,
+        target: OrderedDict[str, float] | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Move refs for one removed entry to bounded stale diagnostics."""
+
+        for element_ref, indexed_snapshot_id in tuple(self._element_refs.items()):
+            if indexed_snapshot_id != snapshot_id:
+                continue
+            del self._element_refs[element_ref]
+            if target is not None:
+                self._remember(
+                    target,
+                    element_ref,
+                    self._clock() if now is None else now,
+                )
+
     def _prune_expired(self, now: float) -> None:
         if self.ttl_seconds < 0:  # Defensive guard for embedders mutating config.
             return
@@ -165,12 +200,18 @@ class SnapshotStore:
             entry = self._entries.pop(snapshot_id)
             self._total_bytes -= entry.size_bytes
             self._remember(self._expired, snapshot_id, entry.stored_at + self.ttl_seconds)
+            self._forget_entry_refs(
+                snapshot_id,
+                target=self._expired_element_refs,
+                now=entry.stored_at + self.ttl_seconds,
+            )
 
     def _evict_for_pressure(self, now: float) -> None:
         while len(self._entries) > self.max_entries or self._total_bytes > self.max_bytes:
             snapshot_id, entry = self._entries.popitem(last=False)
             self._total_bytes -= entry.size_bytes
             self._remember(self._evicted, snapshot_id, now)
+            self._forget_entry_refs(snapshot_id, target=self._evicted_element_refs, now=now)
 
     def put(
         self,
@@ -196,6 +237,7 @@ class SnapshotStore:
             if resolved_id in self._entries:
                 previous = self._entries.pop(resolved_id)
                 self._total_bytes -= previous.size_bytes
+                self._forget_entry_refs(resolved_id)
             stored = snapshot if not clone else snapshot.model_copy(deep=True)
             stored.snapshot_id = resolved_id
             size_bytes = snapshot_size_bytes(stored)
@@ -214,6 +256,7 @@ class SnapshotStore:
             self._expired.pop(resolved_id, None)
             self._evicted.pop(resolved_id, None)
             self._entries[resolved_id] = _SnapshotEntry(stored, now, size_bytes)
+            self._index_entry(resolved_id, stored)
             self._total_bytes += size_bytes
             self._evict_for_pressure(now)
             return stored
@@ -231,6 +274,7 @@ class SnapshotStore:
                 latest_id = next(reversed(self._entries))
                 previous = self._entries.pop(latest_id)
                 self._total_bytes -= previous.size_bytes
+                self._forget_entry_refs(latest_id)
             return self.put(snapshot, clone=clone)
 
     def forget(self, snapshot_id: str, *, reason: str = "not_found") -> None:
@@ -240,6 +284,14 @@ class SnapshotStore:
             entry = self._entries.pop(snapshot_id, None)
             if entry is not None:
                 self._total_bytes -= entry.size_bytes
+                target = (
+                    self._expired_element_refs
+                    if reason == "expired"
+                    else self._evicted_element_refs
+                    if reason == "evicted"
+                    else None
+                )
+                self._forget_entry_refs(snapshot_id, target=target)
             if reason == "expired":
                 self._remember(self._expired, snapshot_id, self._clock())
             elif reason == "evicted":
@@ -254,9 +306,18 @@ class SnapshotStore:
             self._total_bytes = 0
             if reason in {"expired", "evicted"}:
                 target = self._expired if reason == "expired" else self._evicted
+                element_target = (
+                    self._expired_element_refs
+                    if reason == "expired"
+                    else self._evicted_element_refs
+                )
                 now = self._clock()
                 for snapshot_id in ids:
                     self._remember(target, snapshot_id, now)
+                    self._forget_entry_refs(snapshot_id, target=element_target, now=now)
+            else:
+                for snapshot_id in ids:
+                    self._forget_entry_refs(snapshot_id)
 
     def get(self, snapshot_id: str, *, clone: bool = True) -> ScreenSnapshot:
         """Return one identified observation or a specific expiry/stale error."""
@@ -292,9 +353,96 @@ class SnapshotStore:
             raise MobileUseError(
                 ErrorCode.SNAPSHOT_NOT_FOUND,
                 f"Android snapshot {snapshot_id!r} is no longer available.",
-                "Call android_snapshot to capture the current screen and use its new "
-                "snapshot_id.",
+                "Call android_snapshot to capture the current screen and use its new snapshot_id.",
                 data={"snapshot_id": snapshot_id},
+            )
+
+    def find_element_ref(
+        self,
+        element_ref: str,
+        *,
+        clone: bool = True,
+    ) -> tuple[str, ScreenSnapshot, UIElement]:
+        """Resolve an opaque element ref without exposing selector internals.
+
+        References are indexed when snapshots enter the store and removed with
+        the corresponding bounded entry. This preserves a distinct expiry or
+        capacity diagnostic even when the caller did not retain ``snapshot_id``.
+        """
+
+        now = self._clock()
+        with self._lock:
+            self._prune_expired(now)
+            snapshot_id = self._element_refs.get(element_ref)
+            if snapshot_id is not None:
+                entry = self._entries.get(snapshot_id)
+                if entry is not None:
+                    for element in entry.snapshot.elements:
+                        if element.element_ref == element_ref:
+                            if clone:
+                                snapshot = entry.snapshot.model_copy(deep=True)
+                                matched = next(
+                                    item
+                                    for item in snapshot.elements
+                                    if item.element_ref == element_ref
+                                )
+                            else:
+                                snapshot = entry.snapshot
+                                matched = element
+                            return snapshot_id, snapshot, matched
+            if element_ref in self._expired_element_refs:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_REF_EXPIRED,
+                    "The Android element reference has expired with its snapshot.",
+                    "Call android_snapshot and use an element_ref from the new observation.",
+                    data={
+                        "element_ref": element_ref,
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": False,
+                                "error": "The Android element reference has expired.",
+                                "match_count": 0,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            if element_ref in self._evicted_element_refs:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_REF_STALE,
+                    "The Android element reference is no longer retained.",
+                    "Call android_snapshot and use an element_ref from the new observation.",
+                    data={
+                        "element_ref": element_ref,
+                        "reason": "capacity_eviction",
+                        "attempts": [
+                            {
+                                "selector": "element_ref",
+                                "matched": False,
+                                "error": "The Android element reference was evicted.",
+                                "match_count": 0,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            raise MobileUseError(
+                ErrorCode.ELEMENT_REF_NOT_FOUND,
+                "The Android element reference is unknown or invalid.",
+                "Call android_snapshot and use an element_ref from the new observation.",
+                data={
+                    "element_ref": element_ref,
+                    "attempts": [
+                        {
+                            "selector": "element_ref",
+                            "matched": False,
+                            "error": "No matching opaque element reference.",
+                            "match_count": 0,
+                        }
+                    ],
+                    "matched_selector": None,
+                },
             )
 
 
@@ -342,9 +490,10 @@ def parse_hierarchy(
         raise ValueError("UIAutomator returned invalid hierarchy XML") from error
 
     elements: list[UIElement] = []
-    for node in root.iter("node"):
+    for node_index, node in enumerate(root.iter("node")):
         attributes = node.attrib
         element = UIElement(
+            node_index=node_index,
             text=_clean(attributes.get("text"), max_text_length),
             content_description=_clean(attributes.get("content-desc"), max_text_length),
             resource_id=_clean(attributes.get("resource-id"), 512),

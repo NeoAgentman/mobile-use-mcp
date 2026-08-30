@@ -15,8 +15,10 @@ from mobile_use_mcp.models import (
     AppLaunchAttempt,
     AppLaunchResult,
     ForegroundApp,
+    ResolvedTarget,
     ScreenshotCapture,
     ScreenSnapshot,
+    SwipePercentage,
     Target,
 )
 from mobile_use_mcp.processes import ProcessTimeoutError, run_blocking
@@ -56,6 +58,13 @@ class ADBDevice(Protocol):
 
 
 ADBConnector = Callable[[str], ADBDevice]
+
+
+def normalized_coordinate_to_pixel(value: float, size: int) -> int:
+    """Map a normalized coordinate onto the valid native pixel range."""
+
+    # 1.0 denotes the last valid pixel rather than an out-of-range width.
+    return min(size - 1, max(0, round(value * (size - 1))))
 
 
 def _default_adb_connector(
@@ -185,9 +194,7 @@ class AndroidController:
                 max_text_length=max_text_length,
             )
         except Exception:
-            warnings.append(
-                "HIERARCHY_UNAVAILABLE: Android UI hierarchy could not be collected."
-            )
+            warnings.append("HIERARCHY_UNAVAILABLE: Android UI hierarchy could not be collected.")
         try:
             foreground = await self._read_foreground_app()
         except Exception:
@@ -244,30 +251,19 @@ class AndroidController:
         return await self.screenshot()
 
     async def tap(self, target: Target) -> dict[str, object]:
-        snapshot = await self.snapshot()
-        resolved = resolve_target(
-            target,
-            snapshot.elements,
-            screen_width=snapshot.width,
-            screen_height=snapshot.height,
-        )
+        _, resolved = await self.resolve_target(target)
         x, y = resolved.bounds.center
         await self._call_blocking(self.adb_device.click, x, y)
         return {
             "x": x,
             "y": y,
             "selector": resolved.selector,
+            "matched_selector": resolved.matched_selector or resolved.selector,
             "attempts": [attempt.model_dump() for attempt in resolved.attempts],
         }
 
     async def long_press(self, target: Target, duration_ms: int = 1_000) -> dict[str, object]:
-        snapshot = await self.snapshot()
-        resolved = resolve_target(
-            target,
-            snapshot.elements,
-            screen_width=snapshot.width,
-            screen_height=snapshot.height,
-        )
+        _, resolved = await self.resolve_target(target)
         x, y = resolved.bounds.center
         await self._call_blocking(self.adb_device.swipe, x, y, x, y, duration_ms / 1_000)
         return {
@@ -275,6 +271,60 @@ class AndroidController:
             "y": y,
             "duration_ms": duration_ms,
             "selector": resolved.selector,
+            "matched_selector": resolved.matched_selector or resolved.selector,
+            "attempts": [attempt.model_dump() for attempt in resolved.attempts],
+        }
+
+    async def resolve_target(
+        self,
+        target: Target,
+        *,
+        observation: ScreenSnapshot | None = None,
+    ) -> tuple[ScreenSnapshot, ResolvedTarget]:
+        """Read and resolve against the complete current hierarchy.
+
+        Action resolution must not inherit the compact response limit used by
+        ``android_snapshot``. The observation is returned so a session can
+        validate a capability against the exact hierarchy before dispatch.
+        """
+
+        current = observation or await self.snapshot(max_elements=None)
+        resolved = resolve_target(
+            target,
+            current.elements,
+            screen_width=current.width,
+            screen_height=current.height,
+        )
+        return current, resolved
+
+    async def tap_resolved(self, resolved: ResolvedTarget) -> dict[str, object]:
+        """Dispatch a previously validated tap without re-resolving it."""
+
+        x, y = resolved.bounds.center
+        await self._call_blocking(self.adb_device.click, x, y)
+        return {
+            "x": x,
+            "y": y,
+            "selector": resolved.selector,
+            "matched_selector": resolved.matched_selector or resolved.selector,
+            "attempts": [attempt.model_dump() for attempt in resolved.attempts],
+        }
+
+    async def long_press_resolved(
+        self,
+        resolved: ResolvedTarget,
+        duration_ms: int = 1_000,
+    ) -> dict[str, object]:
+        """Dispatch a previously validated long press without re-resolving it."""
+
+        x, y = resolved.bounds.center
+        await self._call_blocking(self.adb_device.swipe, x, y, x, y, duration_ms / 1_000)
+        return {
+            "x": x,
+            "y": y,
+            "duration_ms": duration_ms,
+            "selector": resolved.selector,
+            "matched_selector": resolved.matched_selector or resolved.selector,
             "attempts": [attempt.model_dump() for attempt in resolved.attempts],
         }
 
@@ -285,8 +335,11 @@ class AndroidController:
         end_x: int,
         end_y: int,
         duration_ms: int = 400,
-    ) -> None:
-        snapshot = await self.snapshot(interactive_only=True, max_elements=1)
+    ) -> dict[str, object]:
+        # Coordinate validation only needs dimensions, but the complete
+        # screenshot/hierarchy observation keeps the session's current screen
+        # check coherent and never imposes the compact element limit.
+        snapshot = await self.snapshot(interactive_only=True, max_elements=None)
         for name, x, y in (("start", start_x, start_y), ("end", end_x, end_y)):
             if not 0 <= x < snapshot.width or not 0 <= y < snapshot.height:
                 raise MobileUseError(
@@ -303,6 +356,44 @@ class AndroidController:
             end_y,
             duration_ms / 1_000,
         )
+        return {
+            "start": {"x": start_x, "y": start_y},
+            "end": {"x": end_x, "y": end_y},
+            "duration_ms": duration_ms,
+            "screen_width": snapshot.width,
+            "screen_height": snapshot.height,
+        }
+
+    @staticmethod
+    def _percentage_pixels(value: float, size: int) -> int:
+        return normalized_coordinate_to_pixel(value, size)
+
+    async def swipe_percentage(
+        self, coordinates: SwipePercentage, duration_ms: int = 400
+    ) -> dict[str, object]:
+        """Convert normalized coordinates using the current native dimensions."""
+
+        snapshot = await self.snapshot(interactive_only=True, max_elements=None)
+        start_x = self._percentage_pixels(coordinates.start_x, snapshot.width)
+        start_y = self._percentage_pixels(coordinates.start_y, snapshot.height)
+        end_x = self._percentage_pixels(coordinates.end_x, snapshot.width)
+        end_y = self._percentage_pixels(coordinates.end_y, snapshot.height)
+        await self._call_blocking(
+            self.adb_device.swipe,
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+            duration_ms / 1_000,
+        )
+        return {
+            "start": {"x": start_x, "y": start_y},
+            "end": {"x": end_x, "y": end_y},
+            "duration_ms": duration_ms,
+            "screen_width": snapshot.width,
+            "screen_height": snapshot.height,
+            "coordinates": coordinates.model_dump(mode="json"),
+        }
 
     async def focus(self, target: Target, timeout_seconds: float = 2) -> str:
         """Tap a target and verify focus when it has a semantic selector."""
@@ -319,7 +410,7 @@ class AndroidController:
         )
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
-            snapshot = await self.snapshot()
+            snapshot = await self.snapshot(max_elements=None)
             try:
                 resolved = resolve_target(
                     verification_target,

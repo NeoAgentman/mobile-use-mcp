@@ -20,21 +20,21 @@ modification_statement = "Significantly rewritten for the local MCP session boun
 path = "src/mobile_use_mcp/controller.py"
 upstream_path = "minitap/mobile_use/controllers/android_controller.py; minitap/mobile_use/tools/utils.py"
 kind = "adapted"
-sha256 = "28a9d5a68cda97634c04e1ec3bd0680764752d1aae2d100281a749efd0f27aaa"
+sha256 = "76208e4d63136b7a9a72f44b5234a6d51594d71d41bd757ce550b5e6969616d5"
 modification_statement = "Significantly rewritten as a deterministic Android-only controller with typed errors, validation, MCP-safe results, independent observation components, and screenshot-only capture."
 
 [[files]]
 path = "src/mobile_use_mcp/selectors.py"
 upstream_path = "minitap/mobile_use/tools/utils.py; minitap/mobile_use/utils/ui_hierarchy.py"
 kind = "adapted"
-sha256 = "66b6e36ab3191d410c7d3194d7f10f5699eb00c99bd394d24dcf14008c4c9710"
+sha256 = "95b10a7dac29fd8984f0d5a4234c4206c8bd2ff97df0497adba46de458d5fc99"
 modification_statement = "Significantly rewritten into a small Android selector resolver with bounded normalized targets and an explicit fallback ledger."
 
 [[files]]
 path = "src/mobile_use_mcp/snapshot.py"
 upstream_path = "minitap/mobile_use/clients/ui_automator_client.py"
 kind = "adapted"
-sha256 = "ade14d24568f050ca2b9eae4e697048dc36ecebe29baaa0063ab0a52d5f2e0f9"
+sha256 = "04aaa9d0630bd572e32ec3321e94397d6f6a19fa4f0c64e216a8093fe1bbc590"
 modification_statement = "Significantly rewritten to normalize and bound Android hierarchy output and retain immutable revision-aware observations for the MCP schema."
 
 [[files]]
