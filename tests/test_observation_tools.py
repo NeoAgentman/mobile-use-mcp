@@ -1,3 +1,5 @@
+import asyncio
+import threading
 from io import BytesIO
 from unittest.mock import AsyncMock, Mock
 
@@ -5,6 +7,9 @@ import pytest
 from mcp.types import ImageContent
 from PIL import Image
 
+import mobile_use_mcp.server as server_module
+from mobile_use_mcp.config import RuntimeConfig
+from mobile_use_mcp.errors import ErrorCode
 from mobile_use_mcp.models import (
     AppInfo,
     AppInventory,
@@ -25,6 +30,7 @@ from mobile_use_mcp.server import (
     mcp,
     session,
 )
+from mobile_use_mcp.session import SessionManager
 
 
 async def test_expected_observation_tools_are_registered() -> None:
@@ -62,7 +68,7 @@ async def test_list_devices_returns_paginated_structured_data(
 async def test_connect_and_status(monkeypatch: pytest.MonkeyPatch) -> None:
     device = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
 
-    def fake_connect(serial: str | None = None) -> DeviceInfo:
+    def fake_connect(serial: str | None = None, **_options: object) -> DeviceInfo:
         assert serial == "ABC"
         return device
 
@@ -75,6 +81,84 @@ async def test_connect_and_status(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result["success"] is True
     assert status["connected"] is True
     session.disconnect()
+
+
+async def test_status_reports_the_operation_active_when_status_was_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = SessionManager(
+        config=RuntimeConfig(operation_timeout_seconds=1, queue_timeout_seconds=1)
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def running_operation(_context: object) -> None:
+        started.set()
+        await release.wait()
+
+    active_id = "op-active-work"
+    active = asyncio.create_task(
+        manager.run_operation(
+            "active-work",
+            running_operation,
+            operation_id=active_id,
+        )
+    )
+    await started.wait()
+    monkeypatch.setattr(server_module, "session", manager)
+
+    status_task = asyncio.create_task(server_module.android_status())
+    await asyncio.sleep(0)
+    assert not status_task.done()
+    release.set()
+    await active
+    status = await status_task
+
+    assert status.active_operation_id == active_id
+    assert status.operation_id != active_id
+
+
+async def test_timed_out_connect_cannot_commit_after_the_request_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    device = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    registry = Mock()
+    registry.select.return_value = device
+    controller = Mock()
+
+    def blocking_connect() -> None:
+        started.set()
+        release.wait()
+
+    controller.android_client.connect.side_effect = blocking_connect
+    runtime = RuntimeConfig(
+        operation_timeout_seconds=0.03,
+        queue_timeout_seconds=0.03,
+        subprocess_timeout_seconds=0.2,
+    )
+    manager = SessionManager(
+        registry=registry,
+        controller_factory=lambda _serial: controller,
+        config=runtime,
+    )
+    monkeypatch.setattr(server_module, "session", manager)
+
+    connect = asyncio.create_task(server_module.android_connect("ABC"))
+    try:
+        assert await asyncio.to_thread(started.wait, 0.2)
+        result = await asyncio.wait_for(connect, 0.2)
+        assert result.structuredContent is not None
+        assert result.structuredContent["success"] is False
+        assert manager.device is None
+    finally:
+        release.set()
+
+    await manager.run_operation("connect-cleanup-barrier", lambda _context: None)
+
+    assert manager.device is None
+    controller.disconnect.assert_called_once()
 
 
 async def test_snapshot_returns_image_and_structured_ui(
@@ -142,6 +226,42 @@ async def test_snapshot_supports_explicit_lossless_png(monkeypatch: pytest.Monke
     assert result.structuredContent["lossless_fallback"] is None
     image_content = next(item for item in result.content if isinstance(item, ImageContent))
     assert image_content.mimeType == "image/png"
+
+
+async def test_snapshot_rejects_a_serialized_response_over_the_payload_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = BytesIO()
+    Image.new("RGB", (16, 16), "white").save(image, format="PNG")
+    device = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    registry = Mock()
+    registry.select.return_value = device
+    controller = Mock()
+    controller.snapshot = AsyncMock(
+        return_value=ScreenSnapshot(
+            serial="ABC",
+            width=16,
+            height=16,
+            screenshot_png=image.getvalue(),
+            elements=[UIElement(text="x" * 2_000), UIElement(text="y" * 2_000)],
+            foreground_app=ForegroundApp(),
+        )
+    )
+    manager = SessionManager(
+        registry=registry,
+        controller_factory=lambda _serial: controller,
+        config=RuntimeConfig(payload_max_bytes=4_096),
+    )
+    manager.connect("ABC")
+    monkeypatch.setattr(server_module, "session", manager)
+
+    result = await server_module.android_snapshot(detail_level="full", image_format="png")
+
+    assert result.isError is True
+    assert result.structuredContent is not None
+    assert result.structuredContent["error_code"] == ErrorCode.SNAPSHOT_TOO_LARGE.value
+    assert result.structuredContent["details"]["max_bytes"] == 4_096
+    assert not any(isinstance(content, ImageContent) for content in result.content)
 
 
 async def test_screenshot_default_mentions_lossless_upgrade(

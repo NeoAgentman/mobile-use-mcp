@@ -155,10 +155,12 @@ async def test_running_cancellation_invalidates_state_commit() -> None:
 
 
 @pytest.mark.asyncio
-async def test_running_callback_that_swallows_cancel_still_releases_fifo() -> None:
-    gateway = OperationGateway(operation_timeout_seconds=1, queue_timeout_seconds=1)
+async def test_running_callback_keeps_fifo_owned_until_cancel_cleanup_finishes() -> None:
+    gateway = OperationGateway(operation_timeout_seconds=1, queue_timeout_seconds=0.03)
     started = asyncio.Event()
     release = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    second_started = asyncio.Event()
     order: list[str] = []
 
     async def stubborn(_context: object) -> None:
@@ -170,6 +172,11 @@ async def test_running_callback_that_swallows_cancel_still_releases_fifo() -> No
             # cancellation instead of propagating the cancellation.
             await release.wait()
             order.append("cancelled")
+            cleanup_finished.set()
+
+    async def after_timeout(_context: object) -> None:
+        second_started.set()
+        order.append("after")
 
     task = asyncio.create_task(gateway.run("stubborn", stubborn, timeout_seconds=0.02))
     await started.wait()
@@ -177,10 +184,19 @@ async def test_running_callback_that_swallows_cancel_still_releases_fifo() -> No
         await task
     assert caught.value.code == ErrorCode.TIMEOUT
 
-    await gateway.run("after-timeout", lambda _context: order.append("after"))
-    assert order == ["after"]
-    release.set()
-    await asyncio.sleep(0)
+    try:
+        with pytest.raises(MobileUseError) as queued:
+            await gateway.run("after-timeout", after_timeout, timeout_seconds=0.05)
+        assert queued.value.code == ErrorCode.TIMEOUT
+        assert queued.value.data["stage"] == "queue"
+        assert not second_started.is_set()
+        assert order == []
+    finally:
+        release.set()
+
+    await asyncio.wait_for(cleanup_finished.wait(), 0.2)
+    await gateway.run("after-cleanup", after_timeout)
+    assert order == ["cancelled", "after"]
 
 
 @pytest.mark.asyncio

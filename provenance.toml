@@ -41,5 +41,5 @@ modification_statement = "Significantly rewritten to normalize and bound Android
 path = "src/mobile_use_mcp/recording.py"
 upstream_path = "minitap/mobile_use/utils/video.py; minitap/mobile_use/tools/mobile/video_recording.py"
 kind = "adapted"
-sha256 = "79545b5dd8fc80b8f0119c66f9189ebbebc23e5c205c9274a5d6dc8e69276500"
+sha256 = "779f89d99a0b96a5e369d87299429b5a87820b243235f7a277af25d4a8f69aa7"
 modification_statement = "Significantly rewritten for owned bounded screen-recording processes, segment cleanup, and local artifact limits."

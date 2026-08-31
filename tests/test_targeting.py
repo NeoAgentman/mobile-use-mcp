@@ -5,12 +5,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from PIL import Image
+from pydantic import ValidationError
 
 from mobile_use_mcp.android_client import AndroidClient
 from mobile_use_mcp.controller import AndroidController
 from mobile_use_mcp.errors import ErrorCode, MobileUseError
 from mobile_use_mcp.models import (
     Bounds,
+    BoundsProvenance,
     DeviceInfo,
     DeviceState,
     ForegroundApp,
@@ -63,6 +65,17 @@ def test_selector_conflict_reports_all_attempts() -> None:
     ]
 
 
+def test_bounds_provenance_requires_complete_server_issued_identity() -> None:
+    with pytest.raises(ValidationError):
+        BoundsProvenance.model_validate(
+            {
+                "session_id": "session-current",
+                "generation": 1,
+                "screen_revision": 0,
+            }
+        )
+
+
 def test_session_stamps_opaque_refs_and_rejects_old_revision() -> None:
     manager = SessionManager()
     manager._session_id = "session-test"  # pyright: ignore[reportPrivateUsage]
@@ -103,6 +116,32 @@ def test_session_stamps_opaque_refs_and_rejects_old_revision() -> None:
             )
         )
     assert caught.value.code == ErrorCode.ELEMENT_REF_STALE
+
+
+@pytest.mark.asyncio
+async def test_bounds_must_identify_an_element_in_the_issued_snapshot() -> None:
+    device = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    registry = Mock()
+    registry.select.return_value = device
+    controller = Mock()
+    manager = SessionManager(registry=registry, controller_factory=lambda _serial: controller)
+    manager.connect("ABC")
+    observed = _snapshot([UIElement(text="Continue", bounds=Bounds(x=1, y=2, width=10, height=10))])
+    manager.store_snapshot(observed)
+    provenance = observed.elements[0].bounds_provenance
+    assert provenance is not None
+    controller.snapshot = AsyncMock(return_value=_snapshot(observed.elements))
+
+    with pytest.raises(MobileUseError) as caught:
+        await manager.resolve_target(
+            Target(
+                bounds=Bounds(x=50, y=60, width=10, height=10),
+                bounds_provenance=provenance,
+            ),
+            controller=controller,
+        )
+
+    assert caught.value.code == ErrorCode.INVALID_TARGET
 
 
 @dataclass

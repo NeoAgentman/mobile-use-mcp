@@ -1021,14 +1021,19 @@ class DeviceSession:
                 # selectors. Each reference carries provenance in a separate
                 # typed field so copied coordinates cannot silently outlive
                 # their session generation or screen revision.
+                session_bound = current.session_id is not None and current.generation is not None
                 for element in stamped.elements:
-                    element.element_ref = f"el-{uuid4().hex}"
-                    element.bounds_provenance = BoundsProvenance(
-                        snapshot_id=assigned_snapshot_id,
-                        session_id=current.session_id,
-                        generation=current.generation,
-                        screen_revision=current.screen_revision,
-                    )
+                    if session_bound:
+                        element.element_ref = f"el-{uuid4().hex}"
+                        element.bounds_provenance = BoundsProvenance(
+                            snapshot_id=assigned_snapshot_id,
+                            session_id=cast(str, current.session_id),
+                            generation=cast(int, current.generation),
+                            screen_revision=current.screen_revision,
+                        )
+                    else:
+                        element.element_ref = None
+                        element.bounds_provenance = None
                 # The store owns the opaque identifier.  A caller-provided ID
                 # must never allow an observation to overwrite another entry.
                 # The generated ID is supplied explicitly so its value is
@@ -1081,7 +1086,7 @@ class DeviceSession:
                         )
                 for source, _stored_element in zip(snapshot.elements, stored.elements, strict=True):
                     if source.bounds_provenance is not None:
-                        source.bounds_provenance.snapshot_id = stored.snapshot_id
+                        source.bounds_provenance.snapshot_id = assigned_snapshot_id
                 self._legacy_snapshot_input = snapshot
                 self._snapshot_id = stored.snapshot_id
                 self._snapshot = stored
@@ -1425,15 +1430,6 @@ class DeviceSession:
                     suggestion="Call android_snapshot and use an element_ref from that result.",
                     data={"element_ref": target.element_ref},
                 )
-            if provenance.session_id is None or provenance.generation is None:
-                self._raise_stale_target(
-                    code=ErrorCode.ELEMENT_REF_STALE,
-                    message="The Android element reference is not bound to a live session.",
-                    suggestion=(
-                        "Call android_snapshot after android_connect and use its element_ref."
-                    ),
-                    data={"element_ref": target.element_ref},
-                )
             expected = SnapshotContext(
                 session_id=provenance.session_id,
                 generation=provenance.generation,
@@ -1484,11 +1480,7 @@ class DeviceSession:
                     actual=current_context,
                 )
             provenance_snapshot_id = target.bounds_provenance.snapshot_id
-            if (
-                provenance_snapshot_id is not None
-                and target.snapshot_id is not None
-                and provenance_snapshot_id != target.snapshot_id
-            ):
+            if target.snapshot_id is not None and provenance_snapshot_id != target.snapshot_id:
                 raise MobileUseError(
                     ErrorCode.SELECTOR_CONFLICT,
                     "The snapshot_id and bounds provenance identify different observations.",
@@ -1512,11 +1504,7 @@ class DeviceSession:
                         "matched_selector": None,
                     },
                 )
-            if (
-                provenance_snapshot_id is not None
-                and ref_snapshot_id is not None
-                and provenance_snapshot_id != ref_snapshot_id
-            ):
+            if ref_snapshot_id is not None and provenance_snapshot_id != ref_snapshot_id:
                 raise MobileUseError(
                     ErrorCode.SELECTOR_CONFLICT,
                     "The element_ref and bounds provenance identify different observations.",
@@ -1541,16 +1529,13 @@ class DeviceSession:
                         "matched_selector": None,
                     },
                 )
-            if provenance_snapshot_id is not None or target.snapshot_id is not None:
-                source_id = provenance_snapshot_id or target.snapshot_id
-                assert source_id is not None
-                try:
-                    source_snapshot = self.get_snapshot(source_id)
-                except MobileUseError as error:
-                    raise self._annotate_target_error(
-                        error,
-                        selector="bounds_provenance",
-                    ) from error
+            try:
+                source_snapshot = self.get_snapshot(provenance_snapshot_id)
+            except MobileUseError as error:
+                raise self._annotate_target_error(
+                    error,
+                    selector="bounds_provenance",
+                ) from error
         elif target.snapshot_id is not None:
             try:
                 source_snapshot = self.get_snapshot(target.snapshot_id)
@@ -1652,94 +1637,110 @@ class DeviceSession:
                 ),
                 None,
             )
-            if source_bounds_element is not None:
-                if not source_bounds_element.enabled:
-                    raise MobileUseError(
-                        ErrorCode.ELEMENT_DISABLED,
-                        "The Android element supplying these bounds is disabled.",
-                        "Choose an enabled element from a fresh android_snapshot.",
-                        data={
-                            "snapshot_id": source_snapshot.snapshot_id,
-                            "attempts": [
-                                {
-                                    "selector": "bounds",
-                                    "matched": False,
-                                    "error": (
-                                        "The Android element supplying these bounds is disabled."
-                                    ),
-                                    "match_count": 1,
-                                }
-                            ],
-                            "matched_selector": None,
-                        },
-                    )
-                current_bounds_element = self._find_current_element(
-                    source_snapshot,
-                    source_bounds_element,
-                    current_snapshot,
+            if source_bounds_element is None:
+                raise MobileUseError(
+                    ErrorCode.INVALID_TARGET,
+                    "The supplied Android bounds were not issued by the referenced snapshot.",
+                    "Call android_snapshot and use bounds returned by that observation.",
+                    data={
+                        "snapshot_id": source_snapshot.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "bounds",
+                                "matched": False,
+                                "error": (
+                                    "The supplied Android bounds were not issued by the "
+                                    "referenced snapshot."
+                                ),
+                                "match_count": 0,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
                 )
-                if current_bounds_element is None:
-                    raise MobileUseError(
-                        ErrorCode.ELEMENT_REMOVED,
-                        "The Android element supplying these bounds is no longer present.",
-                        "Call android_snapshot and use bounds from the current screen.",
-                        data={
-                            "snapshot_id": source_snapshot.snapshot_id,
-                            "attempts": [
-                                {
-                                    "selector": "bounds",
-                                    "matched": False,
-                                    "error": (
-                                        "The Android element supplying these bounds is no longer "
-                                        "present."
-                                    ),
-                                    "match_count": 1,
-                                }
-                            ],
-                            "matched_selector": None,
-                        },
-                    )
-                if current_bounds_element.bounds != source_bounds_element.bounds:
-                    raise MobileUseError(
-                        ErrorCode.ELEMENT_REF_STALE,
-                        "The Android element supplying these bounds moved since it was observed.",
-                        "Call android_snapshot and use bounds from the current screen.",
-                        data={
-                            "snapshot_id": source_snapshot.snapshot_id,
-                            "attempts": [
-                                {
-                                    "selector": "bounds",
-                                    "matched": False,
-                                    "error": (
-                                        "The Android element supplying these bounds moved since it "
-                                        "was observed."
-                                    ),
-                                    "match_count": 1,
-                                }
-                            ],
-                            "matched_selector": None,
-                        },
-                    )
-                if not current_bounds_element.enabled:
-                    raise MobileUseError(
-                        ErrorCode.ELEMENT_DISABLED,
-                        "The Android element supplying these bounds is disabled.",
-                        "Choose an enabled element from a fresh android_snapshot.",
-                        data={
-                            "snapshot_id": source_snapshot.snapshot_id,
-                            "attempts": [
-                                {
-                                    "selector": "bounds",
-                                    "matched": False,
-                                    "error": (
-                                        "The Android element supplying these bounds is disabled."
-                                    ),
-                                    "match_count": 1,
-                                }
-                            ],
-                            "matched_selector": None,
-                        },
-                    )
+            if not source_bounds_element.enabled:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_DISABLED,
+                    "The Android element supplying these bounds is disabled.",
+                    "Choose an enabled element from a fresh android_snapshot.",
+                    data={
+                        "snapshot_id": source_snapshot.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "bounds",
+                                "matched": False,
+                                "error": "The Android element supplying these bounds is disabled.",
+                                "match_count": 1,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            current_bounds_element = self._find_current_element(
+                source_snapshot,
+                source_bounds_element,
+                current_snapshot,
+            )
+            if current_bounds_element is None:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_REMOVED,
+                    "The Android element supplying these bounds is no longer present.",
+                    "Call android_snapshot and use bounds from the current screen.",
+                    data={
+                        "snapshot_id": source_snapshot.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "bounds",
+                                "matched": False,
+                                "error": (
+                                    "The Android element supplying these bounds is no longer "
+                                    "present."
+                                ),
+                                "match_count": 1,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            if current_bounds_element.bounds != source_bounds_element.bounds:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_REF_STALE,
+                    "The Android element supplying these bounds moved since it was observed.",
+                    "Call android_snapshot and use bounds from the current screen.",
+                    data={
+                        "snapshot_id": source_snapshot.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "bounds",
+                                "matched": False,
+                                "error": (
+                                    "The Android element supplying these bounds moved since it "
+                                    "was observed."
+                                ),
+                                "match_count": 1,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
+            if not current_bounds_element.enabled:
+                raise MobileUseError(
+                    ErrorCode.ELEMENT_DISABLED,
+                    "The Android element supplying these bounds is disabled.",
+                    "Choose an enabled element from a fresh android_snapshot.",
+                    data={
+                        "snapshot_id": source_snapshot.snapshot_id,
+                        "attempts": [
+                            {
+                                "selector": "bounds",
+                                "matched": False,
+                                "error": "The Android element supplying these bounds is disabled.",
+                                "match_count": 1,
+                            }
+                        ],
+                        "matched_selector": None,
+                    },
+                )
 
         if source_element is not None:
             current_element = self._find_current_element(

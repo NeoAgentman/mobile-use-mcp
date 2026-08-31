@@ -1,6 +1,7 @@
 import asyncio
 import signal
 import sys
+import threading
 import time
 
 import pytest
@@ -88,19 +89,35 @@ async def test_owned_process_wait_drains_captured_streams() -> None:
 
 
 @pytest.mark.asyncio
-async def test_blocking_adapter_timeout_detaches_daemon_worker_and_calls_close_hook() -> None:
-    closed = asyncio.Event()
+async def test_blocking_adapter_timeout_retains_ownership_until_worker_exits() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    abort_called = asyncio.Event()
 
     def hanging_call() -> None:
-        time.sleep(60)
+        started.set()
+        release.wait()
+        finished.set()
 
-    with pytest.raises(ProcessTimeoutError):
-        await run_blocking(
+    task = asyncio.create_task(
+        run_blocking(
             hanging_call,
             timeout_seconds=0.01,
-            on_abort=closed.set,
+            on_abort=abort_called.set,
         )
-    assert closed.is_set()
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 0.2)
+        await asyncio.wait_for(abort_called.wait(), 0.2)
+        assert not task.done()
+        assert not finished.is_set()
+    finally:
+        release.set()
+
+    with pytest.raises(ProcessTimeoutError):
+        await asyncio.wait_for(task, 0.2)
+    assert finished.is_set()
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGTERM"), reason="requires POSIX signals")

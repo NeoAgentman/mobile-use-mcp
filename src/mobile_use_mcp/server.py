@@ -564,6 +564,39 @@ def _image_delivery_metadata(
     }
 
 
+def _bounded_image_result(
+    *,
+    tool_name: str,
+    metadata: dict[str, Any],
+    image_data: bytes,
+    image_format: Literal["png", "jpeg"],
+    max_bytes: int,
+) -> CallToolResult:
+    """Build an image response only when its serialized MCP payload fits."""
+
+    result = CallToolResult(
+        content=[
+            TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
+            Image(data=image_data, format=image_format).to_image_content(),
+        ],
+        structuredContent=metadata,
+    )
+    actual_bytes = len(result.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8"))
+    if actual_bytes > max_bytes:
+        raise MobileUseError(
+            ErrorCode.SNAPSHOT_TOO_LARGE,
+            f"The {tool_name} response exceeds the configured payload byte budget.",
+            "Request a smaller compact observation, lower JPEG quality, or increase the "
+            "payload byte budget.",
+            data={
+                "actual_bytes": actual_bytes,
+                "max_bytes": max_bytes,
+                "tool": tool_name,
+            },
+        )
+    return result
+
+
 async def _capture_screenshot_only(controller: Any) -> ScreenshotCapture:
     """Use the hierarchy-free controller seam with legacy fake fallback.
 
@@ -878,6 +911,7 @@ async def android_connect(
                     session.connect,
                     serial,
                     timeout_seconds=session.config.subprocess_timeout_seconds,
+                    operation=context,
                     **connect_options,
                 ),
                 operation_id=operation_id,
@@ -962,10 +996,13 @@ async def android_status() -> DeviceStatusResult:
     """Return the lifecycle and safe device status of this MCP session."""
 
     operation_id = session.new_operation_id()
+    observed_active_operation_id = session.active_operation_id
     try:
         return await session.run_operation(
             "status",
-            lambda context: session.status(context.operation_id),
+            lambda context: session.status(context.operation_id).model_copy(
+                update={"active_operation_id": observed_active_operation_id}
+            ),
             operation_id=operation_id,
             retry_safe=True,
             mutating=False,
@@ -1220,16 +1257,20 @@ async def android_snapshot(
         ),
         elements=returned_elements,
     ).model_dump(mode="json")
-    return cast(
-        SnapshotResult,
-        CallToolResult(
-            content=[
-                TextContent(type="text", text=json.dumps(metadata, ensure_ascii=False)),
-                Image(data=image_data, format=image_format).to_image_content(),
-            ],
-            structuredContent=metadata,
-        ),
-    )
+    try:
+        result = _bounded_image_result(
+            tool_name="android_snapshot",
+            metadata=metadata,
+            image_data=image_data,
+            image_format=image_format,
+            max_bytes=session.config.payload_max_bytes,
+        )
+    except MobileUseError as error:
+        return cast(
+            SnapshotResult,
+            _typed_failure(SnapshotResult, operation_id=operation_id, error=error),
+        )
+    return cast(SnapshotResult, result)
 
 
 @mcp.tool(
@@ -1315,16 +1356,20 @@ async def android_screenshot(
         foreground_app_collected=False,
         **_image_delivery_metadata("android_screenshot", image_format, image_quality),
     ).model_dump(mode="json")
-    return cast(
-        ScreenshotResult,
-        CallToolResult(
-            content=[
-                TextContent(type="text", text=json.dumps(metadata)),
-                Image(data=image_data, format=image_format).to_image_content(),
-            ],
-            structuredContent=metadata,
-        ),
-    )
+    try:
+        result = _bounded_image_result(
+            tool_name="android_screenshot",
+            metadata=metadata,
+            image_data=image_data,
+            image_format=image_format,
+            max_bytes=session.config.payload_max_bytes,
+        )
+    except MobileUseError as error:
+        return cast(
+            ScreenshotResult,
+            _typed_failure(ScreenshotResult, operation_id=operation_id, error=error),
+        )
+    return cast(ScreenshotResult, result)
 
 
 @mcp.tool(

@@ -358,10 +358,10 @@ class BoundsProvenance(StrictModel):
     The values are metadata, not an encoding of an Android selector.
     """
 
-    snapshot_id: str | None = Field(default=None, max_length=128)
-    session_id: str | None = Field(default=None, max_length=128)
-    generation: int | None = Field(default=None, ge=1)
-    screen_revision: int = Field(default=0, ge=0)
+    snapshot_id: str = Field(max_length=128)
+    session_id: str = Field(max_length=128)
+    generation: int = Field(ge=1)
+    screen_revision: int = Field(ge=0)
 
     @property
     def revision(self) -> int:

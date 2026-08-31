@@ -62,14 +62,14 @@ async def run_blocking[T](
     on_abort: Callable[[], None | Awaitable[None]] | None = None,
     **kwargs: Any,
 ) -> T:
-    """Run a blocking device-library call with a finite owner boundary.
+    """Run a finite blocking device-library call without abandoning its worker.
 
     Cancelling an ``asyncio.to_thread`` await does not stop its non-daemon
-    worker.  This helper uses a daemon worker, invokes the caller's
-    adapter-close hook, and observes the eventual exception/result so it
-    cannot become an unhandled task.  Production adapters pass their socket
-    close hook, making the library-level timeout interruptible as well as
-    bounded; a broken third-party call cannot hold interpreter shutdown open.
+    worker.  This helper invokes the caller's adapter-close hook and retains
+    ownership until the library-level timeout or close operation makes the
+    worker exit.  Production callers must therefore configure a finite timeout
+    in the underlying adbutils/uiautomator2 adapter; the daemon flag is only a
+    final interpreter-shutdown safeguard, never a detachment policy.
     """
 
     if timeout_seconds <= 0:
@@ -102,15 +102,29 @@ async def run_blocking[T](
         except Exception:
             pass
 
+    async def wait_for_worker_exit() -> None:
+        # Once timeout/cancellation is visible to the caller, do not let a
+        # second cancellation detach the same worker during adapter cleanup.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
+        if worker.done():
+            with suppress(BaseException):
+                worker.result()
+
     try:
         return await asyncio.wait_for(asyncio.shield(worker), timeout_seconds)
     except TimeoutError as error:
         await abort_adapter()
-        worker.add_done_callback(_consume_future_exception)
+        await wait_for_worker_exit()
         raise ProcessTimeoutError("Blocking device-library call exceeded its deadline.") from error
     except asyncio.CancelledError:
         await abort_adapter()
-        worker.add_done_callback(_consume_future_exception)
+        await wait_for_worker_exit()
         raise
 
 
@@ -205,15 +219,9 @@ def _set_future_result(future: asyncio.Future[Any], value: Any) -> None:
 def _set_future_error(future: asyncio.Future[Any], error: BaseException) -> None:
     if not future.done():
         future.set_exception(error)
-        # The owner may have timed out and detached already.  Observe the
-        # exception now so Python does not report an unhandled Future later.
+        # Observe the exception immediately; the owner may already be in its
+        # timeout cleanup path and will inspect only worker completion.
         future.exception()
-
-
-def _consume_future_exception(future: asyncio.Future[Any]) -> None:
-    if not future.cancelled():
-        with suppress(BaseException):
-            future.exception()
 
 
 async def _gather_process_tasks(

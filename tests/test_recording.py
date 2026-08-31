@@ -317,6 +317,28 @@ async def test_retention_pressure_evicts_oldest_claimed_artifact(tmp_path: Path)
     ]
 
 
+async def test_single_completed_artifact_cannot_exceed_retention_byte_budget(
+    tmp_path: Path,
+) -> None:
+    process = FakeProcess()
+
+    async def factory(*_args: object) -> FakeProcess:
+        return process
+
+    config = RuntimeConfig(artifact_root=tmp_path, artifact_max_bytes=4)
+    manager = RecordingManager("ABC", FakeADB(), process_factory=factory, config=config)
+    await manager.start(60)
+
+    with pytest.raises(MobileUseError) as caught:
+        await manager.stop()
+
+    assert caught.value.code == ErrorCode.RECORDING_FAILED
+    assert caught.value.data == {"actual_bytes": 8, "max_bytes": 4}
+    assert manager.state == RecordingState.FAILED
+    assert manager.artifacts == []
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
+
+
 async def test_expired_artifact_is_removed_and_not_retrievable(tmp_path: Path) -> None:
     now = [datetime(2026, 1, 1, tzinfo=UTC)]
     config = RuntimeConfig(artifact_root=tmp_path, artifact_retention_seconds=10)

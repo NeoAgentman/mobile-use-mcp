@@ -157,8 +157,15 @@ async def test_operation_cancellation_and_timeout_are_redacted_and_structured(ki
                 await task
             assert caught.value.code == ErrorCode.TIMEOUT
 
-        # Let the gateway's worker finish its cancellation/timeout hook.
-        await asyncio.sleep(0)
+        # A cancelled callback retains FIFO ownership through its cleanup.
+        # Queueing a barrier proves the finish hook ran before we inspect it.
+        await session.run_operation(
+            "observability-barrier",
+            lambda _context: None,
+            operation_id=f"op-observe-{kind}-barrier",
+            retry_safe=True,
+            mutating=False,
+        )
 
     events = _events(stderr.getvalue())
     event = next(item for item in events if item["operation_id"] == f"op-observe-{kind}")

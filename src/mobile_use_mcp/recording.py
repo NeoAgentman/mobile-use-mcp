@@ -813,6 +813,19 @@ class RecordingManager:
         expires_at = completed_at + timedelta(seconds=self.config.artifact_retention_seconds)
         try:
             output_size = resolved_output.stat().st_size
+            if output_size > self.config.artifact_max_bytes:
+                failure = self._recording_error(
+                    ErrorCode.RECORDING_FAILED,
+                    "The completed Android recording exceeds the artifact byte budget.",
+                    "Retry with a shorter duration or lower bit rate.",
+                    data={
+                        "actual_bytes": output_size,
+                        "max_bytes": self.config.artifact_max_bytes,
+                    },
+                )
+                self._set_failed(failure)
+                await self._cleanup_incomplete("recording_artifact_too_large")
+                raise failure
             artifact = RecordingArtifact(
                 artifact_id=self._artifact_id,
                 serial=self.serial,
@@ -936,6 +949,8 @@ class RecordingManager:
                     self._errors.append("Recording process required forced termination.")
             if self._device_path is not None:
                 await self._pull_current_segment()
+            if self._failure is not None:
+                raise self._failure
             if self._artifact is None:
                 await self._finish_after_segment()
             artifact = self._artifact
@@ -1126,23 +1141,16 @@ class RecordingManager:
                 self.config.artifact_max_bytes
             ):
                 break
+            oversized = [
+                item for item in artifacts if item.size_bytes > self.config.artifact_max_bytes
+            ]
+            if oversized:
+                victim = min(oversized, key=lambda item: (item.completed_at, item.artifact_id))
+                evicted.append(victim.artifact_id)
+                self._remove_artifact(victim.artifact_id)
+                continue
             candidates = [item for item in artifacts if item.artifact_id not in protected_ids]
             if not candidates:
-                # A single oversized current artifact remains retrievable; it
-                # is never deleted merely because a new start was requested.
-                if self._artifact is not None and (
-                    "Artifact exceeds configured retention byte budget." not in self._errors
-                ):
-                    warning = "Artifact exceeds configured retention byte budget."
-                    self._errors.append(warning)
-                    updated = self._artifact.model_copy(
-                        update={"warnings": [*self._artifact.warnings, warning][:20]},
-                        deep=True,
-                    )
-                    self._artifact = updated
-                    self._artifacts[updated.artifact_id] = updated
-                    with suppress(OSError):
-                        self._persist_artifact(updated)
                 break
             victim = min(candidates, key=lambda item: (item.completed_at, item.artifact_id))
             evicted.append(victim.artifact_id)

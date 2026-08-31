@@ -306,6 +306,25 @@ class OperationGateway:
             with suppress(BaseException):
                 task.exception()
 
+    @staticmethod
+    async def _wait_for_callback_exit(task: asyncio.Task[Any]) -> None:
+        """Keep FIFO ownership until a cancelled callback has actually exited.
+
+        A callback may catch ``CancelledError`` to finish adapter cleanup.  The
+        gateway must not start the next operation during that cleanup.  Shield
+        the callback so cancellation of the worker itself still propagates
+        instead of being mistaken for normal callback termination.
+        """
+
+        worker = asyncio.current_task()
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if worker is not None and worker.cancelling():
+                raise
+        except BaseException:
+            pass
+
     def _notify_start(self, item: _QueuedOperation[Any]) -> None:
         """Invoke the diagnostic hook without making it part of the operation."""
 
@@ -367,6 +386,7 @@ class OperationGateway:
                             item.context.mark_outcome("timeout", ErrorCode.TIMEOUT.value)
                             item.task.cancel()
                             self._set_future_error(item, item.context.state_error(cancelled=False))
+                            await self._wait_for_callback_exit(item.task)
                         elif abort_wait in done:
                             item.task.cancel()
                             if item.context.cancelled:
@@ -377,6 +397,7 @@ class OperationGateway:
                                 item,
                                 item.context.state_error(cancelled=item.context.cancelled),
                             )
+                            await self._wait_for_callback_exit(item.task)
                         else:
                             try:
                                 value = item.task.result()
@@ -436,10 +457,8 @@ class OperationGateway:
         elif item.task is not None and not item.task.done():
             item.abort_signal.set()
             item.task.cancel()
-            self._notify_finish(item)
         elif item.running:
             item.abort_signal.set()
-            self._notify_finish(item)
         self._set_future_error(item, item.context.state_error(cancelled=True))
 
     async def _timeout_item(self, item: _QueuedOperation[Any], stage: str) -> MobileUseError:
@@ -449,7 +468,6 @@ class OperationGateway:
             item.abort_signal.set()
             if item.task is not None and not item.task.done():
                 item.task.cancel()
-            self._notify_finish(item)
         else:
             item.cancelled = True
             item.context.timeout(stage)
