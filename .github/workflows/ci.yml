@@ -368,7 +368,7 @@ jobs:
           target: google_apis
           arch: x86_64
           profile: pixel_2
-          channel: "0"
+          channel: stable
           emulator-build: ${{ env.ANDROID_EMULATOR_BUILD }}
           emulator-port: "5554"
           emulator-boot-timeout: "300"

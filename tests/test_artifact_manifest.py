@@ -91,3 +91,12 @@ def test_android_job_env_does_not_use_step_only_runner_context() -> None:
     job_header = android_job.split("\n    steps:\n", 1)[0]
 
     assert "${{ runner." not in job_header
+
+
+def test_android_emulator_uses_a_supported_sdk_channel() -> None:
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    android_job = workflow.split("\n  android-emulator-acceptance:\n", 1)[1]
+
+    assert "\n          channel: stable\n" in android_job
