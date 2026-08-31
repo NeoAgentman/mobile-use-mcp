@@ -81,3 +81,13 @@ def test_fixture_manifest_uses_the_pinned_ci_python() -> None:
         "--write" in workflow.replace("\\\n", "")
     )
     assert "\n          python scripts/artifact_manifest.py --write" not in workflow
+
+
+def test_android_job_env_does_not_use_step_only_runner_context() -> None:
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    android_job = workflow.split("\n  android-emulator-acceptance:\n", 1)[1]
+    job_header = android_job.split("\n    steps:\n", 1)[0]
+
+    assert "${{ runner." not in job_header

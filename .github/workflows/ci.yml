@@ -308,8 +308,6 @@ jobs:
     env:
       ANDROID_SERIAL: emulator-5554
       FIXTURE_PACKAGE: com.neoagentman.mobileusefixture
-      ARTIFACT_ROOT: ${{ runner.temp }}/mobile-use-artifacts
-      DIAGNOSTICS_DIR: ${{ runner.temp }}/android-diagnostics
     steps:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -361,6 +359,9 @@ jobs:
 
       - name: Start the pinned emulator and run public acceptance
         uses: reactivecircus/android-emulator-runner@324029e2f414c084d8b15ba075288885e74aef9c # v2.34.0
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/mobile-use-artifacts
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/android-diagnostics
         with:
           api-level: ${{ env.ANDROID_API_LEVEL }}
           system-image-api-level: ${{ env.ANDROID_API_LEVEL }}
@@ -383,6 +384,8 @@ jobs:
 
       - name: Create a redacted diagnostic marker when setup failed early
         if: ${{ always() }}
+        env:
+          DIAGNOSTICS_DIR: ${{ runner.temp }}/android-diagnostics
         run: |
           mkdir -p "$DIAGNOSTICS_DIR"
           if [ ! -f "$DIAGNOSTICS_DIR/acceptance.log" ]; then
