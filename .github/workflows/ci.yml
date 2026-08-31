@@ -384,11 +384,12 @@ jobs:
           disable-animations: true
           emulator-options: "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim"
           script: |
-            set -euo pipefail
+            bash -euo pipefail <<'BASH'
             timeout 90s adb -s "$ANDROID_SERIAL" wait-for-device
             adb -s "$ANDROID_SERIAL" install -r fixture-artifact/app-debug.apk
             timeout 90s .venv/bin/python scripts/android_emulator_preflight.py --serial "$ANDROID_SERIAL" --package "$FIXTURE_PACKAGE"
             .venv/bin/python scripts/android_ci_acceptance.py --serial "$ANDROID_SERIAL" --package "$FIXTURE_PACKAGE" --server-command "$RUNNER_TEMP/mobile-use-server/bin/mobile-use-mcp" --artifact-root "$ARTIFACT_ROOT" --diagnostics "$DIAGNOSTICS_DIR/acceptance.log" --stage-timeout-seconds 35 --total-timeout-seconds 180
+            BASH
 
       - name: Create a redacted diagnostic marker when setup failed early
         if: ${{ always() }}
