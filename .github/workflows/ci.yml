@@ -361,7 +361,7 @@ jobs:
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
+          sudo chmod 0666 /dev/kvm
           test -r /dev/kvm
           test -w /dev/kvm
 
@@ -382,6 +382,7 @@ jobs:
           emulator-boot-timeout: "300"
           force-avd-creation: true
           disable-animations: true
+          disable-linux-hw-accel: false
           emulator-options: "-no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim"
           script: |
             bash -euo pipefail <<'BASH'

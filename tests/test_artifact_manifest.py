@@ -113,6 +113,8 @@ def test_android_job_enables_kvm_before_starting_the_emulator() -> None:
     assert kvm_step in android_job
     assert android_job.index(kvm_step) < android_job.index(emulator_step)
     assert 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' in android_job
+    assert "sudo chmod 0666 /dev/kvm" in android_job
+    assert "\n          disable-linux-hw-accel: false\n" in android_job
 
 
 def test_android_emulator_script_enters_bash_before_using_pipefail() -> None:
