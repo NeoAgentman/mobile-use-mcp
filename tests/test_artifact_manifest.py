@@ -100,3 +100,16 @@ def test_android_emulator_uses_a_supported_sdk_channel() -> None:
     android_job = workflow.split("\n  android-emulator-acceptance:\n", 1)[1]
 
     assert "\n          channel: stable\n" in android_job
+
+
+def test_android_job_enables_kvm_before_starting_the_emulator() -> None:
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+    android_job = workflow.split("\n  android-emulator-acceptance:\n", 1)[1]
+    kvm_step = "      - name: Enable KVM access on the hosted runner\n"
+    emulator_step = "      - name: Start the pinned emulator and run public acceptance\n"
+
+    assert kvm_step in android_job
+    assert android_job.index(kvm_step) < android_job.index(emulator_step)
+    assert 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' in android_job
