@@ -339,6 +339,46 @@ async def test_single_completed_artifact_cannot_exceed_retention_byte_budget(
     assert not any(path.is_file() for path in tmp_path.rglob("*"))
 
 
+async def test_retention_byte_budget_counts_every_retained_recording_segment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = FakeProcess()
+    first.returncode = 0
+    first.finished.set()
+    second = FakeProcess()
+    processes = iter([first, second])
+    clock = iter([0.0, 0.0, 10.0, 10.0, 20.0, 20.0])
+
+    def missing_executable(_name: str) -> None:
+        return None
+
+    monkeypatch.setattr("mobile_use_mcp.recording.shutil.which", missing_executable)
+
+    async def factory(*_args: object) -> FakeProcess:
+        return next(processes)
+
+    config = RuntimeConfig(artifact_root=tmp_path, artifact_max_bytes=12)
+    manager = RecordingManager(
+        "ABC",
+        FakeADB(),
+        process_factory=factory,
+        config=config,
+        clock=lambda: next(clock),
+    )
+    await manager.start(300)
+    await asyncio.sleep(0.6)
+
+    with pytest.raises(MobileUseError) as caught:
+        await manager.stop()
+
+    assert caught.value.code == ErrorCode.RECORDING_FAILED
+    assert caught.value.data == {"actual_bytes": 16, "max_bytes": 12}
+    assert manager.state == RecordingState.FAILED
+    assert manager.artifacts == []
+    assert not any(path.is_file() for path in tmp_path.rglob("*"))
+
+
 async def test_expired_artifact_is_removed_and_not_retrievable(tmp_path: Path) -> None:
     now = [datetime(2026, 1, 1, tzinfo=UTC)]
     config = RuntimeConfig(artifact_root=tmp_path, artifact_retention_seconds=10)

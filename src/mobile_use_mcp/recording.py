@@ -6,7 +6,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -395,8 +395,14 @@ class RecordingManager:
                 artifact, resolved_directory
             ):
                 continue
-            if not Path(artifact.recording_path).is_file():
+            try:
+                retained_size = self._retained_media_bytes(
+                    self._artifact_media_paths(artifact),
+                    resolved_directory,
+                )
+            except OSError:
                 continue
+            artifact = artifact.model_copy(update={"size_bytes": retained_size}, deep=True)
             self._artifacts[artifact.artifact_id] = artifact
             self._artifact_directories[artifact.artifact_id] = resolved_directory
 
@@ -418,10 +424,29 @@ class RecordingManager:
 
     def _artifact_paths_contained(self, artifact: RecordingArtifact, directory: Path) -> bool:
         root = self._root()
+        paths = self._artifact_media_paths(artifact)
+        return all(self._under(path, directory) and self._under(path, root) for path in paths)
+
+    @staticmethod
+    def _artifact_media_paths(artifact: RecordingArtifact) -> list[Path]:
         paths = [Path(artifact.path), Path(artifact.recording_path), Path(artifact.artifact_path)]
         paths.extend(Path(path) for path in artifact.segment_paths)
         paths.extend(Path(segment.path) for segment in artifact.segments)
-        return all(self._under(path, directory) and self._under(path, root) for path in paths)
+        return paths
+
+    def _retained_media_bytes(self, paths: Iterable[Path], directory: Path) -> int:
+        """Count each retained media file once inside its owned directory."""
+
+        root = self._root()
+        retained: set[Path] = set()
+        for path in paths:
+            resolved = path.resolve()
+            if not self._under(resolved, directory) or not self._under(resolved, root):
+                raise OSError("recording media path escaped its owned directory")
+            if not resolved.is_file():
+                raise OSError("recording media path is missing")
+            retained.add(resolved)
+        return sum(path.stat().st_size for path in retained)
 
     def _persist_artifact(self, artifact: RecordingArtifact) -> None:
         """Persist metadata only inside the manager-registered artifact directory."""
@@ -812,14 +837,17 @@ class RecordingManager:
         duration = max(0.0, completed_monotonic - started_monotonic)
         expires_at = completed_at + timedelta(seconds=self.config.artifact_retention_seconds)
         try:
-            output_size = resolved_output.stat().st_size
-            if output_size > self.config.artifact_max_bytes:
+            retained_size = self._retained_media_bytes(
+                [resolved_output, *self._segments],
+                self._directory,
+            )
+            if retained_size > self.config.artifact_max_bytes:
                 failure = self._recording_error(
                     ErrorCode.RECORDING_FAILED,
                     "The completed Android recording exceeds the artifact byte budget.",
                     "Retry with a shorter duration or lower bit rate.",
                     data={
-                        "actual_bytes": output_size,
+                        "actual_bytes": retained_size,
                         "max_bytes": self.config.artifact_max_bytes,
                     },
                 )
@@ -834,7 +862,7 @@ class RecordingManager:
                 started_at=started_at,
                 completed_at=completed_at,
                 duration_seconds=round(duration, 2),
-                size_bytes=output_size,
+                size_bytes=retained_size,
                 path=str(resolved_output),
                 recording_path=str(resolved_output),
                 artifact_path=str(resolved_output),

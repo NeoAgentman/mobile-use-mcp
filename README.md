@@ -427,9 +427,9 @@ target's `text` field. `class_name` and `package` are available as query filters
 `android_get_ui_elements`, not as action selectors. Bounds use original device pixels and become
 stale after the UI changes. A connected-session coordinate target must include the
 `bounds_provenance` returned with the snapshot element; its session ID, generation, screen
-revision, and (when present) snapshot ID are checked before ADB dispatch. References and
-provenance from expired, evicted, prior-generation, removed, disabled, or off-screen elements are
-rejected without issuing a tap or long-press command.
+revision, and required snapshot ID must match the same retained observation before ADB dispatch.
+References and provenance from expired, evicted, prior-generation, removed, disabled, or
+off-screen elements are rejected without issuing a tap or long-press command.
 
 `android_swipe` accepts either all four existing pixel fields (`start_x`, `start_y`, `end_x`,
 `end_y`) or one `percentage` object with four values in `[0, 1]` (the equivalent flat

@@ -144,6 +144,35 @@ async def test_bounds_must_identify_an_element_in_the_issued_snapshot() -> None:
     assert caught.value.code == ErrorCode.INVALID_TARGET
 
 
+@pytest.mark.asyncio
+async def test_bounds_provenance_must_match_the_referenced_snapshot_identity() -> None:
+    device = DeviceInfo(serial="ABC", state=DeviceState.DEVICE)
+    registry = Mock()
+    registry.select.return_value = device
+    controller = Mock()
+    manager = SessionManager(registry=registry, controller_factory=lambda _serial: controller)
+    manager.connect("ABC")
+    observed = _snapshot([UIElement(text="Continue", bounds=Bounds(x=1, y=2, width=10, height=10))])
+    manager.store_snapshot(observed)
+    provenance = observed.elements[0].bounds_provenance
+    assert provenance is not None
+    manager.advance_screen_revision()
+    forged = provenance.model_copy(
+        update={"screen_revision": manager.screen_revision},
+        deep=True,
+    )
+    controller.snapshot = AsyncMock(return_value=_snapshot(observed.elements))
+
+    with pytest.raises(MobileUseError) as caught:
+        await manager.resolve_target(
+            Target(bounds=observed.elements[0].bounds, bounds_provenance=forged),
+            controller=controller,
+        )
+
+    assert caught.value.code == ErrorCode.ELEMENT_REF_STALE
+    controller.snapshot.assert_not_awaited()
+
+
 @dataclass
 class _RunningApp:
     package: str = "com.example"

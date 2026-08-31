@@ -1536,6 +1536,29 @@ class DeviceSession:
                     error,
                     selector="bounds_provenance",
                 ) from error
+            source_context = SnapshotContext(
+                session_id=source_snapshot.session_id,
+                generation=source_snapshot.generation,
+                screen_revision=source_snapshot.screen_revision,
+            )
+            if source_context != expected:
+                self._raise_stale_target(
+                    code=ErrorCode.ELEMENT_REF_STALE,
+                    message=(
+                        "The Android bounds provenance does not match the referenced snapshot."
+                    ),
+                    suggestion="Call android_snapshot and copy bounds with their provenance.",
+                    data={
+                        "snapshot_id": provenance_snapshot_id,
+                        "snapshot_session_id": source_context.session_id,
+                        "snapshot_generation": source_context.generation,
+                        "snapshot_screen_revision": source_context.screen_revision,
+                        "provenance_session_id": expected.session_id,
+                        "provenance_generation": expected.generation,
+                        "provenance_screen_revision": expected.screen_revision,
+                    },
+                    selector="bounds_provenance",
+                )
         elif target.snapshot_id is not None:
             try:
                 source_snapshot = self.get_snapshot(target.snapshot_id)
