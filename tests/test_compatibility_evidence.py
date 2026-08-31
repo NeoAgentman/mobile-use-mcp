@@ -469,7 +469,7 @@ def test_physical_runner_uses_explicit_serial_and_writes_only_a_hash(
     code, record = physical.run_physical_evidence(
         serial=serial,
         matrix_entry="physical-huawei-api-29",
-        server_command="/tmp/installed/bin/mobile-use-mcp",
+        server_command=str((tmp_path / "installed/bin/mobile-use-mcp").resolve()),
         wheel=wheel,
         wheel_digest_file=digest_file,
         wheel_manifest=wheel_manifest,

@@ -96,6 +96,9 @@ def test_timeout_gives_public_cleanup_a_chance_then_forces_and_reaps(
         def send_signal(self, signum: object) -> None:
             direct_signals.append(signum)
 
+        def terminate(self) -> None:
+            direct_signals.append("terminate")
+
     process = TimeoutThenExit()
 
     def fake_signal(_process: object, signum: object, *, force: bool = False) -> None:

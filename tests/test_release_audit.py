@@ -33,6 +33,12 @@ def test_source_provenance_inventory_is_current() -> None:
     validate_source_provenance(PROJECT_ROOT / "provenance.toml", PROJECT_ROOT)
 
 
+def test_provenance_python_bytes_are_stable_across_checkouts() -> None:
+    attributes = (PROJECT_ROOT / ".gitattributes").read_text(encoding="utf-8")
+
+    assert "*.py text eol=lf" in attributes.splitlines()
+
+
 def test_source_provenance_detects_source_drift(tmp_path: Path) -> None:
     source = PROJECT_ROOT / "src/mobile_use_mcp/android_client.py"
     inventory = PROJECT_ROOT / "provenance.toml"

@@ -318,7 +318,7 @@ async def test_explicit_disconnect_unblocks_queued_wait(
     controller.disconnect = Mock()
     wait_session = _wait_session(monkeypatch, controller)
     wait_task = asyncio.create_task(
-        android_wait_for_text("never", timeout_seconds=5, poll_interval_seconds=1)
+        android_wait_for_text("never", timeout_seconds=5, poll_interval_seconds=0.05)
     )
     await started.wait()
     close_task = asyncio.create_task(wait_session.close())
