@@ -14,8 +14,12 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import contextvars
+import dataclasses
+import shutil
 import struct
 import sys
+import time
 from collections.abc import Mapping, Sequence
 from datetime import timedelta
 from pathlib import Path
@@ -38,6 +42,12 @@ FIXTURE_IDS = {
     "scroll_container": f"{FIXTURE_RESOURCE_PREFIX}/fixture_scroll_container",
     "scroll_state": f"{FIXTURE_RESOURCE_PREFIX}/fixture_scroll_state",
 }
+USB_DISCONNECT_ERROR_CODES = {
+    "ADB_UNAVAILABLE",
+    "DEVICE_DISCONNECTED",
+    "DEVICE_OFFLINE",
+    "DEVICE_NOT_FOUND",
+}
 
 REQUIRED_PUBLIC_TOOLS = {
     "android_connect",
@@ -54,6 +64,7 @@ REQUIRED_PUBLIC_TOOLS = {
     "android_wait_for_element",
     "android_wait_for_text",
     "android_wait_for_ui_change",
+    "android_start_recording",
     "android_recording_status",
     "android_stop_recording",
 }
@@ -61,6 +72,21 @@ REQUIRED_PUBLIC_TOOLS = {
 
 class AcceptanceError(RuntimeError):
     """Safe, stage-labelled failure without dumping tool payloads."""
+
+
+@dataclasses.dataclass(frozen=True)
+class WorkflowObservations:
+    """Safe capability observations returned by the public workflow."""
+
+    screen_recording: str
+    slow_device: str
+    slow_delay_seconds: float
+    usb_disconnect: str
+
+
+_WORKFLOW_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "android_fixture_workflow_deadline", default=None
+)
 
 
 def _require(condition: bool, stage: str, message: str) -> None:
@@ -154,15 +180,40 @@ async def _call(
 ) -> CallToolResult:
     """Call one public tool with both client and harness deadlines."""
 
+    deadline = _WORKFLOW_DEADLINE.get()
+    timeout = timeout_seconds
+    if deadline is not None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise AcceptanceError(f"{stage}: total deadline exceeded")
+        timeout = min(timeout_seconds, remaining)
     try:
         return await asyncio.wait_for(
             client.call_tool(
                 name,
                 arguments=dict(arguments or {}),
-                read_timeout_seconds=timedelta(seconds=timeout_seconds),
+                read_timeout_seconds=timedelta(seconds=timeout),
             ),
-            timeout=timeout_seconds + 1,
+            timeout=timeout,
         )
+    except TimeoutError:
+        raise AcceptanceError(f"{stage}: public tool deadline exceeded") from None
+
+
+async def _list_tools(
+    client: ClientSession, *, timeout_seconds: float, stage: str
+) -> Any:
+    """List tools under the same stage and total deadlines as tool calls."""
+
+    deadline = _WORKFLOW_DEADLINE.get()
+    timeout = timeout_seconds
+    if deadline is not None:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise AcceptanceError(f"{stage}: total deadline exceeded")
+        timeout = min(timeout_seconds, remaining)
+    try:
+        return await asyncio.wait_for(client.list_tools(), timeout=timeout)
     except TimeoutError:
         raise AcceptanceError(f"{stage}: public tool deadline exceeded") from None
 
@@ -314,16 +365,211 @@ async def _cleanup_shielded(
         raise
 
 
+async def _recording_observation(
+    client: ClientSession, *, stage_timeout_seconds: float
+) -> str:
+    """Exercise the public recording transition and return supported/unsupported."""
+
+    started = await _call(
+        client,
+        "android_start_recording",
+        {"max_duration_seconds": 5},
+        timeout_seconds=stage_timeout_seconds,
+        stage="recording_start",
+    )
+    if started.isError:
+        _failure(started, "recording_start", "UNSUPPORTED")
+        return "unsupported"
+
+    started_payload = _success(started, "recording_start")
+    _require(
+        started_payload.get("state") == "recording",
+        "recording_start",
+        "recording did not enter the recording state",
+    )
+    status = _success(
+        await _call(
+            client,
+            "android_recording_status",
+            None,
+            timeout_seconds=stage_timeout_seconds,
+            stage="recording_status",
+        ),
+        "recording_status",
+    )
+    _require(status.get("state") == "recording", "recording_status", "recording state was lost")
+    stopped = _success(
+        await _call(
+            client,
+            "android_stop_recording",
+            None,
+            timeout_seconds=stage_timeout_seconds,
+            stage="recording_stop",
+        ),
+        "recording_stop",
+    )
+    _require(
+        stopped.get("state") == "ready",
+        "recording_stop",
+        "recording did not enter the ready state",
+    )
+    return "supported"
+
+
+async def _read_adb_state(adb: str, serial: str, *, timeout_seconds: float) -> str | None:
+    """Read one device state without retaining command output or paths."""
+
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            adb,
+            "-s",
+            serial,
+            "get-state",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout_seconds
+            )
+        except TimeoutError:
+            process.kill()
+            await process.communicate()
+            return None
+    except (OSError, TimeoutError):
+        if process is not None and process.returncode is None:
+            with contextlib.suppress(OSError):
+                process.kill()
+            with contextlib.suppress(Exception):
+                await process.communicate()
+        return None
+    if process.returncode != 0:
+        return None
+    return stdout.decode("utf-8", errors="replace").strip()
+
+
+async def _wait_for_adb_state(
+    adb: str,
+    serial: str,
+    *,
+    connected: bool,
+    timeout_seconds: float,
+) -> bool:
+    """Wait for an explicit disconnect or reconnect within the active deadline."""
+
+    end = asyncio.get_running_loop().time() + timeout_seconds
+    workflow_deadline = _WORKFLOW_DEADLINE.get()
+    if workflow_deadline is not None:
+        end = min(end, workflow_deadline)
+    while asyncio.get_running_loop().time() < end:
+        remaining = end - asyncio.get_running_loop().time()
+        state = await _read_adb_state(adb, serial, timeout_seconds=min(3.0, remaining))
+        if (state == "device") is connected:
+            return True
+        await asyncio.sleep(min(0.5, max(0.05, remaining)))
+    return False
+
+
+async def _usb_disconnect_observation(
+    client: ClientSession,
+    *,
+    serial: str,
+    package: str,
+    stage_timeout_seconds: float,
+    adb_path: str | None,
+) -> str:
+    """Verify a physical disconnect and public reconnect, with operator assistance."""
+
+    adb = adb_path or shutil.which("adb")
+    _require(adb is not None, "usb_disconnect", "adb is required for the disconnect observation")
+    initial_state = await _read_adb_state(
+        adb,
+        serial,
+        timeout_seconds=min(3.0, max(0.1, stage_timeout_seconds)),
+    )
+    _require(
+        initial_state == "device",
+        "usb_disconnect",
+        "the selected device was not connected before the observation",
+    )
+    print(
+        "USB disconnect test: unplug the selected device now, then reconnect it when prompted.",
+        flush=True,
+    )
+    disconnected = await _wait_for_adb_state(
+        adb,
+        serial,
+        connected=False,
+        timeout_seconds=max(stage_timeout_seconds, 30),
+    )
+    _require(disconnected, "usb_disconnect", "the selected device never disconnected")
+
+    lost = await _call(
+        client,
+        "android_snapshot",
+        None,
+        timeout_seconds=stage_timeout_seconds,
+        stage="usb_disconnect_observe",
+    )
+    lost_payload = _payload(lost, "usb_disconnect_observe")
+    _require(lost.isError is True, "usb_disconnect_observe", "snapshot unexpectedly succeeded")
+    _require(
+        lost_payload.get("error_code") in USB_DISCONNECT_ERROR_CODES,
+        "usb_disconnect_observe",
+        "disconnect did not return a typed device failure",
+    )
+
+    print("USB disconnect observed. Reconnect the selected device now.", flush=True)
+    reconnected = await _wait_for_adb_state(
+        adb,
+        serial,
+        connected=True,
+        timeout_seconds=max(stage_timeout_seconds, 45),
+    )
+    _require(reconnected, "usb_disconnect", "the selected device did not reconnect")
+    connected = _success(
+        await _call(
+            client,
+            "android_connect",
+            {
+                "serial": serial,
+                "allowed_packages": [package],
+                "allowed_system_surfaces": ["launcher"],
+            },
+            timeout_seconds=stage_timeout_seconds,
+            stage="usb_reconnect",
+        ),
+        "usb_reconnect",
+    )
+    _require(connected.get("connected") is True, "usb_reconnect", "public reconnect failed")
+    status = _success(
+        await _call(
+            client,
+            "android_status",
+            None,
+            timeout_seconds=stage_timeout_seconds,
+            stage="usb_reconnect_status",
+        ),
+        "usb_reconnect_status",
+    )
+    _require(status.get("connected") is True, "usb_reconnect_status", "device is not healthy")
+    return "passed"
+
+
 async def _workflow(
     client: ClientSession,
     *,
     serial: str,
     package: str,
     stage_timeout_seconds: float,
-) -> None:
+    exercise_usb_disconnect: bool,
+    adb_path: str | None,
+) -> WorkflowObservations:
     """Exercise the complete fixture contract through public MCP calls."""
 
-    listed = await client.list_tools()
+    listed = await _list_tools(client, timeout_seconds=stage_timeout_seconds, stage="tools/list")
     available = {tool.name for tool in listed.tools}
     _require(
         available >= REQUIRED_PUBLIC_TOOLS,
@@ -655,6 +901,7 @@ async def _workflow(
         "delayed_trigger",
         "delayed trigger was not sent",
     )
+    delayed_started = time.monotonic()
     delayed = _success(
         await _call(
             client,
@@ -668,6 +915,12 @@ async def _workflow(
             stage="wait_delayed_element",
         ),
         "wait_delayed_element",
+    )
+    slow_delay_seconds = time.monotonic() - delayed_started
+    _require(
+        slow_delay_seconds >= 1.0,
+        "wait_delayed_element",
+        "delayed fixture did not expose an observable slow-device wait",
     )
     _assert_provenance(delayed, session_id, generation, "wait_delayed_element")
     matched = delayed.get("matched_element")
@@ -743,6 +996,26 @@ async def _workflow(
     cleared_text = _find_text(cleared_page, FIXTURE_IDS["text_input"], "verify_clear")
     _require(cleared_text in (None, ""), "verify_clear", "fixture input was not empty after clear")
 
+    screen_recording = await _recording_observation(
+        client,
+        stage_timeout_seconds=stage_timeout_seconds,
+    )
+    usb_disconnect = "not_tested"
+    if exercise_usb_disconnect:
+        usb_disconnect = await _usb_disconnect_observation(
+            client,
+            serial=serial,
+            package=package,
+            stage_timeout_seconds=stage_timeout_seconds,
+            adb_path=adb_path,
+        )
+    return WorkflowObservations(
+        screen_recording=screen_recording,
+        slow_device="passed",
+        slow_delay_seconds=round(slow_delay_seconds, 3),
+        usb_disconnect=usb_disconnect,
+    )
+
 
 async def run_acceptance(
     *,
@@ -753,7 +1026,9 @@ async def run_acceptance(
     package: str = FIXTURE_PACKAGE,
     stage_timeout_seconds: float = 35,
     total_timeout_seconds: float = 180,
-) -> None:
+    exercise_usb_disconnect: bool = False,
+    adb_path: str | None = None,
+) -> WorkflowObservations:
     """Start an independent stdio server, run the flow, and always clean up."""
 
     _require(
@@ -770,30 +1045,55 @@ async def run_acceptance(
     primary_error: BaseException | None = None
     cleanup_result: CallToolResult | None = None
     cleanup_reset_ok = False
+    observations: WorkflowObservations | None = None
+    loop = asyncio.get_running_loop()
+    workflow_deadline = loop.time() + total_timeout_seconds
+    cleanup_budget_seconds = max(30.0, min(60.0, stage_timeout_seconds * 2))
+    cleanup_stage_timeout_seconds = min(
+        stage_timeout_seconds, max(5.0, cleanup_budget_seconds / 5)
+    )
     async with (
         stdio_client(parameters) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream) as client,
     ):
         try:
-            await asyncio.wait_for(client.initialize(), timeout=stage_timeout_seconds)
-            connect_attempted = True
-            async with asyncio.timeout(total_timeout_seconds):
-                await _workflow(
-                    client,
-                    serial=serial,
-                    package=package,
-                    stage_timeout_seconds=stage_timeout_seconds,
+            deadline_token = _WORKFLOW_DEADLINE.set(workflow_deadline)
+            try:
+                remaining = workflow_deadline - loop.time()
+                _require(remaining > 0, "initialize", "total deadline exceeded")
+                await asyncio.wait_for(
+                    client.initialize(), timeout=min(stage_timeout_seconds, remaining)
                 )
+                connect_attempted = True
+                remaining = workflow_deadline - loop.time()
+                _require(remaining > 0, "workflow", "total deadline exceeded")
+                async with asyncio.timeout(remaining):
+                    observations = await _workflow(
+                        client,
+                        serial=serial,
+                        package=package,
+                        stage_timeout_seconds=stage_timeout_seconds,
+                        exercise_usb_disconnect=exercise_usb_disconnect,
+                        adb_path=adb_path,
+                    )
+            finally:
+                _WORKFLOW_DEADLINE.reset(deadline_token)
         except BaseException as error:
             primary_error = error
             raise
         finally:
-            cleanup_result, cleanup_reset_ok = await _cleanup_shielded(
-                client,
-                package=package,
-                connect_attempted=connect_attempted,
-                timeout_seconds=stage_timeout_seconds,
+            cleanup_deadline_token = _WORKFLOW_DEADLINE.set(
+                loop.time() + cleanup_budget_seconds
             )
+            try:
+                cleanup_result, cleanup_reset_ok = await _cleanup_shielded(
+                    client,
+                    package=package,
+                    connect_attempted=connect_attempted,
+                    timeout_seconds=cleanup_stage_timeout_seconds,
+                )
+            finally:
+                _WORKFLOW_DEADLINE.reset(cleanup_deadline_token)
             if primary_error is None:
                 _require(
                     cleanup_reset_ok,
@@ -808,6 +1108,9 @@ async def run_acceptance(
                     "cleanup.disconnect",
                     "disconnect did not complete successfully",
                 )
+    if observations is None:
+        raise AcceptanceError("workflow: no capability observations were produced")
+    return observations
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -846,6 +1149,16 @@ def _parser() -> argparse.ArgumentParser:
         default=180,
         help="Deadline for the complete flow (default: 180).",
     )
+    parser.add_argument(
+        "--exercise-usb-disconnect",
+        action="store_true",
+        help="Pause for an operator unplug/replug and verify public reconnect recovery.",
+    )
+    parser.add_argument(
+        "--adb-path",
+        default=None,
+        help="Optional adb executable used only by the USB disconnect observer.",
+    )
     return parser
 
 
@@ -865,7 +1178,7 @@ def main(argv: list[str] | None = None) -> int:
         print("android fixture acceptance failed: timeouts must be positive", file=sys.stderr)
         return 2
     try:
-        asyncio.run(
+        observations = asyncio.run(
             run_acceptance(
                 serial=args.serial,
                 server_command=args.server_command,
@@ -873,6 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
                 server_cwd=args.server_cwd,
                 stage_timeout_seconds=args.stage_timeout_seconds,
                 total_timeout_seconds=args.total_timeout_seconds,
+                exercise_usb_disconnect=args.exercise_usb_disconnect,
+                adb_path=args.adb_path,
             )
         )
     except AcceptanceError as error:
@@ -899,6 +1214,13 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("android fixture acceptance cancelled", file=sys.stderr)
         return 130
+    print(
+        "android fixture compatibility result: "
+        f"screen_recording={observations.screen_recording} "
+        f"slow_device={observations.slow_device} "
+        f"slow_delay_seconds={observations.slow_delay_seconds:.3f} "
+        f"usb_disconnect={observations.usb_disconnect}"
+    )
     print("android fixture acceptance passed")
     return 0
 

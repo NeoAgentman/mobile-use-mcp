@@ -109,3 +109,43 @@ The `0.3.x` direct-call compatibility projection (`result["data"]`) remains avai
 Python callers, but MCP clients should migrate to `structuredContent` and the advertised schema.
 Update clients that assumed an action failure returned `isError=false`; this was a breaking protocol
 change in 0.4.0.
+
+## Physical-device release evidence
+
+The repeatable physical-device harness is [`scripts/android_compatibility_evidence.py`](scripts/android_compatibility_evidence.py).
+It consumes the exact wheel and fixture APK artifacts built by CI, requires an explicit ADB serial,
+uses the same installed-wheel public `ClientSession` flow as emulator CI, and writes one
+privacy-safe JSON record per named matrix entry under [`compatibility/evidence`](compatibility/evidence).
+The record contains dated host/device/runtime metadata, input-method and capability status, and
+artifact digests plus CI commit lineage; it never stores a complete serial, screenshots, UI content,
+typed text, credentials, or host paths. Screen-recording status comes only from the public recording
+start/status/stop flow, and slow-device status includes an observed delay. Use
+[`scripts/compatibility_matrix.py`](scripts/compatibility_matrix.py) to validate fresh required entries
+and render the matrix.
+
+The current operator hardware is one HUAWEI P20 (`EML-AL00`) on Android 10/API 29 with an OEM ROM;
+its public screen-recording capability is unsupported.
+The remaining API 26/AOSP, second current-API OEM, supported-screen-recording, slow-device, and
+USB-disconnect evidence is not available in this checkout and is intentionally not a support claim.
+The current HUAWEI run also remains unverified until the CI-built artifacts are downloaded and the
+public smoke plus operator USB recovery flow completes.
+See [`compatibility/matrix.json`](compatibility/matrix.json) for the named release entries and
+operator-provided gaps.
+
+<!-- BEGIN GENERATED ANDROID COMPATIBILITY MATRIX -->
+## Android compatibility evidence
+
+This table is generated from privacy-safe JSON evidence records. A row is a passing, dated smoke record; unverified combinations remain unclaimed.
+
+| Matrix entry | Observed (UTC) | Host / Python | Android | Device / ROM | Unicode IME | Slow device | USB recovery | Recording |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+### Matrix gaps
+
+The following named entries are unverified and are not support claims:
+
+- `physical-aosp-api-26`: unverified
+- `physical-huawei-api-29`: unverified
+- `physical-oem-api-34`: unverified
+- `physical-recording-supported`: unverified
+<!-- END GENERATED ANDROID COMPATIBILITY MATRIX -->

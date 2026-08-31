@@ -133,6 +133,13 @@ jobs:
       - name: Record the wheel SHA-256 digest
         run: uv run python scripts/artifact_digest.py --write --directory dist --output dist/wheel.sha256
 
+      - name: Bind the wheel to this commit
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          uv run python scripts/artifact_manifest.py --write \
+            --artifact "$wheel" --kind wheel --git-commit "$GITHUB_SHA" \
+            --manifest dist/wheel.manifest.json
+
       - name: Upload the exact build output
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -141,6 +148,56 @@ jobs:
             dist/*.whl
             dist/*.tar.gz
             dist/wheel.sha256
+            dist/wheel.manifest.json
+          if-no-files-found: error
+          retention-days: 7
+
+  build-android-fixture:
+    name: Build Android fixture artifact
+    needs: [static-analysis, unit-component-tests, stdio-contract-tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Java 17 for the pinned Android build
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: "17.0.13+11"
+
+      - name: Install the pinned Android SDK components
+        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          cmdline-tools-version: "12266719"
+          packages: platform-tools platforms;android-35 build-tools;35.0.0
+
+      - name: Install Gradle 8.10.2
+        uses: gradle/gradle-build-action@ac2d340dc04d9e1113182899e983b5400c17cda1 # v3.5.0
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Build the deterministic fixture APK once
+        working-directory: fixtures/android-fixture
+        run: gradle --no-daemon --console plain :app:assembleDebug
+
+      - name: Record the fixture APK digest
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/mobile-use-mcp-android-fixture"
+          mkdir -p "$staging"
+          cp fixtures/android-fixture/app/build/outputs/apk/debug/app-debug.apk "$staging/app-debug.apk"
+          (cd "$staging" && sha256sum app-debug.apk > fixture.apk.sha256)
+          python scripts/artifact_manifest.py --write \
+            --artifact "$staging/app-debug.apk" --kind fixture_apk --git-commit "$GITHUB_SHA" \
+            --manifest "$staging/fixture.apk.manifest.json"
+
+      - name: Upload the exact fixture APK artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: mobile-use-mcp-android-fixture-${{ github.sha }}
+          path: ${{ runner.temp }}/mobile-use-mcp-android-fixture
           if-no-files-found: error
           retention-days: 7
 
@@ -238,7 +295,7 @@ jobs:
 
   android-emulator-acceptance:
     name: Android emulator acceptance
-    needs: build-wheel
+    needs: [build-wheel, build-android-fixture]
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -269,26 +326,25 @@ jobs:
       - name: Verify the wheel digest before installation
         run: .venv/bin/python scripts/artifact_digest.py --verify --directory dist --output dist/wheel.sha256
 
-      - name: Install Java 17 for the pinned Android build
-        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+      - name: Download the exact CI-built fixture APK
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5.0.0
         with:
-          distribution: temurin
-          java-version: "17.0.13+11"
+          name: mobile-use-mcp-android-fixture-${{ github.sha }}
+          path: fixture-artifact
 
-      - name: Install the pinned Android SDK components
-        uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
-        with:
-          cmdline-tools-version: "12266719"
-          packages: platform-tools emulator platforms;android-35 build-tools;35.0.0 system-images;android-35;google_apis;x86_64
+      - name: Verify the fixture APK digest before installation
+        run: (cd fixture-artifact && sha256sum --check fixture.apk.sha256)
 
-      - name: Install Gradle 8.10.2
-        uses: gradle/gradle-build-action@ac2d340dc04d9e1113182899e983b5400c17cda1 # v3.5.0
-        with:
-          gradle-version: "8.10.2"
-
-      - name: Build the deterministic fixture APK
-        working-directory: fixtures/android-fixture
-        run: gradle --no-daemon --console plain :app:assembleDebug
+      - name: Verify both artifacts are from this commit
+        run: |
+          wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+          uv run --no-project --python "$PYTHON_VERSION" python scripts/artifact_manifest.py \
+            --verify --artifact "$wheel" --kind wheel --manifest dist/wheel.manifest.json
+          python scripts/artifact_manifest.py --verify \
+            --artifact fixture-artifact/app-debug.apk --kind fixture_apk \
+            --manifest fixture-artifact/fixture.apk.manifest.json
+          test "$(python -c 'import json; print(json.load(open("dist/wheel.manifest.json"))["git_commit"])')" = "$GITHUB_SHA"
+          test "$(python -c 'import json; print(json.load(open("fixture-artifact/fixture.apk.manifest.json"))["git_commit"])')" = "$GITHUB_SHA"
 
       - name: Install the exact wheel into an isolated server environment
         run: |
@@ -314,7 +370,7 @@ jobs:
           script: |
             set -euo pipefail
             timeout 90s adb -s "$ANDROID_SERIAL" wait-for-device
-            adb -s "$ANDROID_SERIAL" install -r fixtures/android-fixture/app/build/outputs/apk/debug/app-debug.apk
+            adb -s "$ANDROID_SERIAL" install -r fixture-artifact/app-debug.apk
             timeout 90s .venv/bin/python scripts/android_emulator_preflight.py --serial "$ANDROID_SERIAL" --package "$FIXTURE_PACKAGE"
             .venv/bin/python scripts/android_ci_acceptance.py --serial "$ANDROID_SERIAL" --package "$FIXTURE_PACKAGE" --server-command "$RUNNER_TEMP/mobile-use-server/bin/mobile-use-mcp" --artifact-root "$ARTIFACT_ROOT" --diagnostics "$DIAGNOSTICS_DIR/acceptance.log" --stage-timeout-seconds 35 --total-timeout-seconds 180
 
@@ -343,6 +399,7 @@ jobs:
       - unit-component-tests
       - stdio-contract-tests
       - build-wheel
+      - build-android-fixture
       - installed-package-smoke
       - mcp-inspection
       - android-emulator-acceptance
@@ -355,6 +412,7 @@ jobs:
           UNIT_RESULT: ${{ needs.unit-component-tests.result }}
           STDIO_RESULT: ${{ needs.stdio-contract-tests.result }}
           BUILD_RESULT: ${{ needs.build-wheel.result }}
+          FIXTURE_RESULT: ${{ needs.build-android-fixture.result }}
           SMOKE_RESULT: ${{ needs.installed-package-smoke.result }}
           INSPECT_RESULT: ${{ needs.mcp-inspection.result }}
           ANDROID_RESULT: ${{ needs.android-emulator-acceptance.result }}
@@ -363,6 +421,7 @@ jobs:
           test "$UNIT_RESULT" = success
           test "$STDIO_RESULT" = success
           test "$BUILD_RESULT" = success
+          test "$FIXTURE_RESULT" = success
           test "$SMOKE_RESULT" = success
           test "$INSPECT_RESULT" = success
           test "$ANDROID_RESULT" = success

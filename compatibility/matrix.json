@@ -1,0 +1,60 @@
+{
+  "schema_version": 1,
+  "max_age_days": 180,
+  "required_entries": [
+    "physical-huawei-api-29",
+    "physical-aosp-api-26",
+    "physical-oem-api-34",
+    "physical-recording-supported"
+  ],
+  "entries": {
+    "physical-huawei-api-29": {
+      "api_levels": [29],
+      "manufacturers": ["huawei"],
+      "required_capabilities": {
+        "unicode_input": ["passed"],
+        "slow_device_behavior": ["passed"],
+        "usb_disconnect_recovery": ["passed"],
+        "screen_recording": ["unsupported"]
+      }
+    },
+    "physical-aosp-api-26": {
+      "api_levels": [26],
+      "manufacturers": ["aosp", "google"],
+      "required_capabilities": {
+        "unicode_input": ["passed"],
+        "slow_device_behavior": ["passed"],
+        "usb_disconnect_recovery": ["passed"],
+        "screen_recording": ["supported", "unsupported"]
+      }
+    },
+    "physical-oem-api-34": {
+      "min_api_level": 34,
+      "manufacturer_not_in": ["aosp", "google"],
+      "required_capabilities": {
+        "unicode_input": ["passed"],
+        "slow_device_behavior": ["passed"],
+        "usb_disconnect_recovery": ["passed"],
+        "screen_recording": ["supported", "unsupported"]
+      }
+    },
+    "physical-recording-supported": {
+      "min_api_level": 1,
+      "required_capabilities": {
+        "screen_recording": ["supported"]
+      }
+    }
+  },
+  "notes": {
+    "available_hardware": "One connected physical HUAWEI P20 (EML-AL00), Android 10/API 29, OEM build; device screenrecord is unsupported and a current smoke record still requires the CI-built fixture artifact.",
+    "missing_hardware": [
+      "A representative API 26 AOSP device or emulator with USB/physical-device evidence.",
+      "A second OEM device on a current API 34 or newer release.",
+      "A device on which the public screen-recording flow is supported."
+    ],
+    "operator_conditions": [
+      "Unicode IME behavior must be recorded by the public fixture flow.",
+      "Slow-device and USB-disconnect recovery require an explicit operator run."
+    ]
+  }
+}

@@ -76,10 +76,12 @@ and Android-emulator checks. The supported host matrix is Ubuntu 24.04, macOS 14
 with Python 3.12. The project metadata permits newer Python versions, but they are not support
 claims until they are added to this matrix.
 
-The `Build wheel artifact` job builds the wheel once and records `dist/wheel.sha256`. Every
-installed-package smoke, MCP inspector, and Android acceptance job verifies that digest and
-installs that exact wheel; none imports the checkout as the server under test. The Android gate
-uses API 35, the `google_apis` x86_64 image, pinned SDK/build tooling, and a stable fixture App.
+The `Build wheel artifact` job builds the wheel once and records `dist/wheel.sha256`. The
+`Build Android fixture artifact` job separately builds the fixture APK once and records its digest.
+Every installed-package smoke, MCP inspector, and Android acceptance job verifies the exact wheel;
+the Android gate also verifies and installs the exact CI-built fixture APK. None imports the
+checkout as the server under test. The Android gate uses API 35, the `google_apis` x86_64 image,
+pinned SDK/build tooling, and a stable fixture App.
 
 Configure these exact check names as required branch-protection gates:
 
@@ -89,6 +91,7 @@ Configure these exact check names as required branch-protection gates:
 - `Unit/component tests (windows-2022, Python 3.12)`
 - `stdio contract tests`
 - `Build wheel artifact`
+- `Build Android fixture artifact`
 - `Installed-package smoke (ubuntu-24.04, Python 3.12)`
 - `Installed-package smoke (macos-14, Python 3.12)`
 - `Installed-package smoke (windows-2022, Python 3.12)`
@@ -183,6 +186,15 @@ python -m venv "$smoke_env"
 "$smoke_env/bin/python" -m pip install dist/mobile_use_mcp-*.whl
 "$smoke_env/bin/python" scripts/stdio_smoke.py \
   --command "$smoke_env/bin/mobile-use-mcp"
+```
+
+For a release that has operator-provided physical evidence, add the evidence directory and matrix
+config so missing or stale named entries fail the audit:
+
+```bash
+uv run python scripts/release_audit.py \
+  --compatibility-evidence compatibility/evidence \
+  --compatibility-matrix compatibility/matrix.json
 ```
 
 ## Codex configuration
@@ -563,6 +575,30 @@ same flow against a wheel-installed command, pass its absolute entry point with
 
 See [`COMPATIBILITY.md`](COMPATIBILITY.md) for current Codex, Claude Code, MCP client, and real
 device verification results.
+
+### Physical-device compatibility evidence
+
+The physical-device harness is [`scripts/android_compatibility_evidence.py`](scripts/android_compatibility_evidence.py).
+It requires an explicit serial, the exact wheel and `wheel.sha256` plus `wheel.manifest.json` from CI,
+the exact APK and `fixture.apk.sha256` plus `fixture.apk.manifest.json` from the same CI commit, an
+installed wheel entry point, and a named matrix entry. It delegates the public `ClientSession` workflow
+to the same bounded acceptance wrapper as the emulator gate. Evidence is written as privacy-safe JSON under
+[`compatibility/evidence`](compatibility/evidence), and [`scripts/compatibility_matrix.py`](scripts/compatibility_matrix.py)
+validates or renders those records. A release audit can require fresh named entries with
+`--compatibility-evidence` and repeated `--require-matrix-entry` options.
+
+The harness measures the delayed fixture wait and exercises the public recording start/status/stop
+flow. Unsupported recording is accepted only when the public tool returns structured `UNSUPPORTED`.
+USB recovery cannot be claimed through an argument: add `--exercise-usb-disconnect` to pause for an
+operator unplug/replug, observe the same serial disconnect, require a public snapshot failure, then
+reconnect through public MCP tools and verify status. Without that option the capability remains
+`not_tested`.
+
+The current operator setup has one HUAWEI P20/EML-AL00 on Android 10/API 29; its public
+screen-recording capability is unsupported. The remaining AOSP/API 26, second-OEM/current-API,
+supported-screen-recording, slow-device, and USB-disconnect evidence is explicitly unverified; see
+[`compatibility/matrix.json`](compatibility/matrix.json). No untested combination is included as a
+support claim.
 
 ## Known limitations
 

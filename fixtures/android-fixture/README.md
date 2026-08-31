@@ -21,7 +21,13 @@ and are part of the acceptance contract:
 | `fixture_scroll_container` | Scrollable container with 32 deterministic rows |
 | `fixture_scroll_state` | Indicates top/moved scroll state |
 
-Build and install the debug APK with a locally installed Android SDK and Gradle:
+CI builds and publishes the debug APK as the `mobile-use-mcp-android-fixture-<commit>` artifact,
+including `fixture.apk.sha256` and `fixture.apk.manifest.json`. For a release-evidence run, download
+that exact artifact and verify both files before installing it. The manifest must identify the same
+commit as the wheel manifest. A local build is useful for fixture development, but must not replace
+the CI artifact in compatibility evidence.
+
+For local fixture development, build and install the debug APK with an Android SDK and Gradle:
 
 ```bash
 gradle --no-daemon --console plain assembleDebug

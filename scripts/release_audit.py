@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import hashlib
 import re
 import sys
 import tarfile
@@ -19,6 +18,18 @@ from email.parser import Parser
 from importlib import import_module
 from pathlib import Path
 from typing import Any, cast
+
+# Keep the documented direct script invocation working. Python otherwise puts
+# only ``scripts/`` on ``sys.path`` and cannot resolve the sibling package.
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from scripts.compatibility_evidence import (
+    CompatibilityEvidenceError,
+    load_matrix_config,
+    sha256_file,
+    validate_evidence_directory,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_ROOT = PROJECT_ROOT / "src"
@@ -37,6 +48,40 @@ SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 class ReleaseAuditError(ValueError):
     """Raised when a release identity, archive, or provenance check fails."""
+
+
+def validate_compatibility_evidence(
+    directory: Path,
+    *,
+    required_matrix_entries: tuple[str, ...] = (),
+    max_age_days: int = 180,
+    wheel_path: Path | None = None,
+    matrix_constraints: dict[str, dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Validate fresh physical-device records for release use."""
+
+    try:
+        records = validate_evidence_directory(
+            Path(directory),
+            required_entries=required_matrix_entries,
+            max_age_days=max_age_days,
+            matrix_constraints=matrix_constraints,
+        )
+        if wheel_path is not None:
+            wheel_digest = sha256_file(Path(wheel_path))
+            mismatched = [
+                str(record["matrix_entry"])
+                for record in records
+                if record["artifact_digest"]["wheel_sha256"].casefold() != wheel_digest
+            ]
+            if mismatched:
+                raise ReleaseAuditError(
+                    "Compatibility evidence references a different wheel digest for: "
+                    + ", ".join(mismatched)
+                )
+        return records
+    except CompatibilityEvidenceError as error:
+        raise ReleaseAuditError(f"Compatibility evidence failed: {error}") from error
 
 
 def expected_release_tag(version: str = __version__) -> str:
@@ -79,11 +124,10 @@ def _metadata_value(metadata: str, key: str) -> str:
 
 
 def _file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    try:
+        return sha256_file(path)
+    except CompatibilityEvidenceError as error:
+        raise ReleaseAuditError(f"Could not hash file: {path.name}") from error
 
 
 def _safe_project_path(root: Path, value: str) -> Path:
@@ -419,8 +463,18 @@ def audit_artifacts(
     root: Path = PROJECT_ROOT,
     provenance_path: Path | None = None,
     tag: str | None = None,
+    compatibility_evidence: Path | None = None,
+    required_matrix_entries: tuple[str, ...] = (),
+    compatibility_max_age_days: int = 180,
+    compatibility_matrix_constraints: dict[str, dict[str, Any]] | None = None,
 ) -> None:
-    """Run all repeatable release checks for one wheel and one sdist."""
+    """Run all repeatable release checks for one wheel and one sdist.
+
+    Compatibility evidence is opt-in for ordinary artifact checks because a
+    physical-device record is operator-provided.  Once a release names an
+    evidence directory (or required matrix entries), every record must be a
+    fresh passing record and every named entry must be present.
+    """
 
     root = Path(root)
     validate_version_configuration(root)
@@ -429,6 +483,19 @@ def audit_artifacts(
     if provenance_path is None:
         provenance_path = root / "provenance.toml"
     validate_source_provenance(Path(provenance_path), root)
+    if compatibility_evidence is not None or required_matrix_entries:
+        evidence_directory = (
+            Path(compatibility_evidence)
+            if compatibility_evidence is not None
+            else root / "compatibility" / "evidence"
+        )
+        validate_compatibility_evidence(
+            evidence_directory,
+            required_matrix_entries=required_matrix_entries,
+            max_age_days=compatibility_max_age_days,
+            wheel_path=wheel_path,
+            matrix_constraints=compatibility_matrix_constraints,
+        )
     audit_wheel(wheel_path)
     audit_sdist(sdist_path)
 
@@ -449,18 +516,69 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--sdist", type=Path)
     parser.add_argument("--provenance", type=Path)
     parser.add_argument("--tag")
+    parser.add_argument(
+        "--compatibility-evidence",
+        type=Path,
+        help="Directory of privacy-safe physical-device evidence JSON records.",
+    )
+    parser.add_argument(
+        "--require-matrix-entry",
+        action="append",
+        default=[],
+        help="Require one fresh passing compatibility record; may be repeated.",
+    )
+    parser.add_argument(
+        "--compatibility-matrix",
+        type=Path,
+        help="JSON matrix config whose required entries must be fresh and passing.",
+    )
+    parser.add_argument(
+        "--compatibility-max-age-days",
+        type=int,
+        default=None,
+        help="Maximum age for compatibility records (default: matrix config or 180).",
+    )
     args = parser.parse_args(argv)
     try:
         root = args.root.resolve()
         if args.tag is not None:
             validate_release_tag(args.tag)
+        try:
+            if args.compatibility_matrix is not None:
+                configured_entries, configured_max_age, matrix_constraints = load_matrix_config(
+                    args.compatibility_matrix
+                )
+            else:
+                configured_entries, configured_max_age, matrix_constraints = (), 180, None
+        except CompatibilityEvidenceError as error:
+            raise ReleaseAuditError(f"Compatibility matrix failed: {error}") from error
+        required_entries = tuple(configured_entries) + tuple(args.require_matrix_entry)
+        if len(set(required_entries)) != len(required_entries):
+            raise ReleaseAuditError("Compatibility evidence required entries must be unique.")
+        max_age_days = (
+            args.compatibility_max_age_days
+            if args.compatibility_max_age_days is not None
+            else configured_max_age
+        )
         dist_dir = root / "dist"
         wheel = args.wheel or _discover_artifact(dist_dir, ".whl")
         sdist = args.sdist or _discover_artifact(dist_dir, ".tar.gz")
         provenance = args.provenance
         if provenance is None:
             provenance = root / "provenance.toml"
-        audit_artifacts(wheel, sdist, root=root, provenance_path=provenance, tag=args.tag)
+        audit_artifacts(
+            wheel,
+            sdist,
+            root=root,
+            provenance_path=provenance,
+            tag=args.tag,
+            compatibility_evidence=args.compatibility_evidence,
+            required_matrix_entries=required_entries,
+            compatibility_max_age_days=max_age_days,
+            compatibility_matrix_constraints=(
+                matrix_constraints if required_entries else None
+            ),
+        )
     except ReleaseAuditError as error:
         print(f"release audit failed: {error}", file=sys.stderr)
         return 1

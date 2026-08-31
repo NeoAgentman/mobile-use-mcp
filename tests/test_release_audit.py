@@ -9,6 +9,7 @@ from mobile_use_mcp import __version__
 from scripts.release_audit import (
     ReleaseAuditError,
     expected_release_tag,
+    validate_compatibility_evidence,
     validate_release_tag,
     validate_source_provenance,
 )
@@ -47,3 +48,11 @@ def test_source_provenance_detects_source_drift(tmp_path: Path) -> None:
 
     with pytest.raises(ReleaseAuditError, match="sha256"):
         validate_source_provenance(copied_inventory, tmp_path)
+
+
+def test_release_validation_can_require_named_compatibility_entries(tmp_path: Path) -> None:
+    with pytest.raises(ReleaseAuditError, match="missing matrix evidence"):
+        validate_compatibility_evidence(
+            tmp_path,
+            required_matrix_entries=("physical-huawei-api-29",),
+        )

@@ -31,6 +31,7 @@ _PATH_RE = re.compile(
 _ENV_VALUE_RE = re.compile(r"(?i)(MOBILE_USE_[A-Z0-9_]+)=([^\s\"']+)")
 _SERIAL_REPLACEMENT = "<redacted-device>"
 _KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
+_REAP_GRACE_SECONDS = 20.0
 
 
 class AcceptanceRunnerError(RuntimeError):
@@ -137,6 +138,8 @@ def run_acceptance(
     diagnostics_path: Path,
     stage_timeout_seconds: float = 35,
     total_timeout_seconds: float = 180,
+    exercise_usb_disconnect: bool = False,
+    adb_path: str | None = None,
 ) -> int:
     """Run the public flow, always stop/reap it, and write safe diagnostics."""
 
@@ -166,6 +169,10 @@ def run_acceptance(
             "--total-timeout-seconds",
             str(total_timeout_seconds),
         ]
+        if exercise_usb_disconnect:
+            command.append("--exercise-usb-disconnect")
+        if adb_path is not None:
+            command.extend(("--adb-path", adb_path))
         try:
             process = subprocess.Popen(
                 command,
@@ -177,7 +184,10 @@ def run_acceptance(
                 start_new_session=os.name == "posix",
             )
             try:
-                process.wait(timeout=total_timeout_seconds + stage_timeout_seconds + 30)
+                cleanup_budget = max(30.0, min(60.0, stage_timeout_seconds * 2))
+                process.wait(
+                    timeout=total_timeout_seconds + cleanup_budget + _REAP_GRACE_SECONDS
+                )
             except subprocess.TimeoutExpired:
                 _terminate_and_reap(process)
                 output.write(b"android acceptance outer deadline exceeded\n")
@@ -209,6 +219,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--diagnostics", type=Path, required=True)
     parser.add_argument("--stage-timeout-seconds", type=float, default=35)
     parser.add_argument("--total-timeout-seconds", type=float, default=180)
+    parser.add_argument(
+        "--exercise-usb-disconnect",
+        action="store_true",
+        help="Pause for an operator unplug/replug and verify public reconnect recovery.",
+    )
+    parser.add_argument(
+        "--adb-path", help="Optional adb executable for USB disconnect observation."
+    )
     return parser
 
 
@@ -226,6 +244,8 @@ def main(argv: list[str] | None = None) -> int:
             diagnostics_path=args.diagnostics,
             stage_timeout_seconds=args.stage_timeout_seconds,
             total_timeout_seconds=args.total_timeout_seconds,
+            exercise_usb_disconnect=args.exercise_usb_disconnect,
+            adb_path=args.adb_path,
         )
     except (OSError, AcceptanceRunnerError):
         print("android acceptance failed: cleanup could not complete", file=sys.stderr)
