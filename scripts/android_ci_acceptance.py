@@ -18,8 +18,10 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
+from typing import BinaryIO
 
 # Match absolute filesystem paths without consuming the slash in an URL.  The
 # diagnostics are intentionally redacted even when a third-party dependency
@@ -32,10 +34,34 @@ _ENV_VALUE_RE = re.compile(r"(?i)(MOBILE_USE_[A-Z0-9_]+)=([^\s\"']+)")
 _SERIAL_REPLACEMENT = "<redacted-device>"
 _KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 _REAP_GRACE_SECONDS = 20.0
+_SAFE_OPERATOR_PROMPTS = frozenset(
+    {
+        "USB disconnect test: unplug the selected device now, then reconnect it when prompted.",
+        "USB disconnect observed. Reconnect the selected device now.",
+    }
+)
 
 
 class AcceptanceRunnerError(RuntimeError):
     """Raised when the outer acceptance process cannot complete safely."""
+
+
+def _capture_child_output(
+    source: BinaryIO,
+    destination: BinaryIO,
+    *,
+    relay_operator_prompts: bool,
+) -> None:
+    """Capture all output but relay only fixed, privacy-safe operator prompts."""
+
+    while line := source.readline():
+        destination.write(line)
+        destination.flush()
+        if not relay_operator_prompts:
+            continue
+        decoded = line.decode("utf-8", errors="replace").strip()
+        if decoded in _SAFE_OPERATOR_PROMPTS:
+            print(decoded, flush=True)
 
 
 def _redact(text: str, serial: str) -> str:
@@ -81,6 +107,24 @@ def _terminate_and_reap(process: subprocess.Popen[bytes], timeout_seconds: float
         # signal is harmless when the group no longer exists and closes that
         # leak without recursively deleting any artifact data.
         _signal_process_group(process, _KILL_SIGNAL, force=True)
+
+
+def _request_public_cleanup(process: subprocess.Popen[bytes], timeout_seconds: float) -> None:
+    """Give the harness a bounded chance to run its public cleanup first."""
+
+    if process.returncode is not None:
+        return
+    try:
+        if os.name == "posix":
+            # Signal only the harness PID.  Its MCP child must remain alive
+            # long enough for the harness's cancellation path to call public
+            # reset/Home/disconnect before the whole process group is reaped.
+            process.send_signal(signal.SIGINT)
+        else:
+            process.terminate()
+        process.wait(timeout=timeout_seconds)
+    except (OSError, subprocess.TimeoutExpired):
+        return
 
 
 def _run_adb_cleanup(serial: str, package: str) -> None:
@@ -149,6 +193,11 @@ def run_acceptance(
     raw_output = b""
     return_code = 1
     process: subprocess.Popen[bytes] | None = None
+    primary_error: BaseException | None = None
+    cleanup_error: AcceptanceRunnerError | None = None
+    request_public_cleanup = False
+    capture_thread: threading.Thread | None = None
+    diagnostic_markers: list[bytes] = []
     with tempfile.TemporaryFile() as output:
         child_environment = os.environ.copy()
         # The server under test must come from the installed wheel, even when
@@ -174,39 +223,73 @@ def run_acceptance(
         if adb_path is not None:
             command.extend(("--adb-path", adb_path))
         try:
+            interactive_output = exercise_usb_disconnect
             process = subprocess.Popen(
                 command,
                 cwd=Path.cwd(),
                 env=child_environment,
                 stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=output,
+                stdout=subprocess.PIPE if interactive_output else output,
+                stderr=subprocess.STDOUT if interactive_output else output,
                 start_new_session=os.name == "posix",
             )
-            try:
-                cleanup_budget = max(30.0, min(60.0, stage_timeout_seconds * 2))
-                process.wait(
-                    timeout=total_timeout_seconds + cleanup_budget + _REAP_GRACE_SECONDS
+            if interactive_output:
+                if process.stdout is None:
+                    raise AcceptanceRunnerError("acceptance output pipe was unavailable")
+                capture_thread = threading.Thread(
+                    target=_capture_child_output,
+                    args=(process.stdout, output),
+                    kwargs={"relay_operator_prompts": True},
+                    name="android-acceptance-output",
+                    daemon=True,
                 )
+                capture_thread.start()
+            try:
+                process.wait(timeout=total_timeout_seconds)
             except subprocess.TimeoutExpired:
-                _terminate_and_reap(process)
-                output.write(b"android acceptance outer deadline exceeded\n")
+                request_public_cleanup = True
+                diagnostic_markers.append(b"android acceptance outer deadline exceeded\n")
+            except BaseException as error:
+                primary_error = error
+                request_public_cleanup = True
+                diagnostic_markers.append(b"android acceptance externally cancelled\n")
             else:
                 return_code = process.returncode if process.returncode is not None else 1
         except OSError:
-            output.write(b"android acceptance process could not start\n")
+            diagnostic_markers.append(b"android acceptance process could not start\n")
         finally:
             if process is not None:
-                _terminate_and_reap(process)
+                graceful_seconds = max(1.0, _REAP_GRACE_SECONDS / 3)
+                reap_seconds = max(1.0, _REAP_GRACE_SECONDS / 3)
+                if request_public_cleanup:
+                    _request_public_cleanup(process, graceful_seconds)
+                try:
+                    _terminate_and_reap(process, timeout_seconds=reap_seconds)
+                except AcceptanceRunnerError as error:
+                    cleanup_error = error
+            if capture_thread is not None:
+                capture_thread.join(timeout=max(1.0, _REAP_GRACE_SECONDS / 3))
+                if capture_thread.is_alive() and cleanup_error is None:
+                    cleanup_error = AcceptanceRunnerError(
+                        "acceptance output capture could not be reaped"
+                    )
+            # This fallback is deliberately outside the child process.  It is
+            # reached for timeout, KeyboardInterrupt, startup failure, and a
+            # normal result even when the public cleanup path was interrupted.
+            _run_adb_cleanup(serial, package)
+            _quarantine_artifacts(artifact_root, diagnostics_path)
+            for marker in diagnostic_markers:
+                output.write(marker)
             output.seek(0)
             raw_output = output.read()
-
-    _run_adb_cleanup(serial, package)
-    _quarantine_artifacts(artifact_root, diagnostics_path)
-    diagnostics_path.write_text(
-        _redact(raw_output.decode("utf-8", errors="replace"), serial),
-        encoding="utf-8",
-    )
+            diagnostics_path.write_text(
+                _redact(raw_output.decode("utf-8", errors="replace"), serial),
+                encoding="utf-8",
+            )
+    if primary_error is not None:
+        raise primary_error
+    if cleanup_error is not None:
+        raise cleanup_error
     return return_code
 
 

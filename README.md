@@ -566,10 +566,13 @@ uv run python scripts/android_fixture_acceptance.py --serial "$MOBILE_USE_ANDROI
 
 The acceptance flow requires `--serial`; it never discovers and silently chooses a device. It
 starts a separate installed `mobile-use-mcp` process through the official MCP `ClientSession` and
-uses only public `android_*` tools after startup. The flow covers native PNG image content,
+uses public `android_*` tools after startup. The only direct-ADB exception is the explicitly
+requested `--exercise-usb-disconnect` operator phase: bounded `adb get-state` probes observe the
+physical unplug/replug, while public MCP calls verify the typed disconnect error and reconnect.
+The flow covers native PNG image content,
 snapshot paging, stale element rejection, a percentage swipe, UI-change and delayed-element
 condition waits, scoped app inventory, Unicode type/clear with non-echo assertions, session and
-screen-revision provenance, and unconditional fixture reset/Home/disconnect cleanup. To run the
+screen-revision provenance, and cleanup reserved inside the one total deadline. To run the
 same flow against a wheel-installed command, pass its absolute entry point with
 `--server-command`.
 

@@ -200,9 +200,7 @@ async def _call(
         raise AcceptanceError(f"{stage}: public tool deadline exceeded") from None
 
 
-async def _list_tools(
-    client: ClientSession, *, timeout_seconds: float, stage: str
-) -> Any:
+async def _list_tools(client: ClientSession, *, timeout_seconds: float, stage: str) -> Any:
     """List tools under the same stage and total deadlines as tool calls."""
 
     deadline = _WORKFLOW_DEADLINE.get()
@@ -365,9 +363,7 @@ async def _cleanup_shielded(
         raise
 
 
-async def _recording_observation(
-    client: ClientSession, *, stage_timeout_seconds: float
-) -> str:
+async def _recording_observation(client: ClientSession, *, stage_timeout_seconds: float) -> str:
     """Exercise the public recording transition and return supported/unsupported."""
 
     started = await _call(
@@ -431,9 +427,7 @@ async def _read_adb_state(adb: str, serial: str, *, timeout_seconds: float) -> s
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, _stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_seconds
-            )
+            stdout, _stderr = await asyncio.wait_for(process.communicate(), timeout=timeout_seconds)
         except TimeoutError:
             process.kill()
             await process.communicate()
@@ -1047,11 +1041,13 @@ async def run_acceptance(
     cleanup_reset_ok = False
     observations: WorkflowObservations | None = None
     loop = asyncio.get_running_loop()
-    workflow_deadline = loop.time() + total_timeout_seconds
-    cleanup_budget_seconds = max(30.0, min(60.0, stage_timeout_seconds * 2))
-    cleanup_stage_timeout_seconds = min(
-        stage_timeout_seconds, max(5.0, cleanup_budget_seconds / 5)
+    overall_deadline = loop.time() + total_timeout_seconds
+    cleanup_reserve_seconds = min(
+        stage_timeout_seconds,
+        30.0,
+        total_timeout_seconds * 0.25,
     )
+    workflow_deadline = overall_deadline - cleanup_reserve_seconds
     async with (
         stdio_client(parameters) as (read_stream, write_stream),
         ClientSession(read_stream, write_stream) as client,
@@ -1082,18 +1078,26 @@ async def run_acceptance(
             primary_error = error
             raise
         finally:
-            cleanup_deadline_token = _WORKFLOW_DEADLINE.set(
-                loop.time() + cleanup_budget_seconds
-            )
-            try:
-                cleanup_result, cleanup_reset_ok = await _cleanup_shielded(
-                    client,
-                    package=package,
-                    connect_attempted=connect_attempted,
-                    timeout_seconds=cleanup_stage_timeout_seconds,
+            cleanup_remaining = overall_deadline - loop.time()
+            if cleanup_remaining > 0:
+                # Cleanup is part of the one total deadline.  Divide the
+                # remaining budget across the bounded public cleanup calls so
+                # a slow first stage cannot consume time reserved for
+                # disconnect and process reaping.
+                cleanup_stage_timeout_seconds = max(
+                    0.05,
+                    min(stage_timeout_seconds, cleanup_remaining / 9),
                 )
-            finally:
-                _WORKFLOW_DEADLINE.reset(cleanup_deadline_token)
+                cleanup_deadline_token = _WORKFLOW_DEADLINE.set(overall_deadline)
+                try:
+                    cleanup_result, cleanup_reset_ok = await _cleanup_shielded(
+                        client,
+                        package=package,
+                        connect_attempted=connect_attempted,
+                        timeout_seconds=cleanup_stage_timeout_seconds,
+                    )
+                finally:
+                    _WORKFLOW_DEADLINE.reset(cleanup_deadline_token)
             if primary_error is None:
                 _require(
                     cleanup_reset_ok,

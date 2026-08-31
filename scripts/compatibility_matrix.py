@@ -69,9 +69,9 @@ def main(argv: list[str] | None = None) -> int:
         required_entries = tuple(configured_entries) + tuple(args.require_matrix_entry)
         if len(set(required_entries)) != len(required_entries):
             raise CompatibilityEvidenceError("required matrix entries must be unique")
-        max_age_days = (
-            args.max_age_days if args.max_age_days is not None else configured_max_age
-        )
+        if args.command == "render" and matrix_constraints is None:
+            raise CompatibilityEvidenceError("render requires --matrix-config")
+        max_age_days = args.max_age_days if args.max_age_days is not None else configured_max_age
         records = validate_evidence_directory(
             args.evidence_dir,
             # Rendering is useful before the full matrix is complete: it
@@ -79,15 +79,14 @@ def main(argv: list[str] | None = None) -> int:
             # release gate that requires every named entry.
             required_entries=required_entries if args.command == "validate" else (),
             max_age_days=max_age_days,
-            matrix_constraints=(
-                matrix_constraints if args.command == "validate" else None
-            ),
+            matrix_constraints=matrix_constraints,
         )
         if args.command == "render":
             update_markdown_matrix(
                 args.output,
                 records,
                 required_entries=required_entries,
+                matrix_constraints=matrix_constraints,
             )
     except CompatibilityEvidenceError as error:
         print(f"compatibility matrix failed: {error}")

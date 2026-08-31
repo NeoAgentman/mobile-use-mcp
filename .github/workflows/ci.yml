@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "codex/**"]
   pull_request:
     branches: [main]
 
@@ -161,6 +161,13 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
+      - name: Install pinned uv and Python for the artifact manifest
+        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
       - name: Install Java 17 for the pinned Android build
         uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
         with:
@@ -189,7 +196,7 @@ jobs:
           mkdir -p "$staging"
           cp fixtures/android-fixture/app/build/outputs/apk/debug/app-debug.apk "$staging/app-debug.apk"
           (cd "$staging" && sha256sum app-debug.apk > fixture.apk.sha256)
-          python scripts/artifact_manifest.py --write \
+          uv run --no-project --python "$PYTHON_VERSION" python scripts/artifact_manifest.py --write \
             --artifact "$staging/app-debug.apk" --kind fixture_apk --git-commit "$GITHUB_SHA" \
             --manifest "$staging/fixture.apk.manifest.json"
 
@@ -340,11 +347,11 @@ jobs:
           wheel="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
           uv run --no-project --python "$PYTHON_VERSION" python scripts/artifact_manifest.py \
             --verify --artifact "$wheel" --kind wheel --manifest dist/wheel.manifest.json
-          python scripts/artifact_manifest.py --verify \
+          .venv/bin/python scripts/artifact_manifest.py --verify \
             --artifact fixture-artifact/app-debug.apk --kind fixture_apk \
             --manifest fixture-artifact/fixture.apk.manifest.json
-          test "$(python -c 'import json; print(json.load(open("dist/wheel.manifest.json"))["git_commit"])')" = "$GITHUB_SHA"
-          test "$(python -c 'import json; print(json.load(open("fixture-artifact/fixture.apk.manifest.json"))["git_commit"])')" = "$GITHUB_SHA"
+          test "$(.venv/bin/python -c 'import json; print(json.load(open("dist/wheel.manifest.json"))["git_commit"])')" = "$GITHUB_SHA"
+          test "$(.venv/bin/python -c 'import json; print(json.load(open("fixture-artifact/fixture.apk.manifest.json"))["git_commit"])')" = "$GITHUB_SHA"
 
       - name: Install the exact wheel into an isolated server environment
         run: |

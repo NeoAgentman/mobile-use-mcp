@@ -114,9 +114,7 @@ def _adb_shell(adb: str, serial: str, *arguments: str, stage: str) -> str:
     return _run(_adb_command(adb, serial, "shell", *arguments), stage)
 
 
-def _screen_recording_status(
-    adb: str, serial: str, *, deadline: float | None = None
-) -> str:
+def _screen_recording_status(adb: str, serial: str, *, deadline: float | None = None) -> str:
     """Probe the built-in binary without retaining its device path or output."""
 
     timeout_seconds = 30.0
@@ -168,9 +166,7 @@ def collect_device_facts(
     adb_version, platform_tools_version = parse_adb_version(
         _run([adb, "version"], "adb_version", deadline=deadline)
     )
-    state = _run(
-        _adb_command(adb, serial, "get-state"), "device_state", deadline=deadline
-    )
+    state = _run(_adb_command(adb, serial, "get-state"), "device_state", deadline=deadline)
     if state != "device":
         raise CompatibilityEvidenceError("selected device is not online")
 
@@ -199,9 +195,7 @@ def collect_device_facts(
     rom = f"{manufacturer} Android {android_release} ({build})"
     input_method = _one_line(
         _run(
-            _adb_command(
-                adb, serial, "shell", "settings", "get", "secure", "default_input_method"
-            ),
+            _adb_command(adb, serial, "shell", "settings", "get", "secure", "default_input_method"),
             "input_method",
             deadline=deadline,
         ),
@@ -246,6 +240,25 @@ def collect_host_facts(*, adb_version: str, platform_tools_version: str) -> dict
             max_length=128,
         ),
     }
+
+
+def install_fixture_apk(
+    serial: str,
+    fixture_apk: Path,
+    *,
+    adb_path: str,
+    deadline: float,
+) -> None:
+    """Install the already verified CI fixture onto the explicit device."""
+
+    output = _run(
+        _adb_command(adb_path, serial, "install", "-r", str(fixture_apk)),
+        "fixture_install",
+        timeout_seconds=90,
+        deadline=deadline,
+    )
+    if "Success" not in {line.strip() for line in output.splitlines()}:
+        raise CompatibilityEvidenceError("device metadata stage failed: fixture_install")
 
 
 def build_evidence_record(
@@ -429,6 +442,12 @@ def run_physical_evidence(
         adb_path=adb_path,
         deadline=operation_deadline,
     )
+    install_fixture_apk(
+        serial,
+        fixture_apk,
+        adb_path=cast(str, device_facts["adb"]),
+        deadline=operation_deadline,
+    )
     host_facts = collect_host_facts(
         adb_version=cast(str, device_facts["adb_version"]),
         platform_tools_version=cast(str, device_facts["platform_tools_version"]),
@@ -488,9 +507,7 @@ def run_physical_evidence(
         total_timeout_seconds=total_timeout_seconds,
         duration_seconds=duration,
         screen_recording_status=(
-            workflow_result[0]
-            if workflow_result is not None
-            else "not_tested"
+            workflow_result[0] if workflow_result is not None else "not_tested"
         ),
         usb_disconnect_status=workflow_result[3] if workflow_result is not None else "not_tested",
         slow_device_status=workflow_result[1] if workflow_result is not None else "not_tested",

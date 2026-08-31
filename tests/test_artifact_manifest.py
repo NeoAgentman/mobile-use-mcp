@@ -22,12 +22,15 @@ def test_manifest_binds_artifact_digest_and_commit(tmp_path: Path) -> None:
 
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["git_commit"] == "a" * 40
-    assert verify_artifact_manifest(
-        manifest,
-        artifact=artifact,
-        kind="wheel",
-        expected_digest=sha256_file(artifact),
-    ) == "a" * 40
+    assert (
+        verify_artifact_manifest(
+            manifest,
+            artifact=artifact,
+            kind="wheel",
+            expected_digest=sha256_file(artifact),
+        )
+        == "a" * 40
+    )
 
     artifact.write_bytes(b"tampered")
     with pytest.raises(CompatibilityEvidenceError, match="digest"):
@@ -66,3 +69,15 @@ def test_manifest_rejects_unknown_fields(tmp_path: Path) -> None:
             kind="fixture_apk",
             expected_digest=sha256_file(artifact),
         )
+
+
+def test_fixture_manifest_uses_the_pinned_ci_python() -> None:
+    workflow = (Path(__file__).resolve().parents[1] / ".github/workflows/ci.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert (
+        'uv run --no-project --python "$PYTHON_VERSION" python scripts/artifact_manifest.py '
+        "--write" in workflow.replace("\\\n", "")
+    )
+    assert "\n          python scripts/artifact_manifest.py --write" not in workflow

@@ -41,7 +41,10 @@ The acceptance command requires an explicit serial and launches an independently
 uv run python scripts/android_fixture_acceptance.py --serial "$MOBILE_USE_ANDROID_SERIAL"
 ```
 
-The acceptance flow does not import `mobile_use_mcp.server`, access a controller, or call `adb`
-after it starts the MCP server. It uses public `android_*` tools for observation, actions,
-condition waits, reset, Home, and disconnect. See the script's `--help` output for selecting an
-installed server command or changing bounded deadlines.
+The core acceptance flow does not import `mobile_use_mcp.server`, access a controller, or call
+`adb` after it starts the MCP server. It uses public `android_*` tools for observation, actions,
+condition waits, reset, Home, recording, and disconnect. The optional, explicitly requested
+`--exercise-usb-disconnect` operator phase is the sole exception: its outer harness uses bounded
+`adb get-state` probes to observe the physical unplug/replug while the disconnect error and
+recovery are still verified through public MCP tools. See the script's `--help` output for
+selecting an installed server command or changing the one total deadline.

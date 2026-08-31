@@ -60,12 +60,8 @@ _RECORD_KEYS = frozenset(
         "failure_stage",
     }
 )
-_HOST_KEYS = frozenset(
-    {"client", "os", "python", "adb_version", "platform_tools_version"}
-)
-_DEVICE_KEYS = frozenset(
-    {"api_level", "manufacturer", "model", "rom", "serial_sha256"}
-)
+_HOST_KEYS = frozenset({"client", "os", "python", "adb_version", "platform_tools_version"})
+_DEVICE_KEYS = frozenset({"api_level", "manufacturer", "model", "rom", "serial_sha256"})
 _INPUT_METHOD_KEYS = frozenset({"id", "unicode_status"})
 _WORKFLOW_KEYS = frozenset(
     {
@@ -82,9 +78,7 @@ _CAPABILITY_KEYS = frozenset({"status", "source", "classification", "observed_de
 _ARTIFACT_KEYS = frozenset({"filename", "sha256"})
 _ARTIFACTS_KEYS = frozenset({"wheel", "fixture_apk"})
 _ARTIFACT_DIGEST_KEYS = frozenset({"wheel_sha256", "fixture_apk_sha256"})
-_ARTIFACT_LINEAGE_KEYS = frozenset(
-    {"git_commit", "wheel_sha256", "fixture_apk_sha256"}
-)
+_ARTIFACT_LINEAGE_KEYS = frozenset({"git_commit", "wheel_sha256", "fixture_apk_sha256"})
 _PRIVACY_KEYS = frozenset({"serial", "screenshots", "ui_content", "typed_text", "credentials"})
 _REQUIRED_CAPABILITIES = frozenset(
     {
@@ -267,9 +261,7 @@ def _parse_timestamp(value: object, context: str) -> datetime:
     return timestamp.astimezone(UTC)
 
 
-def _assert_allowed_keys(
-    mapping: Mapping[str, Any], context: str, allowed: frozenset[str]
-) -> None:
+def _assert_allowed_keys(mapping: Mapping[str, Any], context: str, allowed: frozenset[str]) -> None:
     """Reject unknown keys before values can become an evidence data channel."""
 
     unknown = sorted(str(key) for key in mapping if not isinstance(key, str) or key not in allowed)
@@ -400,6 +392,8 @@ def validate_evidence(
     duration = _number(workflow, "duration_seconds", "record.workflow")
     if stage_timeout <= 0 or total_timeout <= 0 or duration < 0:
         raise CompatibilityEvidenceError("workflow timeouts and duration must be positive")
+    if duration > total_timeout:
+        raise CompatibilityEvidenceError("workflow duration exceeds total timeout")
     _string(workflow, "cleanup", "record.workflow", max_length=128)
     _string(workflow, "cancellation", "record.workflow", max_length=256)
 
@@ -551,18 +545,13 @@ def validate_evidence_directory(
     missing = [entry for entry in required if entry not in by_entry]
     if missing:
         raise CompatibilityEvidenceError("missing matrix evidence: " + ", ".join(missing))
-    if required and matrix_constraints is None:
-        raise CompatibilityEvidenceError(
-            "matrix constraints are required when named entries are required"
-        )
     if matrix_constraints is not None:
-        for entry in required:
+        for record in records:
+            entry = cast(str, record["matrix_entry"])
             constraint = matrix_constraints.get(entry)
             if constraint is None:
-                raise CompatibilityEvidenceError(
-                    f"matrix entry has no validation constraints: {entry}"
-                )
-            _validate_matrix_record(by_entry[entry], entry, constraint)
+                raise CompatibilityEvidenceError(f"matrix entry is not configured: {entry}")
+            _validate_matrix_record(record, entry, constraint)
     return sorted(records, key=lambda item: cast(str, item["matrix_entry"]))
 
 
@@ -599,8 +588,7 @@ def _validate_matrix_constraint(name: str, value: object) -> dict[str, Any]:
                 f"matrix.entries.{name}.api_levels must be a non-empty array"
             )
         levels = [
-            _positive_integer(item, f"matrix.entries.{name}.api_levels")
-            for item in raw_levels
+            _positive_integer(item, f"matrix.entries.{name}.api_levels") for item in raw_levels
         ]
         if len(set(levels)) != len(levels):
             raise CompatibilityEvidenceError(
@@ -780,9 +768,26 @@ def _capability(record: Mapping[str, Any], name: str, field: str = "status") -> 
 
 
 def render_matrix(
-    records: Sequence[Mapping[str, Any]], *, required_entries: Iterable[str] = ()
+    records: Sequence[Mapping[str, Any]],
+    *,
+    required_entries: Iterable[str] = (),
+    matrix_constraints: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> str:
-    """Render passing evidence into a user-facing matrix with explicit gaps."""
+    """Render configured passing evidence into a user-facing matrix with gaps."""
+
+    if records and matrix_constraints is None:
+        raise CompatibilityEvidenceError(
+            "matrix constraints are required to render evidence records"
+        )
+    if matrix_constraints is not None:
+        for record in records:
+            entry = cast(str, record.get("matrix_entry"))
+            constraint = matrix_constraints.get(entry)
+            if constraint is None:
+                raise CompatibilityEvidenceError(f"matrix entry is not configured: {entry}")
+            if record.get("result") != PASSING_RESULT:
+                raise CompatibilityEvidenceError(f"matrix entry {entry} has a non-passing result")
+            _validate_matrix_record(record, entry, constraint)
 
     entries = {str(entry) for entry in required_entries}
     rows = sorted(records, key=lambda item: str(item.get("matrix_entry", "")))
@@ -845,12 +850,18 @@ def update_markdown_matrix(
     records: Sequence[Mapping[str, Any]],
     *,
     required_entries: Iterable[str] = (),
+    matrix_constraints: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     """Replace the generated matrix block while preserving surrounding documentation."""
 
     begin = "<!-- BEGIN GENERATED ANDROID COMPATIBILITY MATRIX -->"
     end = "<!-- END GENERATED ANDROID COMPATIBILITY MATRIX -->"
-    generated = f"{begin}\n{render_matrix(records, required_entries=required_entries)}{end}"
+    rendered = render_matrix(
+        records,
+        required_entries=required_entries,
+        matrix_constraints=matrix_constraints,
+    )
+    generated = f"{begin}\n{rendered}{end}"
     path = Path(document)
     try:
         existing = path.read_text(encoding="utf-8") if path.exists() else ""

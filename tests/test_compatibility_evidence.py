@@ -112,6 +112,12 @@ def test_validate_evidence_rejects_stale_or_failed_records() -> None:
     with pytest.raises(CompatibilityEvidenceError, match="passed"):
         validate_evidence(failed, now=NOW)
 
+    over_deadline = _record()
+    workflow = cast(dict[str, object], over_deadline["workflow"])
+    workflow["duration_seconds"] = 181
+    with pytest.raises(CompatibilityEvidenceError, match="exceeds total timeout"):
+        validate_evidence(over_deadline, now=NOW)
+
 
 def test_validate_evidence_rejects_complete_serial_and_ui_content() -> None:
     record = _record()
@@ -137,9 +143,7 @@ def test_validate_evidence_rejects_complete_serial_and_ui_content() -> None:
         ("workflow", "diagnostics"),
     ),
 )
-def test_validate_evidence_rejects_nested_sensitive_payloads(
-    location: str, field: str
-) -> None:
+def test_validate_evidence_rejects_nested_sensitive_payloads(location: str, field: str) -> None:
     record = _record()
     target = cast(dict[str, object], record[location])
     target[field] = "malicious payload"
@@ -178,6 +182,13 @@ def test_directory_validation_requires_named_fresh_entries(tmp_path: Path) -> No
         },
     )
     assert [item["matrix_entry"] for item in records] == ["physical-huawei-api-29"]
+
+    name_only_records = validate_evidence_directory(
+        tmp_path,
+        required_entries=("physical-huawei-api-29",),
+        now=NOW,
+    )
+    assert [item["matrix_entry"] for item in name_only_records] == ["physical-huawei-api-29"]
 
     with pytest.raises(CompatibilityEvidenceError, match="missing"):
         validate_evidence_directory(
@@ -288,18 +299,77 @@ def test_release_audit_rejects_evidence_for_a_different_wheel(tmp_path: Path) ->
 def test_write_evidence_is_machine_readable_and_matrix_is_explicit_about_gaps(
     tmp_path: Path,
 ) -> None:
+    record = _record()
+    capabilities = cast(dict[str, object], record["capabilities"])
+    capabilities["slow_device_behavior"] = {
+        "status": "passed",
+        "classification": "within_deadline",
+        "source": "public-delay-observation",
+        "observed_delay_seconds": 2.0,
+    }
+    capabilities["usb_disconnect_recovery"] = {
+        "status": "passed",
+        "source": "public-usb-disconnect-flow",
+    }
     evidence_path = tmp_path / "physical-huawei-api-29.json"
-    write_evidence(evidence_path, _record())
+    write_evidence(evidence_path, record)
     assert json.loads(evidence_path.read_text(encoding="utf-8"))["schema_version"] == 1
 
+    required_entries, _max_age, constraints = load_matrix_config(
+        PROJECT_ROOT / "compatibility/matrix.json"
+    )
     matrix = render_matrix(
-        validate_evidence_directory(tmp_path, now=NOW),
-        required_entries=("physical-huawei-api-29", "android-api-35-emulator"),
+        validate_evidence_directory(
+            tmp_path,
+            now=NOW,
+            matrix_constraints=constraints,
+        ),
+        required_entries=required_entries,
+        matrix_constraints=constraints,
     )
     assert "physical-huawei-api-29" in matrix
-    assert "android-api-35-emulator" in matrix
+    assert "physical-aosp-api-26" in matrix
     assert "unverified" in matrix.casefold()
     assert "SERIAL-UNDER-TEST" not in matrix
+
+
+def test_render_matrix_rejects_record_that_misses_configured_device_constraint() -> None:
+    record = _record()
+    capabilities = cast(dict[str, object], record["capabilities"])
+    capabilities["slow_device_behavior"] = {
+        "status": "passed",
+        "classification": "within_deadline",
+        "source": "public-delay-observation",
+        "observed_delay_seconds": 2.0,
+    }
+    capabilities["usb_disconnect_recovery"] = {
+        "status": "passed",
+        "source": "public-usb-disconnect-flow",
+    }
+    device = cast(dict[str, object], record["device"])
+    device["api_level"] = 30
+    required_entries, _max_age, constraints = load_matrix_config(
+        PROJECT_ROOT / "compatibility/matrix.json"
+    )
+
+    with pytest.raises(CompatibilityEvidenceError, match="requires API"):
+        render_matrix(
+            [validate_evidence(record, now=NOW)],
+            required_entries=required_entries,
+            matrix_constraints=constraints,
+        )
+
+
+def test_fixture_delay_exceeds_the_slow_observation_threshold() -> None:
+    source = (
+        PROJECT_ROOT
+        / "fixtures/android-fixture/app/src/main/java"
+        / "com/neoagentman/mobileusefixture/MainActivity.java"
+    ).read_text(encoding="utf-8")
+    marker = "DELAYED_ELEMENT_DELAY_MS = "
+    delay = int(source.split(marker, 1)[1].split("L", 1)[0])
+
+    assert delay >= 1_250
 
 
 def test_parse_adb_version_keeps_both_versions() -> None:
@@ -369,6 +439,20 @@ def test_physical_runner_uses_explicit_serial_and_writes_only_a_hash(
 
     monkeypatch.setattr(physical, "collect_device_facts", fake_facts)
     calls: list[str] = []
+    installs: list[tuple[str, Path]] = []
+
+    def fake_install(
+        selected_serial: str,
+        selected_apk: Path,
+        *,
+        adb_path: str,
+        deadline: float,
+    ) -> None:
+        assert adb_path == "/usr/bin/adb"
+        assert deadline > 0
+        installs.append((selected_serial, selected_apk))
+
+    monkeypatch.setattr(physical, "install_fixture_apk", fake_install)
 
     def fake_acceptance(**kwargs: object) -> int:
         calls.append(cast(str, kwargs["serial"]))
@@ -397,6 +481,7 @@ def test_physical_runner_uses_explicit_serial_and_writes_only_a_hash(
 
     assert code == 0
     assert calls == [serial]
+    assert installs == [(serial, fixture)]
     encoded = (tmp_path / "evidence.json").read_text(encoding="utf-8")
     assert serial not in encoded
     assert record["device"]["serial_sha256"] == "a" * 64

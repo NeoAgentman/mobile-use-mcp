@@ -575,9 +575,7 @@ def main(argv: list[str] | None = None) -> int:
             compatibility_evidence=args.compatibility_evidence,
             required_matrix_entries=required_entries,
             compatibility_max_age_days=max_age_days,
-            compatibility_matrix_constraints=(
-                matrix_constraints if required_entries else None
-            ),
+            compatibility_matrix_constraints=(matrix_constraints if required_entries else None),
         )
     except ReleaseAuditError as error:
         print(f"release audit failed: {error}", file=sys.stderr)

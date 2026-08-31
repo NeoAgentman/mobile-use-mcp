@@ -26,7 +26,7 @@ import java.util.Locale;
  * new acceptance scenarios.</p>
  */
 public final class MainActivity extends Activity {
-    private static final long DELAYED_ELEMENT_DELAY_MS = 650L;
+    private static final long DELAYED_ELEMENT_DELAY_MS = 1250L;
     private static final int ROW_COUNT = 32;
 
     private final Handler handler = new Handler(Looper.getMainLooper());

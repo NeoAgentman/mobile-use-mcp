@@ -23,8 +23,9 @@ uv run python scripts/artifact_digest.py \
   --verify --directory distributions --output distributions/wheel.sha256
 ```
 
-Install the wheel into a dedicated environment and the CI-built APK onto one
-explicitly authorized device. Then run:
+Install the wheel into a dedicated environment, connect and authorize one
+explicit device, then run. The harness installs the already verified CI-built
+APK onto that exact serial before it starts the public MCP flow:
 
 ```bash
 uv run python scripts/android_compatibility_evidence.py \
